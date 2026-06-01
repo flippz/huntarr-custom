@@ -932,6 +932,23 @@ def handle_app_settings(app_name):
         success = settings_manager.save_settings(app_name, data)
         
         if success:
+            # Reschedule instance cycles if sleep_duration changed so countdown updates immediately
+            if 'instances' in data and isinstance(data['instances'], list):
+                try:
+                    from src.primary.utils.database import get_database
+                    from src.primary.utils.timezone_utils import get_user_timezone
+                    _db = get_database()
+                    _tz = get_user_timezone()
+                    _now = datetime.datetime.now(_tz).replace(microsecond=0)
+                    for _inst in data['instances']:
+                        _iid = _inst.get('instance_id') or _inst.get('instance_name')
+                        _dur = _inst.get('sleep_duration')
+                        if _iid and _dur is not None:
+                            _next = _now + datetime.timedelta(seconds=int(_dur))
+                            _db.set_sleep_data_per_instance(app_name, str(_iid), next_cycle_time=_next.isoformat())
+                except Exception as _e:
+                    web_logger.debug(f"Could not reschedule cycles after settings save: {_e}")
+
             # Return updated settings so client can show server-generated fields (e.g. instance_id for new instances)
             updated = settings_manager.load_settings(app_name)
             return jsonify({"success": True, "settings": updated})
