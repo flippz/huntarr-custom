@@ -15,6 +15,7 @@ from src.primary.apps.lidarr import api as lidarr_api
 from src.primary.stats_manager import increment_stat, check_hourly_cap_exceeded
 from src.primary.stateful_manager import is_processed, add_processed_id
 from src.primary.utils.history_utils import log_processed_media
+from src.primary.history_manager import update_history_status
 from src.primary.settings_manager import load_settings, get_advanced_setting
 from src.primary.state import check_state_reset
 from src.primary.apps._common.settings import extract_app_settings, validate_settings
@@ -257,9 +258,12 @@ def process_missing_albums(
                             lidarr_logger.debug(f"Added album ID {album_id} to processed list for {instance_name}, success: {album_success}")
                 
                 # Log to history system
-                log_processed_media("lidarr", f"{artist_name}", artist_id, instance_key, "missing", display_name_for_log=app_settings.get("instance_display_name") or instance_name)
+                _entry_id = log_processed_media("lidarr", f"{artist_name}", artist_id, instance_key, "missing", display_name_for_log=app_settings.get("instance_display_name") or instance_name)
                 lidarr_logger.debug(f"Logged history entry for artist: {artist_name}")
-                
+                if _entry_id and command_id and command_id != 'failed':
+                    _cmd_ok = lidarr_api.wait_for_command(api_url, api_key, api_timeout, command_id, command_wait_delay, command_wait_attempts)
+                    update_history_status(_entry_id, 'completed' if _cmd_ok else 'failed')
+
                 time.sleep(0.1) # Small delay between triggers
         else: # Album mode
             album_ids_to_search = list(entities_to_search_ids)
@@ -337,6 +341,7 @@ def process_missing_albums(
                             tagged_artists.add(artist_id)
                 
                 # Log to history system
+                _album_entry_ids = []
                 for album_id in album_ids_to_search:
                     album_info = missing_items_dict.get(album_id)
                     if album_info:
@@ -346,10 +351,16 @@ def process_missing_albums(
                         media_name = f"{artist_name} - {title}"
                         # Use foreignAlbumId for Lidarr URLs (falls back to internal ID if not available)
                         foreign_album_id = album_info.get('foreignAlbumId', album_id)
-                        log_processed_media("lidarr", media_name, foreign_album_id, instance_key, "missing", display_name_for_log=app_settings.get("instance_display_name") or instance_name)
+                        _eid = log_processed_media("lidarr", media_name, foreign_album_id, instance_key, "missing", display_name_for_log=app_settings.get("instance_display_name") or instance_name)
                         lidarr_logger.debug(f"Logged history entry for album: {media_name}")
-                
-                time.sleep(command_wait_delay) # Basic delay after the single command
+                        if _eid:
+                            _album_entry_ids.append(_eid)
+
+                _actual_cmd_id = command_id.get('id') if isinstance(command_id, dict) else command_id
+                if _album_entry_ids and _actual_cmd_id:
+                    _cmd_ok = lidarr_api.wait_for_command(api_url, api_key, api_timeout, _actual_cmd_id, command_wait_delay, command_wait_attempts)
+                    for _eid in _album_entry_ids:
+                        update_history_status(_eid, 'completed' if _cmd_ok else 'failed')
             else:
                 lidarr_logger.warning(f"Failed to trigger album search for IDs {album_ids_to_search} on {instance_name}.")
 

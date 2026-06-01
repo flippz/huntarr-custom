@@ -459,6 +459,24 @@ def get_command_status(api_url: str, api_key: str, api_timeout: int, command_id:
          lidarr_logger.error(f"Error getting Lidarr command status for ID {command_id}. Response: {response}")
          return None
 
+def wait_for_command(api_url: str, api_key: str, api_timeout: int, command_id: int,
+                     delay_seconds: int = 1, max_attempts: int = 600) -> bool:
+    """Wait for a Lidarr command to complete. Returns True on success, False on failure/timeout."""
+    attempts = 0
+    while attempts < max_attempts:
+        status = get_command_status(api_url, api_key, api_timeout, command_id)
+        if status:
+            state = status.get('status')
+            if state == 'completed':
+                return True
+            elif state == 'failed':
+                lidarr_logger.error(f"Lidarr command {command_id} failed")
+                return False
+        time.sleep(delay_seconds)
+        attempts += 1
+    lidarr_logger.warning(f"Timed out waiting for Lidarr command {command_id} to complete")
+    return False
+
 def get_artist_by_id(api_url: str, api_key: str, api_timeout: int, artist_id: int) -> Optional[Dict[str, Any]]:
     """Get artist details by ID from Lidarr."""
     return arr_request(api_url, api_key, api_timeout, f"artist/{artist_id}")

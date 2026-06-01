@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional, Callable, List, Union, Set # Added List,
 from src.primary.utils.logger import get_logger
 from src.primary.apps.lidarr import api as lidarr_api
 from src.primary.utils.history_utils import log_processed_media
+from src.primary.history_manager import update_history_status
 from src.primary.stateful_manager import is_processed, add_processed_id
 from src.primary.stats_manager import increment_stat, check_hourly_cap_exceeded
 from src.primary.settings_manager import load_settings, get_advanced_setting
@@ -205,6 +206,7 @@ def process_cutoff_upgrades(
                     tagged_artists_upgraded.add(artist_id)
             
             # Log to history
+            _album_entry_ids = []
             for album_id in album_ids_to_search:
                 # Find the album info for this ID to log to history
                 for album in albums_to_search:
@@ -214,15 +216,20 @@ def process_cutoff_upgrades(
                         media_name = f"{artist_name} - {album_title}"
                         # Use foreignAlbumId for Lidarr URLs (falls back to internal ID if not available)
                         foreign_album_id = album.get('foreignAlbumId', album_id)
-                        log_processed_media("lidarr", media_name, foreign_album_id, instance_key, "upgrade", display_name_for_log=app_settings.get("instance_display_name") or instance_name)
+                        _eid = log_processed_media("lidarr", media_name, foreign_album_id, instance_key, "upgrade", display_name_for_log=app_settings.get("instance_display_name") or instance_name)
                         lidarr_logger.debug(f"Logged quality upgrade to history for album ID {album_id}")
+                        if _eid:
+                            _album_entry_ids.append(_eid)
                         break
-                
-            time.sleep(command_wait_delay) # Basic delay
+
+            _actual_cmd_id = command_id.get('id') if isinstance(command_id, dict) else command_id
+            if _album_entry_ids and _actual_cmd_id:
+                _cmd_ok = lidarr_api.wait_for_command(api_url, api_key, api_timeout, _actual_cmd_id, command_wait_delay, command_wait_attempts)
+                for _eid in _album_entry_ids:
+                    update_history_status(_eid, 'completed' if _cmd_ok else 'failed')
+
             processed_count += len(album_ids_to_search)
             processed_any = True # Mark that we processed something
-            # Consider adding wait_for_command logic if needed
-            # wait_for_command(api_url, api_key, command_id, command_wait_delay, command_wait_attempts)
         else:
             lidarr_logger.warning(f"Failed to trigger upgrade album search for IDs {album_ids_to_search} on {instance_name}.")
 

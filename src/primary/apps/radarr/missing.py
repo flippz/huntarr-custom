@@ -14,6 +14,7 @@ from src.primary.apps.radarr import api as radarr_api
 from src.primary.stats_manager import increment_stat_only
 from src.primary.stateful_manager import add_processed_id
 from src.primary.utils.history_utils import log_processed_media
+from src.primary.history_manager import update_history_status
 from src.primary.settings_manager import load_settings
 from src.primary.apps._common.settings import extract_app_settings, validate_settings
 from src.primary.apps._common.filtering import filter_exempt_items, filter_unprocessed
@@ -111,6 +112,8 @@ def process_missing_movies(
     # App-specific settings
     skip_future_releases = app_settings.get("skip_future_releases", True)
     search_order = app_settings.get("search_order", "random")
+    command_wait_delay = app_settings.get("command_wait_delay", 1)
+    command_wait_attempts = app_settings.get("command_wait_attempts", 600)
     
     radarr_logger.info(f"Missing: checking for {hunt_missing_movies} movies in instance '{instance_name}'")
     
@@ -284,8 +287,11 @@ def process_missing_movies(
             media_name = f"{movie_title} ({year})"
             # Use TMDb ID for Radarr URLs (falls back to internal ID if TMDb ID not available)
             tmdb_id = movie.get("tmdbId", movie_id)
-            log_processed_media("radarr", media_name, tmdb_id, instance_key, "missing", display_name_for_log=app_settings.get("instance_display_name") or instance_name)
+            _entry_id = log_processed_media("radarr", media_name, tmdb_id, instance_key, "missing", display_name_for_log=app_settings.get("instance_display_name") or instance_name)
             radarr_logger.debug(f"Logged history entry for movie: {media_name}")
+            if _entry_id:
+                _cmd_ok = radarr_api.wait_for_command(api_url, api_key, api_timeout, search_success, command_wait_delay, command_wait_attempts)
+                update_history_status(_entry_id, 'completed' if _cmd_ok else 'failed')
             
             increment_stat_only("radarr", "hunted", 1, instance_key)
             movies_processed += 1
