@@ -10,7 +10,7 @@ logger = get_logger("history")
 _recent_log_entries = {}
 _DUPLICATE_WINDOW_SECONDS = 30
 
-def log_processed_media(app_type, media_name, media_id, instance_name, operation_type="missing", display_name_for_log=None):
+def log_processed_media(app_type, media_name, media_id, instance_name, operation_type="missing", display_name_for_log=None, status='sent'):
     """
     Log when media is processed by an app instance.
     instance_name is the stable instance key (instance_id) for DB; display_name_for_log is shown in logs when set.
@@ -37,7 +37,7 @@ def log_processed_media(app_type, media_name, media_id, instance_name, operation
             last_logged = _recent_log_entries[entry_key]
             if current_time - last_logged < _DUPLICATE_WINDOW_SECONDS:
                 logger.debug(f"Skipping duplicate history entry for {app_type} - {log_label}: {media_name} (last logged {current_time - last_logged:.1f}s ago)")
-                return True
+                return None
 
         # Clean up old entries from cache
         expired_keys = [k for k, v in _recent_log_entries.items() if current_time - v > _DUPLICATE_WINDOW_SECONDS]
@@ -52,16 +52,17 @@ def log_processed_media(app_type, media_name, media_id, instance_name, operation
             "instance_name": instance_name,
             "operation_type": operation_type,
             "instance_display_name": display_name_for_log,
+            "status": status,
         }
 
         result = add_history_entry(app_type, entry_data)
         if result:
             _recent_log_entries[entry_key] = current_time
             logger.info(f"Logged history entry for {app_type} - {log_label}: {media_name} ({operation_type})")
-            return True
+            return result.get("id")
         else:
             logger.error(f"Failed to log history entry for {app_type} - {log_label}: {media_name}")
-            return False
+            return None
     except Exception as e:
         logger.error(f"Error logging history entry: {str(e)}")
-        return False
+        return None

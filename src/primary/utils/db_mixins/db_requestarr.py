@@ -588,7 +588,7 @@ class RequestarrMixin:
     # Hunt History/Manager Database Methods
     def add_hunt_history_entry(self, app_type: str, instance_name: str, media_id: str, 
                          processed_info: str, operation_type: str = "missing", 
-                         discovered: bool = False, date_time: int = None) -> Dict[str, Any]:
+                         discovered: bool = False, status: str = 'sent', date_time: int = None) -> Dict[str, Any]:
         """Add a new hunt history entry to the database"""
         if date_time is None:
             date_time = int(time.time())
@@ -598,9 +598,9 @@ class RequestarrMixin:
         with self.get_connection() as conn:
             cursor = conn.execute('''
                 INSERT INTO hunt_history 
-                (app_type, instance_name, media_id, processed_info, operation_type, discovered, date_time, date_time_readable)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (app_type, instance_name, media_id, processed_info, operation_type, discovered, date_time, date_time_readable))
+                (app_type, instance_name, media_id, processed_info, operation_type, discovered, status, date_time, date_time_readable)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (app_type, instance_name, media_id, processed_info, operation_type, discovered, status, date_time, date_time_readable))
             
             entry_id = cursor.lastrowid
             conn.commit()
@@ -614,13 +614,29 @@ class RequestarrMixin:
                 "processed_info": processed_info,
                 "operation_type": operation_type,
                 "discovered": discovered,
+                "status": status,
                 "date_time": date_time,
                 "date_time_readable": date_time_readable
             }
             
             logger.debug(f"Added hunt history entry for {app_type}-{instance_name}: {processed_info}")
             return entry
-    
+
+    def update_hunt_history_status(self, entry_id: int, status: str) -> bool:
+        """Update the status of a hunt history entry."""
+        try:
+            with self.get_connection() as conn:
+                conn.execute(
+                    "UPDATE hunt_history SET status = ? WHERE id = ?",
+                    (status, entry_id)
+                )
+                conn.commit()
+                logger.debug(f"Updated hunt history entry {entry_id} status to '{status}'")
+                return True
+        except Exception as e:
+            logger.error(f"Error updating hunt history status for entry {entry_id}: {e}")
+            return False
+
     def get_hunt_history(self, app_type: str = None, search_query: str = None, 
                    page: int = 1, page_size: int = 20, instance_name: str = None) -> Dict[str, Any]:
         """Get hunt history entries with pagination and filtering"""

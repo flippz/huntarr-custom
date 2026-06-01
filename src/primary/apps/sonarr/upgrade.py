@@ -190,7 +190,7 @@ def log_season_pack_upgrade(api_url: str, api_key: str, api_timeout: int, series
             media_name = f"{series_title} - {season_id}"
             
             # Log the season pack upgrade to history with normal 'upgrade' operation type
-            log_processed_media("sonarr", media_name, season_id_num, instance_name, "upgrade", display_name_for_log=instance_display_name or instance_name)
+            log_processed_media("sonarr", media_name, season_id_num, instance_name, "upgrade", display_name_for_log=instance_display_name or instance_name, status='completed')
             sonarr_logger.debug(f"Logged season pack upgrade to history for {series_title} Season {season_number}")
     except Exception as e:
         sonarr_logger.error(f"Failed to log season pack upgrade to history: {str(e)}")
@@ -785,7 +785,7 @@ def process_upgrade_episodes_mode(
                     
                     # Log to history system
                     media_name = f"{series_title} - {season_episode} - {episode_title}"
-                    log_processed_media("sonarr", media_name, str(episode_id), instance_name, "upgrade", display_name_for_log=instance_display_name or instance_name)
+                    log_processed_media("sonarr", media_name, str(episode_id), instance_name, "upgrade", display_name_for_log=instance_display_name or instance_name, status='completed')
                     sonarr_logger.debug(f"Logged upgrade to history for episode: {media_name}")
                     
                     # Increment statistics

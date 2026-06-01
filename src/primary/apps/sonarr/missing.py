@@ -12,6 +12,7 @@ from typing import List, Dict, Any, Optional, Callable
 from src.primary.utils.logger import get_logger
 from src.primary.settings_manager import load_settings, get_advanced_setting
 from src.primary.utils.history_utils import log_processed_media
+from src.primary.history_manager import update_history_status
 from src.primary.stats_manager import increment_stat, increment_stat_only, check_hourly_cap_exceeded
 from src.primary.stateful_manager import is_processed, add_processed_id
 from src.primary.apps._common.tagging import try_tag_item, extract_tag_settings
@@ -381,7 +382,7 @@ def process_missing_seasons_packs_mode(
             
             # Log to history system
             media_name = f"{series_title} - Season {season_number} (contains {episode_count} missing episodes)"
-            log_processed_media("sonarr", media_name, season_id, instance_name, "missing", display_name_for_log=instance_display_name or instance_name)
+            _entry_id = log_processed_media("sonarr", media_name, season_id, instance_name, "missing", display_name_for_log=instance_display_name or instance_name)
             sonarr_logger.debug(f"Logged history entry for season pack: {media_name}")
             
             # CRITICAL FIX: Use increment_stat_only to avoid double-counting API calls
@@ -392,12 +393,13 @@ def process_missing_seasons_packs_mode(
             
             # Wait for command to complete if configured
             if command_wait_delay > 0 and command_wait_attempts > 0:
-                if wait_for_command(
+                _cmd_success = wait_for_command(
                     api_url, api_key, api_timeout, command_id, 
                     command_wait_delay, command_wait_attempts, "Season Search", stop_check,
                     instance_name=instance_name
-                ):
-                    pass
+                )
+                if _entry_id:
+                    update_history_status(_entry_id, 'completed' if _cmd_success else 'failed')
         else:
             sonarr_logger.error(f"Failed to trigger search for {series_title}.")
     

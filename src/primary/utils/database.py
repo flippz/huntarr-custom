@@ -992,11 +992,19 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                     processed_info TEXT NOT NULL,
                     operation_type TEXT DEFAULT 'missing',
                     discovered BOOLEAN DEFAULT FALSE,
+                    status TEXT DEFAULT 'sent',
                     date_time INTEGER NOT NULL,
                     date_time_readable TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+
+            # Add status column if it doesn't exist (for existing databases)
+            try:
+                conn.execute("ALTER TABLE hunt_history ADD COLUMN status TEXT DEFAULT 'sent'")
+                logger.info("Added status column to hunt_history table")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
             # Create chat_messages table for lightweight in-app chat
             conn.execute('''

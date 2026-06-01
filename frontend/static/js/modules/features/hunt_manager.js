@@ -255,6 +255,11 @@ const huntManagerModule = {
         operationCell.className = 'col-op';
         operationCell.innerHTML = this.formatOperation(entry.operation_type);
         
+        // Status
+        const statusCell = document.createElement('td');
+        statusCell.className = 'col-status';
+        statusCell.innerHTML = this.formatStatus(entry.status);
+        
         // Media ID
         const idCell = document.createElement('td');
         idCell.className = 'col-id';
@@ -274,6 +279,7 @@ const huntManagerModule = {
         
         row.appendChild(processedInfoCell);
         row.appendChild(operationCell);
+        row.appendChild(statusCell);
         row.appendChild(idCell);
         row.appendChild(instanceCell);
         row.appendChild(timeCell);
@@ -311,6 +317,17 @@ const huntManagerModule = {
         return html;
     },
     
+    // Format status badge
+    formatStatus: function(status) {
+        const statusMap = {
+            'sent':      { text: 'Sent',      cls: 'status-sent' },
+            'completed': { text: 'Completed', cls: 'status-completed' },
+            'failed':    { text: 'Failed',    cls: 'status-failed' }
+        };
+        const s = statusMap[(status || '').toLowerCase()] || { text: (status || 'Sent'), cls: 'status-sent' };
+        return `<span class="status-badge ${s.cls}">${s.text}</span>`;
+    },
+
     // Format operation type
     formatOperation: function(operationType) {
         const operationMap = {

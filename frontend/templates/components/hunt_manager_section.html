@@ -60,6 +60,7 @@
                 <tr>
                     <th class="col-info">Processed Information</th>
                     <th class="col-op">Operation</th>
+                    <th class="col-status">Status</th>
                     <th class="col-id">ID</th>
                     <th class="col-instance">App Instance</th>
                     <th class="col-time">Time</th>
@@ -418,6 +419,44 @@
 .col-op {
     width: 100px;
     white-space: nowrap;
+}
+
+.col-status {
+    width: 90px;
+    white-space: nowrap;
+}
+
+/* Status Badges */
+.status-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 3px 10px;
+    border-radius: 9999px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    min-width: 60px;
+    line-height: 1;
+}
+
+.status-sent {
+    background: rgba(100, 116, 139, 0.12);
+    color: #94a3b8;
+    border: 1px solid rgba(100, 116, 139, 0.2);
+}
+
+.status-completed {
+    background: rgba(34, 197, 94, 0.12);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.2);
+}
+
+.status-failed {
+    background: rgba(239, 68, 68, 0.12);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.2);
 }
 
 .col-id {

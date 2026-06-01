@@ -60,7 +60,8 @@ def add_history_entry(app_type, entry_data):
                 media_id=entry_data["id"],
                 processed_info=entry_data["name"],
                 operation_type=entry_data.get("operation_type", "missing"),
-                discovered=False  # Default to false - will be updated by discovery tracker
+                discovered=False,  # Default to false - will be updated by discovery tracker
+                status=entry_data.get("status", "sent")
             )
             
             # Add additional fields for compatibility
@@ -81,6 +82,24 @@ def add_history_entry(app_type, entry_data):
         except Exception as e:
             logger.error(f"Database error adding history entry for {app_type}: {e}")
             return None
+
+def update_history_status(entry_id: int, status: str) -> bool:
+    """
+    Update the status of a history entry.
+
+    Parameters:
+    - entry_id: int - The ID of the history entry to update
+    - status: str - The new status ('sent', 'completed', 'failed')
+
+    Returns:
+    - bool - Success or failure
+    """
+    try:
+        manager_db = get_manager_database()
+        return manager_db.update_hunt_history_status(entry_id, status)
+    except Exception as e:
+        logger.error(f"Error updating history status for entry {entry_id}: {e}")
+        return False
 
 def get_history(app_type, search_query=None, page=1, page_size=20, instance_name=None):
     """
