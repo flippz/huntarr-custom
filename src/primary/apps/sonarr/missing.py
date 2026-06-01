@@ -803,23 +803,31 @@ def process_missing_episodes_mode(
         if search_successful:
             processed_any = True
             processed_count += 1
-            
+
             # Mark episode as processed
             success = add_processed_id("sonarr", instance_name, str(episode_id))
             sonarr_logger.debug(f"Added episode ID {episode_id} to processed list, success: {success}")
-            
+
             # Log to history system
             media_name = f"{series_title} - {season_episode} - {episode_title}"
-            log_processed_media("sonarr", media_name, str(episode_id), instance_name, "missing", display_name_for_log=instance_display_name or instance_name)
+            _entry_id = log_processed_media("sonarr", media_name, str(episode_id), instance_name, "missing", display_name_for_log=instance_display_name or instance_name)
             sonarr_logger.debug(f"Logged history entry for episode: {media_name}")
-            
+
+            if _entry_id and command_wait_delay > 0 and command_wait_attempts > 0:
+                _cmd_ok = wait_for_command(
+                    api_url, api_key, api_timeout, search_successful,
+                    command_wait_delay, command_wait_attempts, "Episode Search", stop_check,
+                    instance_name=instance_name
+                )
+                update_history_status(_entry_id, 'completed' if _cmd_ok else 'failed')
+
             # Increment statistics
             increment_stat("sonarr", "hunted", 1, instance_name)
             sonarr_logger.debug(f"Incremented sonarr hunted statistics for episode {episode_id}")
-            
+
             # Note: No tagging is performed in episodes mode as it would be inefficient
             # and could overwhelm the API with individual episode tag operations
-            
+
         else:
             sonarr_logger.error(f"Failed to trigger search for episode: {series_title} - {season_episode}")
     
