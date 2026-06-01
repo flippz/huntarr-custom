@@ -291,6 +291,7 @@ def process_cutoff_upgrades(
         
         # Search for cutoff upgrade
         radarr_logger.info(f"  - Searching for quality upgrade...")
+        _search_start_iso = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
         search_result = radarr_api.movie_search(api_url, api_key, api_timeout, [movie_id])
         
         if search_result:
@@ -321,7 +322,13 @@ def process_cutoff_upgrades(
             radarr_logger.debug(f"Logged quality upgrade to history for movie ID {movie_id}")
             if _entry_id:
                 _cmd_ok = radarr_api.wait_for_command(api_url, api_key, api_timeout, search_result, command_wait_delay, command_wait_attempts)
-                update_history_status(_entry_id, 'completed' if _cmd_ok else 'failed')
+                if _cmd_ok:
+                    _grabbed = radarr_api.check_grabbed(api_url, api_key, api_timeout,
+                                                        movie_id=movie_id,
+                                                        search_start_iso=_search_start_iso)
+                    update_history_status(_entry_id, 'grabbed' if _grabbed else 'searched')
+                else:
+                    update_history_status(_entry_id, 'failed')
             
             processed_count += 1
             processed_something = True

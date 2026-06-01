@@ -3581,9 +3581,11 @@ const huntManagerModule = {
     // Format status badge
     formatStatus: function(status) {
         const statusMap = {
-            'sent':      { text: 'Sent',      cls: 'status-sent' },
-            'completed': { text: 'Completed', cls: 'status-completed' },
-            'failed':    { text: 'Failed',    cls: 'status-failed' }
+            'sent':      { text: 'Sent',     cls: 'status-sent' },
+            'searched':  { text: 'Searched', cls: 'status-searched' },
+            'completed': { text: 'Searched', cls: 'status-searched' }, // backward compat
+            'grabbed':   { text: 'Grabbed',  cls: 'status-grabbed' },
+            'failed':    { text: 'Failed',   cls: 'status-failed' }
         };
         const s = statusMap[(status || '').toLowerCase()] || { text: (status || 'Sent'), cls: 'status-sent' };
         return `<span class="status-badge ${s.cls}">${s.text}</span>`;

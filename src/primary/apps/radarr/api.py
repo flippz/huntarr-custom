@@ -8,6 +8,7 @@ import requests
 import json
 import sys
 import time
+import datetime
 import traceback
 from typing import List, Dict, Any, Optional, Union
 # Correct the import path
@@ -497,6 +498,33 @@ def wait_for_command(api_url: str, api_key: str, api_timeout: int, command_id: i
         time.sleep(delay_seconds)
         attempts += 1
     radarr_logger.warning(f"Timed out waiting for command {command_id} to complete")
+    return False
+
+def check_grabbed(api_url: str, api_key: str, api_timeout: int,
+                  movie_id: int = None, search_start_iso: str = None) -> bool:
+    """
+    Check Radarr history for a grab event after search_start_iso.
+    Returns True if a grabbed event is found, False otherwise.
+    """
+    if movie_id is None:
+        return False
+    try:
+        response = arr_request(api_url, api_key, api_timeout, "history",
+                               params={"movieId": movie_id, "pageSize": 20,
+                                       "sortDirection": "descending", "sortKey": "date"},
+                               count_api=False)
+        if not response or 'records' not in response:
+            return False
+        for record in response.get('records', []):
+            if record.get('eventType') != 'grabbed':
+                continue
+            if search_start_iso:
+                grab_date = record.get('date', '').rstrip('Z')
+                if grab_date < search_start_iso:
+                    continue
+            return True
+    except Exception as e:
+        radarr_logger.debug(f"check_grabbed error: {e}")
     return False
 
 def get_tag_id_by_label(api_url: str, api_key: str, api_timeout: int, tag_label: str) -> Optional[int]:

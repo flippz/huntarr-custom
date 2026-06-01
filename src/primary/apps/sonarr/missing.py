@@ -363,7 +363,8 @@ def process_missing_seasons_packs_mode(
         # Refresh functionality has been removed as it was identified as a performance bottleneck
         
         sonarr_logger.info(f"Searching for season pack: {series_title} - Season {season_number} (contains {episode_count} missing episodes)")
-        
+
+        _search_start_iso = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
         # Trigger an API call to search for the entire season (pass instance_name for per-instance API cap)
         command_id = sonarr_api.search_season(api_url, api_key, api_timeout, series_id, season_number, instance_name=instance_name)
         
@@ -394,12 +395,19 @@ def process_missing_seasons_packs_mode(
             # Wait for command to complete if configured
             if command_wait_delay > 0 and command_wait_attempts > 0:
                 _cmd_success = wait_for_command(
-                    api_url, api_key, api_timeout, command_id, 
+                    api_url, api_key, api_timeout, command_id,
                     command_wait_delay, command_wait_attempts, "Season Search", stop_check,
                     instance_name=instance_name
                 )
                 if _entry_id:
-                    update_history_status(_entry_id, 'completed' if _cmd_success else 'failed')
+                    if _cmd_success:
+                        _grabbed = sonarr_api.check_grabbed(api_url, api_key, api_timeout,
+                                                            series_id=series_id,
+                                                            season_number=season_number,
+                                                            search_start_iso=_search_start_iso)
+                        update_history_status(_entry_id, 'grabbed' if _grabbed else 'searched')
+                    else:
+                        update_history_status(_entry_id, 'failed')
         else:
             sonarr_logger.error(f"Failed to trigger search for {series_title}.")
     
@@ -796,10 +804,11 @@ def process_missing_episodes_mode(
             season_episode = f"S{season_number}E{episode_number}"
         
         sonarr_logger.info(f"Processing episode: {series_title} - {season_episode} - {episode_title}")
-        
+
+        _search_start_iso = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
         # Search for this specific episode
         search_successful = sonarr_api.search_episode(api_url, api_key, api_timeout, [episode_id], instance_name=instance_name)
-        
+
         if search_successful:
             processed_any = True
             processed_count += 1
@@ -819,7 +828,13 @@ def process_missing_episodes_mode(
                     command_wait_delay, command_wait_attempts, "Episode Search", stop_check,
                     instance_name=instance_name
                 )
-                update_history_status(_entry_id, 'completed' if _cmd_ok else 'failed')
+                if _cmd_ok:
+                    _grabbed = sonarr_api.check_grabbed(api_url, api_key, api_timeout,
+                                                        episode_id=int(episode_id),
+                                                        search_start_iso=_search_start_iso)
+                    update_history_status(_entry_id, 'grabbed' if _grabbed else 'searched')
+                else:
+                    update_history_status(_entry_id, 'failed')
 
             # Increment statistics
             increment_stat("sonarr", "hunted", 1, instance_name)

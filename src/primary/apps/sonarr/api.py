@@ -126,6 +126,46 @@ def check_connection(api_url: str, api_key: str, api_timeout: int) -> bool:
     from src.primary.apps._common.arr_api import check_connection as _check
     return _check(api_url, api_key, api_timeout, "sonarr", sonarr_logger)
 
+def check_grabbed(api_url: str, api_key: str, api_timeout: int,
+                  episode_id: int = None, series_id: int = None,
+                  season_number: int = None, search_start_iso: str = None) -> bool:
+    """
+    Check Sonarr history for a grab event after search_start_iso.
+
+    - episode_id: filter history to a specific episode (most precise)
+    - series_id + season_number: filter to a specific season
+    - search_start_iso: UTC ISO string (no Z), only grabs at or after this time count
+
+    Returns True if a grabbed event is found, False otherwise.
+    """
+    if episode_id is not None:
+        qs = f"history?pageSize=20&sortDirection=descending&sortKey=date&episodeId={episode_id}"
+    elif series_id is not None:
+        qs = f"history?pageSize=50&sortDirection=descending&sortKey=date&seriesId={series_id}"
+    else:
+        return False
+
+    try:
+        response = arr_request(api_url, api_key, api_timeout, qs, count_api=False)
+        if not response or 'records' not in response:
+            return False
+
+        for record in response.get('records', []):
+            if record.get('eventType') != 'grabbed':
+                continue
+            if search_start_iso:
+                grab_date = record.get('date', '').rstrip('Z')
+                if grab_date < search_start_iso:
+                    continue
+            if season_number is not None and episode_id is None:
+                ep = record.get('episode', {})
+                if ep.get('seasonNumber') != season_number:
+                    continue
+            return True
+    except Exception as e:
+        sonarr_logger.debug(f"check_grabbed error: {e}")
+    return False
+
 def get_system_status(api_url: str, api_key: str, api_timeout: int) -> Dict:
     """
     Get Sonarr system status.
