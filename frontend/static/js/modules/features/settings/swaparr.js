@@ -217,10 +217,10 @@
                         <input type="number" id="swaparr_sleep_duration" value="${settings.sleep_duration
                 ? Math.round(settings.sleep_duration / 60)
                 : 15
-            }" min="10" max="1440" style="width: 120px;">
+            }" min="1" max="1440" style="width: 120px;">
                         <span style="color: #9ca3af; font-size: 14px;">minutes</span>
                     </div>
-                    <p class="setting-help">Time to wait between Swaparr processing cycles (minimum 10 minutes, default: 15 minutes)</p>
+                    <p class="setting-help">Time to wait between Swaparr processing cycles (minimum 1 minute, default: 15 minutes)</p>
                 </div>
                 
             </div>

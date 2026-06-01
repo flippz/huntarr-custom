@@ -544,7 +544,7 @@
             }
 
             const devMode = !!(window.huntarrUI && window.huntarrUI.originalSettings && window.huntarrUI.originalSettings.general && window.huntarrUI.originalSettings.general.dev_mode);
-            const sleepMin = devMode ? 1 : 10;
+            const sleepMin = 1;
 
             // Default port and example URL per app (for placeholder and help text)
             const defaultPortByApp = { sonarr: 8989, radarr: 7878, lidarr: 8686, readarr: 8787, whisparr: 6969, eros: 6969 };

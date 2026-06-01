@@ -204,26 +204,21 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
         'hunt_missing_movies', 'hunt_upgrade_movies', 'hunt_missing_books', 'hunt_upgrade_books'
     ]
     
-    # Sleep duration: min 600s (10 min) normally; min 60s (1 min) when dev mode (allows 1-min, does not force it)
-    # When saving general, use incoming data to avoid load_settings -> save_settings -> is_dev_mode -> load_settings recursion
-    if app_name == 'general':
-        _dev = _is_dev_mode_from_general(settings_data)
-    else:
-        _dev = is_dev_mode()
-    _sleep_min = 60 if _dev else 600
+    # Sleep duration: hard minimum 60s (1 minute) for all modes
+    _sleep_min = 60
     if 'sleep_duration' in settings_data:
         original_value = settings_data['sleep_duration']
         if isinstance(original_value, (int, float)) and original_value < _sleep_min:
             settings_data['sleep_duration'] = _sleep_min
-            settings_logger.warning(f"Sleep duration for {app_name} was {original_value}s, set to minimum {_sleep_min}s" + (" (dev mode)" if _dev else " (10 minutes)"))
-    
+            settings_logger.warning(f"Sleep duration for {app_name} was {original_value}s, set to minimum {_sleep_min}s (1 minute)")
+
     for field in numeric_fields:
         if field in settings_data:
             original_value = settings_data[field]
             if isinstance(original_value, (int, float)) and original_value < 0:
                 settings_data[field] = 0
                 settings_logger.warning(f"{field} for {app_name} was {original_value}, automatically set to minimum allowed value of 0")
-    
+
     # Also validate numeric fields in instances array
     if 'instances' in settings_data and isinstance(settings_data['instances'], list):
         for i, instance in enumerate(settings_data['instances']):
@@ -232,7 +227,7 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
                     original_value = instance['sleep_duration']
                     if isinstance(original_value, (int, float)) and original_value < _sleep_min:
                         instance['sleep_duration'] = _sleep_min
-                        settings_logger.warning(f"Sleep duration for {app_name} instance {i+1} was {original_value}s, set to minimum {_sleep_min}s" + (" (dev mode)" if _dev else " (10 minutes)"))
+                        settings_logger.warning(f"Sleep duration for {app_name} instance {i+1} was {original_value}s, set to minimum {_sleep_min}s (1 minute)")
                 # Enforce hourly_cap max 400 per instance
                 if 'hourly_cap' in instance:
                     original_cap = instance['hourly_cap']
