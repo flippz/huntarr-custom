@@ -1,0 +1,12 @@
+services:
+  huntarr:
+    build: .
+    container_name: huntarr
+    ports:
+      - "9705:9705"
+    volumes:
+      - ./data/config:/config        # database, logs, settings
+      - ./data/downloads:/downloads  # NZB Hunt / Tor Hunt output
+    environment:
+      - TZ=Europe/Amsterdam          # change to your timezone
+    restart: unless-stopped
