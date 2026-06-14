@@ -231,6 +231,23 @@ def check_for_failed_imports(item, settings):
     
     return False, ""
 
+def check_for_download_errors(item, settings):
+    """Check if a download has a download client error (e.g. qBittorrent reporting an error).
+    Targets items where the *arr app status is 'warning' and an error message is present."""
+    if not settings.get("remove_download_errors", False):
+        return False, ""
+
+    error_message = item.get("error_message", "")
+    status = item.get("status", "").lower()
+
+    if not error_message:
+        return False, ""
+
+    if status == "warning":
+        return True, error_message
+
+    return False, ""
+
 def parse_time_string_to_seconds(time_string):
     """Parse a time string like '2h', '30m', '1d' to seconds"""
     if not time_string:
@@ -801,6 +818,34 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                 
                 continue  # Skip to next item - don't process further
             
+            # Check for download client errors FIFTH - immediate removal and optional re-search
+            has_download_error, error_reason = check_for_download_errors(item, settings)
+            if has_download_error:
+                swaparr_logger.warning(f"DOWNLOAD CLIENT ERROR: {item['name']} - {error_reason}")
+
+                if not settings.get("dry_run", False):
+                    trigger_search = settings.get("research_removed", False)
+                    if delete_download(app_name, instance_data["api_url"], instance_data["api_key"], item["id"], True, item, trigger_search):
+                        swaparr_logger.info(f"Successfully removed download with error: {item['name']}")
+
+                        removed_items[item_hash] = {
+                            "name": item["name"],
+                            "removed_time": datetime.utcnow().isoformat(),
+                            "reason": f"Download error: {error_reason}",
+                            "size": item["size"]
+                        }
+                        save_removed_items(app_name, removed_items)
+
+                        item_state = f"REMOVED (Download error: {error_reason})"
+
+                        SWAPARR_STATS['download_error_removed'] = SWAPARR_STATS.get('download_error_removed', 0) + 1
+                        increment_swaparr_stat("download_error_removals", 1)
+                else:
+                    swaparr_logger.info(f"DRY RUN: Would remove download with error: {item['name']} - {error_reason}")
+                    item_state = f"Would Remove (Download error: {error_reason})"
+
+                continue  # Skip to next item - don't process further
+
             # Check if download should be striked
             should_strike = False
             strike_reason = ""

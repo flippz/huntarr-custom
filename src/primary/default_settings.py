@@ -267,7 +267,8 @@ SWAPARR_DEFAULTS = {
     "blocked_quality_patterns": [
         "cam", "camrip", "hdcam", "ts", "telesync", "tc", "telecine",
         "r6", "dvdscr", "dvdscreener", "workprint", "wp"
-    ]
+    ],
+    "remove_download_errors": False
 }
 
 # General settings default configuration

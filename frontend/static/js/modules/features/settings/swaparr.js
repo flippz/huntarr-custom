@@ -172,7 +172,19 @@
                     </label>
                     <p class="setting-help">Automatically detect failed imports, blocklist them, and search for alternatives</p>
                 </div>
-                
+
+                <div class="setting-item">
+                    <label for="swaparr_remove_download_errors">
+                        Remove Download Errors:
+                    </label>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="swaparr_remove_download_errors" ${settings.remove_download_errors === true ? "checked" : ""
+            }>
+                        <span class="toggle-slider"></span>
+                    </label>
+                    <p class="setting-help">Automatically remove downloads that have a warning status with an error from the download client (e.g. "qBittorrent is reporting an error"), blocklist them, and search for alternatives if Re-Search is enabled</p>
+                </div>
+
                 <div class="setting-item">
                     <label for="swaparr_dry_run">
                         Dry Run Mode:
@@ -647,6 +659,9 @@
 
             const failedImport = document.getElementById("swaparr_failed_import_detection");
             if (failedImport) settings.failed_import_detection = failedImport.checked;
+
+            const removeDownloadErrors = document.getElementById("swaparr_remove_download_errors");
+            if (removeDownloadErrors) settings.remove_download_errors = removeDownloadErrors.checked;
 
             const dryRun = document.getElementById("swaparr_dry_run");
             if (dryRun) settings.dry_run = dryRun.checked;

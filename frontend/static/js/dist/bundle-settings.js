@@ -1524,7 +1524,7 @@ document.head.appendChild(styleEl);
             }
 
             const devMode = !!(window.huntarrUI && window.huntarrUI.originalSettings && window.huntarrUI.originalSettings.general && window.huntarrUI.originalSettings.general.dev_mode);
-            const sleepMin = devMode ? 1 : 10;
+            const sleepMin = 1;
 
             // Default port and example URL per app (for placeholder and help text)
             const defaultPortByApp = { sonarr: 8989, radarr: 7878, lidarr: 8686, readarr: 8787, whisparr: 6969, eros: 6969 };
@@ -3318,7 +3318,19 @@ document.head.appendChild(styleEl);
                     </label>
                     <p class="setting-help">Automatically detect failed imports, blocklist them, and search for alternatives</p>
                 </div>
-                
+
+                <div class="setting-item">
+                    <label for="swaparr_remove_download_errors">
+                        Remove Download Errors:
+                    </label>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="swaparr_remove_download_errors" ${settings.remove_download_errors === true ? "checked" : ""
+            }>
+                        <span class="toggle-slider"></span>
+                    </label>
+                    <p class="setting-help">Automatically remove downloads that have a warning status with an error from the download client (e.g. "qBittorrent is reporting an error"), blocklist them, and search for alternatives if Re-Search is enabled</p>
+                </div>
+
                 <div class="setting-item">
                     <label for="swaparr_dry_run">
                         Dry Run Mode:
@@ -3363,10 +3375,10 @@ document.head.appendChild(styleEl);
                         <input type="number" id="swaparr_sleep_duration" value="${settings.sleep_duration
                 ? Math.round(settings.sleep_duration / 60)
                 : 15
-            }" min="10" max="1440" style="width: 120px;">
+            }" min="1" max="1440" style="width: 120px;">
                         <span style="color: #9ca3af; font-size: 14px;">minutes</span>
                     </div>
-                    <p class="setting-help">Time to wait between Swaparr processing cycles (minimum 10 minutes, default: 15 minutes)</p>
+                    <p class="setting-help">Time to wait between Swaparr processing cycles (minimum 1 minute, default: 15 minutes)</p>
                 </div>
                 
             </div>
@@ -3793,6 +3805,9 @@ document.head.appendChild(styleEl);
 
             const failedImport = document.getElementById("swaparr_failed_import_detection");
             if (failedImport) settings.failed_import_detection = failedImport.checked;
+
+            const removeDownloadErrors = document.getElementById("swaparr_remove_download_errors");
+            if (removeDownloadErrors) settings.remove_download_errors = removeDownloadErrors.checked;
 
             const dryRun = document.getElementById("swaparr_dry_run");
             if (dryRun) settings.dry_run = dryRun.checked;
