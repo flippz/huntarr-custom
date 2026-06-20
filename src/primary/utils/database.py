@@ -367,8 +367,9 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 logger.warning(f"Could not recover users: {e}")
 
             try:
-                # Try to read general settings
-                cursor = conn.execute("SELECT setting_key, setting_value FROM general_settings")
+                # Try to read general settings (including setting_type so typed values
+                # like booleans/ints/JSON objects aren't flattened into plain strings)
+                cursor = conn.execute("SELECT setting_key, setting_value, setting_type FROM general_settings")
                 recovered_settings = cursor.fetchall()
                 logger.info(f"Recovered {len(recovered_settings)} setting(s) from corrupted database")
             except Exception as e:
@@ -420,12 +421,12 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                         logger.warning(f"Failed to restore user {user[0]}: {e}")
 
                 # Restore general settings (skip setup_progress to avoid stale state)
-                for key, value in recovered_settings:
+                for key, value, setting_type in recovered_settings:
                     if key != 'setup_progress':
                         try:
                             conn.execute(
-                                "INSERT OR REPLACE INTO general_settings (setting_key, setting_value) VALUES (?, ?)",
-                                (key, value)
+                                "INSERT OR REPLACE INTO general_settings (setting_key, setting_value, setting_type) VALUES (?, ?, ?)",
+                                (key, value, setting_type)
                             )
                         except Exception as e:
                             logger.warning(f"Failed to restore setting {key}: {e}")
