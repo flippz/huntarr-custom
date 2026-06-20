@@ -46,11 +46,15 @@ def _get_qbittorrent_statuses(client_config: Dict[str, Any], download_ids: List[
             use_ssl=bool(client_config.get("use_ssl", False))
         )
 
-        torrents = client.get_torrents(hashes="|".join(download_ids))
+        # Decypharr (unlike real qBittorrent) doesn't honor the `hashes` filter param and
+        # returns an empty list when it's passed, so fetch the full torrent list and match
+        # client-side instead.
+        wanted = {d.lower() for d in download_ids}
+        torrents = client.get_torrents()
         statuses = {}
         for torrent in torrents:
             torrent_hash = (torrent.get("hash") or "").lower()
-            if not torrent_hash:
+            if not torrent_hash or torrent_hash not in wanted:
                 continue
             statuses[torrent_hash] = {
                 "state": torrent.get("state"),
