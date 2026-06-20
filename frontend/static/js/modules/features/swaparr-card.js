@@ -27,12 +27,22 @@ window.HuntarrSwaparr = {
                     document.getElementById('swaparr-strikes').textContent = formatNumber(persistentStats.strikes || 0);
                     document.getElementById('swaparr-removals').textContent = formatNumber(persistentStats.removals || 0);
                     document.getElementById('swaparr-ignored').textContent = formatNumber(persistentStats.ignored || 0);
-                    
+
+                    // Populate the Activity panel's Sonarr instance dropdown (only Swaparr-enabled instances)
+                    if (window.HuntarrSwaparrActivity) {
+                        const sonarrInstances = ((data.configured_instances || {}).sonarr || [])
+                            .filter(inst => inst.swaparr_enabled);
+                        window.HuntarrSwaparrActivity.setInstances(sonarrInstances);
+                    }
+
                     // Setup button event handlers after content is loaded
                     setTimeout(() => {
                         this.setupSwaparrResetCycle();
+                        if (window.HuntarrSwaparrActivity) {
+                            window.HuntarrSwaparrActivity.init();
+                        }
                     }, 100);
-                    
+
                 } else {
                     swaparrCard.style.display = 'none';
                 }

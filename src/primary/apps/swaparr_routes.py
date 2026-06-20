@@ -96,6 +96,7 @@ def get_status():
         for app_name, app_instances in instances.items():
             instances_info[app_name] = [
                 {
+                    "instance_id": instance.get("instance_id"),
                     "instance_name": instance.get("instance_name", "Unknown"),
                     "api_url": instance.get("api_url", "Not configured"),
                     "enabled": instance.get("enabled", False),
@@ -367,10 +368,113 @@ def manual_run():
     except Exception as e:
         swaparr_logger.error(f"Error during manual Swaparr run: {str(e)}")
         return jsonify({
-            "success": False, 
+            "success": False,
             "message": f"Manual run failed: {str(e)}"
         }), 500
 
 
+def _find_instance(app_name, instance_id):
+    """Find a configured instance dict for app_name by instance_id."""
+    instances = get_configured_instances(quiet=True)
+    for instance in instances.get(app_name, []):
+        if instance.get("instance_id") == instance_id:
+            return instance
+    return None
 
- 
+
+def _summarize_sonarr_status(record):
+    """Reduce a raw Sonarr/Radarr queue record to a short status label + detail message."""
+    tracked_status = (record.get("trackedDownloadStatus") or "").strip()
+    tracked_state = (record.get("trackedDownloadState") or "").strip()
+    messages = record.get("statusMessages") or []
+    detail = "; ".join(
+        msg for m in messages for msg in [m.get("title") or ""] if msg
+    ) or record.get("errorMessage") or ""
+
+    if tracked_status.lower() == "error":
+        label = "Error"
+    elif tracked_status.lower() == "warning":
+        label = "Warning"
+    elif tracked_state:
+        label = tracked_state.replace("Pending", "Pending ").title()
+    else:
+        label = (record.get("status") or "Unknown").title()
+
+    return {"label": label, "detail": detail}
+
+
+@swaparr_bp.route('/activity/<app_name>/<instance_id>', methods=['GET'])
+def get_activity(app_name, instance_id):
+    """Live merged view of a queue: Sonarr's own queue records + Swaparr strikes + torrent client status."""
+    try:
+        instance = _find_instance(app_name, instance_id)
+        if not instance:
+            return jsonify({"success": False, "message": "Instance not found"}), 404
+
+        if app_name != "sonarr":
+            return jsonify({"success": False, "message": f"Unsupported app_name: {app_name}"}), 400
+
+        try:
+            from src.primary.apps.sonarr.api import get_queue
+            records = get_queue(instance["api_url"], instance["api_key"], instance.get("api_timeout", 120)) or []
+        except Exception as e:
+            swaparr_logger.error(f"Error fetching queue for {app_name}/{instance_id}: {str(e)}")
+            records = []
+
+        try:
+            strike_data = get_database().get_swaparr_strike_data(app_name)
+        except Exception as e:
+            swaparr_logger.error(f"Error loading strike data for {app_name}: {str(e)}")
+            strike_data = {}
+
+        download_ids = [r.get("downloadId") for r in records if r.get("downloadId")]
+        try:
+            from src.primary.apps.swaparr.torrent_status import get_torrent_statuses
+            torrent_statuses = get_torrent_statuses(instance, download_ids)
+        except Exception as e:
+            swaparr_logger.debug(f"Torrent status lookup unavailable: {e}")
+            torrent_statuses = {}
+
+        settings = load_settings("swaparr")
+        max_strikes = settings.get("max_strikes", 3)
+
+        queue = []
+        for record in records:
+            item_id = str(record.get("id"))
+            strikes = strike_data.get(item_id, {}).get("strikes", 0)
+            torrent_hash = (record.get("downloadId") or "").lower()
+            queue.append({
+                "id": item_id,
+                "name": record.get("title") or record.get("name") or "Unknown",
+                "size": record.get("size"),
+                "sizeleft": record.get("sizeleft"),
+                "sonarr_status": _summarize_sonarr_status(record),
+                "strikes": strikes,
+                "max_strikes": max_strikes,
+                "torrent_status": torrent_statuses.get(torrent_hash)
+            })
+
+        return jsonify({"success": True, "queue": queue, "max_strikes": max_strikes})
+    except Exception as e:
+        swaparr_logger.error(f"Error building activity view for {app_name}/{instance_id}: {str(e)}")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@swaparr_bp.route('/activity/<app_name>/<instance_id>/history', methods=['GET'])
+def get_activity_history(app_name, instance_id):
+    """Paginated history of completed/removed queue items for an instance."""
+    try:
+        instance = _find_instance(app_name, instance_id)
+        if not instance:
+            return jsonify({"success": False, "message": "Instance not found"}), 404
+
+        page = int(request.args.get('page', 1))
+        page_size = int(request.args.get('page_size', 20))
+
+        history = get_database().get_swaparr_activity_history(
+            app_name, instance.get("instance_name"), page, page_size
+        )
+        return jsonify({"success": True, **history})
+    except Exception as e:
+        swaparr_logger.error(f"Error fetching activity history for {app_name}/{instance_id}: {str(e)}")
+        return jsonify({"success": False, "message": str(e)}), 500

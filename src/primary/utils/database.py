@@ -602,7 +602,13 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                                 logger.info(f"Cleaned up {cursor.rowcount} old hunt history entries")
                     except Exception as e:
                         logger.warning(f"Hunt history cleanup failed: {e}")
-                    
+
+                    # Clean up old Swaparr activity history (keep last 15 days)
+                    try:
+                        self.cleanup_swaparr_activity_history(15)
+                    except Exception as e:
+                        logger.warning(f"Swaparr activity history cleanup failed: {e}")
+
                     # Clean up old processed reset requests
                     try:
                         with self.get_connection() as conn:
@@ -929,7 +935,27 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                     UNIQUE(app_name, state_type)
                 )
             ''')
-            
+
+            # Create swaparr_activity_history table - durable record of queue items
+            # that completed normally vs were removed by Swaparr (and why)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS swaparr_activity_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    app_name TEXT NOT NULL,
+                    instance_name TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    item_name TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    reason TEXT,
+                    strikes_at_event INTEGER DEFAULT 0,
+                    occurred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_swaparr_activity_history_lookup
+                ON swaparr_activity_history (app_name, instance_name, occurred_at)
+            ''')
+
             # Create users table for authentication and user management
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS users (

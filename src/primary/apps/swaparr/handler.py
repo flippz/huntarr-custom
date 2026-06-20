@@ -99,6 +99,32 @@ def save_removed_items(app_name, removed_items):
         swaparr_logger.error(f"Error saving removed items for {app_name}: {str(e)}")
         SWAPARR_STATS['errors_encountered'] += 1
 
+def load_queue_snapshot(app_name, instance_name):
+    """Load the previous cycle's queue item snapshot ({item_id: item_name}) for completion detection."""
+    try:
+        db = get_database()
+        data = db.get_swaparr_state_data(app_name, f"queue_snapshot_{instance_name}")
+        return data if data is not None else {}
+    except Exception as e:
+        swaparr_logger.error(f"Error loading queue snapshot for {app_name}/{instance_name}: {str(e)}")
+        return {}
+
+def save_queue_snapshot(app_name, instance_name, snapshot):
+    """Save the current cycle's queue item snapshot for next-cycle completion detection."""
+    try:
+        db = get_database()
+        db.set_swaparr_state_data(app_name, f"queue_snapshot_{instance_name}", snapshot)
+    except Exception as e:
+        swaparr_logger.error(f"Error saving queue snapshot for {app_name}/{instance_name}: {str(e)}")
+
+def log_activity_event(app_name, instance_name, item_id, item_name, event_type, reason=None, strikes_at_event=0):
+    """Best-effort record of a Swaparr activity event (completed/removed) for the Activity history view."""
+    try:
+        db = get_database()
+        db.add_swaparr_activity_event(app_name, instance_name, str(item_id), item_name, event_type, reason, strikes_at_event)
+    except Exception as e:
+        swaparr_logger.error(f"Error logging activity event for {app_name}/{instance_name}: {str(e)}")
+
 def generate_item_hash(item):
     """Generate a unique hash for an item based on its name and size.
     This helps track items across restarts even if their queue ID changes."""
@@ -587,11 +613,17 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
         
         if len(queue_items) == 0:
             return 0
-        
+
         # Load strike data and removed items for this app
         strike_data = load_strike_data(app_name)
         removed_items = load_removed_items(app_name)
-        
+
+        # Snapshot of the queue from the previous cycle, used below to detect items that
+        # left the queue on their own (completed) vs. were removed by Swaparr this cycle
+        previous_queue_snapshot = load_queue_snapshot(app_name, instance_name)
+        current_queue_snapshot = {str(item["id"]): item["name"] for item in queue_items}
+        removed_ids_this_cycle = set()
+
         # Process each queue item
         items_processed_this_run = 0
         for item in queue_items:
@@ -626,6 +658,9 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                             swaparr_logger.info(f"Re-removed previously removed download: {item['name']}")
                             # Update the removal time
                             removed_items[item_hash]["removed_time"] = datetime.utcnow().isoformat()
+                            removed_ids_this_cycle.add(item_id)
+                            log_activity_event(app_name, instance_name, item_id, item['name'], "removed",
+                                                removed_items[item_hash].get("reason", "Re-appeared after previous removal"))
                             # Note: Swaparr uses its own statistics system (SWAPARR_STATS), not the hunting stats manager
                     else:
                         swaparr_logger.info(f"DRY RUN: Would have re-removed previously removed download: {item['name']}")
@@ -700,7 +735,9 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                             "size": item["size"]
                         }
                         save_removed_items(app_name, removed_items)
-                        
+                        removed_ids_this_cycle.add(item_id)
+                        log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Malicious: {malicious_reason}")
+
                         item_state = f"REMOVED (Malicious: {malicious_reason})"
                         
                         # Track malicious removal statistics
@@ -731,7 +768,9 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                             "size": item["size"]
                         }
                         save_removed_items(app_name, removed_items)
-                        
+                        removed_ids_this_cycle.add(item_id)
+                        log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Quality: {quality_reason}")
+
                         item_state = f"REMOVED (Quality: {quality_reason})"
                         
                         # Track quality removal statistics
@@ -775,7 +814,10 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                         # Keep the item in strike data for reference but mark as removed
                         strike_data[item_id]["removed"] = True
                         strike_data[item_id]["removed_time"] = datetime.utcnow().isoformat()
-                        
+                        removed_ids_this_cycle.add(item_id)
+                        log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Age: {age_reason}",
+                                            strike_data[item_id].get("strikes", 0))
+
                         item_state = f"REMOVED (Age: {age_reason})"
                         
                         # Track age removal statistics
@@ -806,7 +848,9 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                             "size": item["size"]
                         }
                         save_removed_items(app_name, removed_items)
-                        
+                        removed_ids_this_cycle.add(item_id)
+                        log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Failed Import: {import_reason}")
+
                         item_state = f"REMOVED (Failed Import: {import_reason})"
                         
                         # Track failed import removal statistics
@@ -835,6 +879,8 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                             "size": item["size"]
                         }
                         save_removed_items(app_name, removed_items)
+                        removed_ids_this_cycle.add(item_id)
+                        log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Download error: {error_reason}")
 
                         item_state = f"REMOVED (Download error: {error_reason})"
 
@@ -942,7 +988,10 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                                 "removed_time": datetime.utcnow().isoformat(),
                                 "reason": strike_reason
                             }
-                            
+                            removed_ids_this_cycle.add(item_id)
+                            log_activity_event(app_name, instance_name, item_id, item['name'], "removed",
+                                                f"Max strikes ({strike_reason})", current_strikes)
+
                             # Note: Swaparr uses its own statistics system (SWAPARR_STATS), not the hunting stats manager
                     else:
                         swaparr_logger.info(f"DRY RUN: Would have removed {item['name']} after {settings.get('max_strikes', 3)} strikes")
@@ -955,10 +1004,19 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
         
         # Save updated strike data
         save_strike_data(app_name, strike_data)
-        
+
         # Save updated removed items list
         save_removed_items(app_name, removed_items)
-        
+
+        # Items that were in the previous snapshot, are no longer in the queue, and weren't
+        # removed by Swaparr this cycle left on their own (imported/completed, or removed
+        # outside Swaparr) - record that for the Activity history view.
+        if not settings.get("dry_run", False):
+            for prev_id, prev_name in previous_queue_snapshot.items():
+                if prev_id not in current_queue_snapshot and prev_id not in removed_ids_this_cycle:
+                    log_activity_event(app_name, instance_name, prev_id, prev_name, "completed")
+        save_queue_snapshot(app_name, instance_name, current_queue_snapshot)
+
         # Update last run time
         SWAPARR_STATS['last_run_time'] = datetime.utcnow().isoformat()
         

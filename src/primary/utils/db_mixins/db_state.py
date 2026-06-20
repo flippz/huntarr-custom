@@ -927,10 +927,72 @@ class StateMixin:
         """Get removed items data for a specific Swaparr app"""
         data = self.get_swaparr_state_data(app_name, "removed_items")
         return data if data is not None else {}
-    
+
     def set_swaparr_removed_items(self, app_name: str, removed_items: Dict[str, Any]):
         """Set removed items data for a specific Swaparr app"""
         self.set_swaparr_state_data(app_name, "removed_items", removed_items)
+
+    # Swaparr Activity History (durable record of completed vs removed queue items)
+    def add_swaparr_activity_event(self, app_name: str, instance_name: str, item_id: str,
+                                    item_name: str, event_type: str, reason: Optional[str] = None,
+                                    strikes_at_event: int = 0) -> None:
+        """Record a Swaparr activity event: an item completed normally or was removed by Swaparr."""
+        with self.get_connection() as conn:
+            conn.execute('''
+                INSERT INTO swaparr_activity_history
+                (app_name, instance_name, item_id, item_name, event_type, reason, strikes_at_event)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (app_name, instance_name, item_id, item_name, event_type, reason, strikes_at_event))
+            conn.commit()
+            logger.debug(f"Swaparr activity event for {app_name}/{instance_name}: {item_name} -> {event_type}")
+
+    def get_swaparr_activity_history(self, app_name: str, instance_name: Optional[str] = None,
+                                      page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """Get Swaparr activity history (completed/removed events) with pagination."""
+        with self.get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+
+            where_conditions = ["app_name = ?"]
+            params: List[Any] = [app_name]
+
+            if instance_name:
+                where_conditions.append("instance_name = ?")
+                params.append(instance_name)
+
+            where_clause = "WHERE " + " AND ".join(where_conditions)
+
+            cursor = conn.execute(f"SELECT COUNT(*) FROM swaparr_activity_history {where_clause}", params)
+            total_entries = cursor.fetchone()[0]
+
+            total_pages = max(1, (total_entries + page_size - 1) // page_size)
+            offset = (page - 1) * page_size
+
+            cursor = conn.execute(
+                f"""SELECT * FROM swaparr_activity_history {where_clause}
+                    ORDER BY occurred_at DESC LIMIT ? OFFSET ?""",
+                params + [page_size, offset]
+            )
+            entries = [dict(row) for row in cursor.fetchall()]
+
+            return {
+                "entries": entries,
+                "total_entries": total_entries,
+                "total_pages": total_pages,
+                "current_page": page,
+                "page_size": page_size
+            }
+
+    def cleanup_swaparr_activity_history(self, days: int = 15) -> int:
+        """Delete Swaparr activity history entries older than the given number of days."""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM swaparr_activity_history WHERE occurred_at < datetime('now', ?)",
+                (f'-{days} days',)
+            )
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.info(f"Cleaned up {cursor.rowcount} old Swaparr activity history entries")
+            return cursor.rowcount
 
     # Reset Request Management Methods (replaces file-based reset system)
     
