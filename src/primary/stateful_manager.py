@@ -23,6 +23,13 @@ APP_TYPES = ["sonarr", "radarr", "lidarr", "readarr", "whisparr", "eros", "movie
 from src.primary.utils.database import get_database
 from src.primary.settings_manager import get_advanced_setting
 
+def _get_expiration_hours() -> int:
+    """Get the stateful_management_hours setting as an int (it may be stored as a string)."""
+    try:
+        return int(get_advanced_setting("stateful_management_hours", DEFAULT_HOURS))
+    except (TypeError, ValueError):
+        return DEFAULT_HOURS
+
 def initialize_lock_file() -> None:
     """Initialize the lock file with the current timestamp if it doesn't exist."""
     db = get_database()
@@ -32,7 +39,7 @@ def initialize_lock_file() -> None:
         try:
             current_time = int(time.time())
             # Get the expiration hours setting
-            expiration_hours = get_advanced_setting("stateful_management_hours", DEFAULT_HOURS)
+            expiration_hours = _get_expiration_hours()
             
             expires_at = current_time + (expiration_hours * 3600)
             
@@ -52,7 +59,7 @@ def get_lock_info() -> Dict[str, Any]:
         # Validate the structure and ensure required fields exist
         if not lock_info or "created_at" not in lock_info:
             current_time = int(time.time())
-            expiration_hours = get_advanced_setting("stateful_management_hours", DEFAULT_HOURS)
+            expiration_hours = _get_expiration_hours()
             expires_at = current_time + (expiration_hours * 3600)
             
             lock_info = {
@@ -63,7 +70,7 @@ def get_lock_info() -> Dict[str, Any]:
             
         if "expires_at" not in lock_info or lock_info["expires_at"] is None:
             # Recalculate expiration if missing
-            expiration_hours = get_advanced_setting("stateful_management_hours", DEFAULT_HOURS)
+            expiration_hours = _get_expiration_hours()
             expires_at = lock_info["created_at"] + (expiration_hours * 3600)
             lock_info["expires_at"] = expires_at
             
@@ -80,7 +87,7 @@ def get_lock_info() -> Dict[str, Any]:
             pass
         # Return default values if there's an error
         current_time = int(time.time())
-        expiration_hours = get_advanced_setting("stateful_management_hours", DEFAULT_HOURS)
+        expiration_hours = _get_expiration_hours()
         expires_at = current_time + (expiration_hours * 3600)
         
         return {
@@ -91,7 +98,7 @@ def get_lock_info() -> Dict[str, Any]:
 def update_lock_expiration(hours: int = None) -> bool:
     """Update the lock expiration based on the hours setting."""
     if hours is None:
-        expiration_hours = get_advanced_setting("stateful_management_hours", DEFAULT_HOURS)
+        expiration_hours = _get_expiration_hours()
     else:
         expiration_hours = hours
     
@@ -124,7 +131,7 @@ def reset_stateful_management() -> bool:
         db = get_database()
         
         # Get the expiration hours setting BEFORE writing the lock info
-        expiration_hours = get_advanced_setting("stateful_management_hours", DEFAULT_HOURS)
+        expiration_hours = _get_expiration_hours()
         
         # Create new lock info with calculated expiration
         current_time = int(time.time())
@@ -304,7 +311,7 @@ def get_stateful_management_info() -> Dict[str, Any]:
     expires_at_ts = lock_info.get("expires_at")
     
     # Get the interval setting
-    expiration_hours = get_advanced_setting("stateful_management_hours", DEFAULT_HOURS)
+    expiration_hours = _get_expiration_hours()
 
     return {
         "created_at_ts": created_at_ts,
@@ -331,7 +338,7 @@ def get_state_management_summary(app_type: str, instance_name: str, instance_hou
         if instance_hours is not None:
             expiration_hours = instance_hours
         else:
-            expiration_hours = get_advanced_setting("stateful_management_hours", DEFAULT_HOURS)
+            expiration_hours = _get_expiration_hours()
         
         # Initialize per-instance state management if not already done
         db.initialize_instance_state_management(app_type, instance_name, expiration_hours)
@@ -397,7 +404,7 @@ def get_next_reset_time() -> Optional[str]:
         user_tz = _get_user_timezone()
         
         # Get reset interval in hours
-        reset_interval = get_advanced_setting("stateful_management_hours", DEFAULT_HOURS)
+        reset_interval = _get_expiration_hours()
         
         # Get last reset time and calculate next reset (use 'sonarr' as default for global state)
         last_reset = get_last_reset_time('sonarr')  # Pass app_type parameter
@@ -475,7 +482,7 @@ def initialize_stateful_system():
     try:
         initialize_lock_file()
         # Update expiration time
-        expiration_hours = get_advanced_setting("stateful_management_hours", DEFAULT_HOURS)
+        expiration_hours = _get_expiration_hours()
         update_lock_expiration(expiration_hours)
         stateful_logger.info(f"Stateful lock initialized in database with {expiration_hours} hour expiration")
     except Exception as e:

@@ -85,8 +85,11 @@ def check_state_reset(app_type: str) -> bool:
         return False
         
     # Use a longer default interval (3 days = 72 hours) to prevent too frequent resets
-    reset_interval = settings_manager.get_advanced_setting("stateful_management_hours", 72)
-    
+    try:
+        reset_interval = int(settings_manager.get_advanced_setting("stateful_management_hours", 72))
+    except (TypeError, ValueError):
+        reset_interval = 72
+
     last_reset = get_last_reset_time(app_type)
     now = datetime.datetime.now()
     
@@ -144,10 +147,13 @@ def calculate_reset_time(app_type: str) -> str:
         logger.error("calculate_reset_time called without app_type.")
         return "Next reset: Unknown (app type not provided)"
         
-    reset_interval = settings_manager.get_advanced_setting("stateful_management_hours", 72)
-    
+    try:
+        reset_interval = int(settings_manager.get_advanced_setting("stateful_management_hours", 72))
+    except (TypeError, ValueError):
+        reset_interval = 72
+
     last_reset = get_last_reset_time(app_type)
-    
+
     # Get user's timezone for consistent time display
     user_tz = _get_user_timezone()
     

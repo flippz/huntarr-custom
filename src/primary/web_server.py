@@ -780,6 +780,13 @@ def save_general_settings():
             timezone_changed = True
             general_logger.info(f"Timezone changed from {current_timezone} to {new_timezone}")
     
+    # Coerce numeric fields that may arrive as strings from form inputs
+    if 'stateful_management_hours' in data:
+        try:
+            data['stateful_management_hours'] = int(data['stateful_management_hours'])
+        except (ValueError, TypeError):
+            del data['stateful_management_hours']
+
     # Merge incoming data with current general settings so we never drop keys (e.g. show_trending)
     current = settings_manager.load_settings('general')
     merged = {**current, **data}

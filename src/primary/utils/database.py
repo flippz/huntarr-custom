@@ -351,9 +351,10 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
             except Exception:
                 pass
         
-        # Strategy 1: Try to salvage critical data (users, settings) from corrupted DB
+        # Strategy 1: Try to salvage critical data (users, settings, app configs) from corrupted DB
         recovered_users = []
         recovered_settings = []
+        recovered_app_configs = []
         try:
             conn = sqlite3.connect(backup_path, timeout=10)
             conn.execute('PRAGMA journal_mode = OFF')  # Don't use WAL on corrupted file
@@ -364,7 +365,7 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 logger.info(f"Recovered {len(recovered_users)} user(s) from corrupted database")
             except Exception as e:
                 logger.warning(f"Could not recover users: {e}")
-            
+
             try:
                 # Try to read general settings
                 cursor = conn.execute("SELECT setting_key, setting_value FROM general_settings")
@@ -372,7 +373,15 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 logger.info(f"Recovered {len(recovered_settings)} setting(s) from corrupted database")
             except Exception as e:
                 logger.warning(f"Could not recover settings: {e}")
-            
+
+            try:
+                # Try to read app configs (Sonarr/Radarr/etc instances) - critical user data
+                cursor = conn.execute("SELECT app_type, config_data FROM app_configs")
+                recovered_app_configs = cursor.fetchall()
+                logger.info(f"Recovered {len(recovered_app_configs)} app config(s) from corrupted database")
+            except Exception as e:
+                logger.warning(f"Could not recover app configs: {e}")
+
             conn.close()
         except Exception as e:
             logger.warning(f"Could not open corrupted database for recovery: {e}")
@@ -391,14 +400,14 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
             logger.error(f"Error removing corrupted database: {rm_error}")
         
         # Strategy 2: Recreate database and restore recovered data
-        if recovered_users or recovered_settings:
+        if recovered_users or recovered_settings or recovered_app_configs:
             try:
                 # Create fresh database with tables
                 self.ensure_database_exists()
-                
+
                 conn = sqlite3.connect(self.db_path, timeout=30)
                 self._configure_connection(conn)
-                
+
                 # Restore users
                 for user in recovered_users:
                     try:
@@ -409,7 +418,7 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                         logger.info(f"Restored user: {user[0]}")
                     except Exception as e:
                         logger.warning(f"Failed to restore user {user[0]}: {e}")
-                
+
                 # Restore general settings (skip setup_progress to avoid stale state)
                 for key, value in recovered_settings:
                     if key != 'setup_progress':
@@ -420,11 +429,22 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                             )
                         except Exception as e:
                             logger.warning(f"Failed to restore setting {key}: {e}")
-                
+
+                # Restore app configs (Sonarr/Radarr/etc instances) - prevents silent data loss
+                for app_type, config_data in recovered_app_configs:
+                    try:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO app_configs (app_type, config_data, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                            (app_type, config_data)
+                        )
+                        logger.info(f"Restored app config: {app_type}")
+                    except Exception as e:
+                        logger.warning(f"Failed to restore app config {app_type}: {e}")
+
                 conn.commit()
                 conn.close()
                 logger.info("Successfully restored critical data from corrupted database")
-                
+
             except Exception as restore_error:
                 logger.error(f"Failed to restore data to fresh database: {restore_error}")
         else:
