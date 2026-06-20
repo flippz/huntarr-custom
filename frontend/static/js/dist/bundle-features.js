@@ -6948,9 +6948,12 @@ window.HuntarrSwaparrActivity = {
 
             const torrent = item.torrent_status;
             const torrentHtml = torrent ? (torrent.state || '-') : '-';
+            const nameHtml = item.episode_count > 1
+                ? `${item.name} <span class="swaparr-activity-badge">${item.episode_count} episodes</span>`
+                : item.name;
 
             return `<tr>
-                <td>${item.name}</td>
+                <td>${nameHtml}</td>
                 <td>${this.formatBytes(item.size)}</td>
                 <td>${statusHtml}${status.detail ? `<div class="swaparr-activity-empty" style="text-align:left;padding:2px 0;">${status.detail}</div>` : ''}</td>
                 <td>${item.strikes}/${item.max_strikes}</td>

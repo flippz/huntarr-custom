@@ -438,21 +438,33 @@ def get_activity(app_name, instance_id):
         settings = load_settings("swaparr")
         max_strikes = settings.get("max_strikes", 3)
 
-        queue = []
+        # Sonarr returns one queue record per episode, so a single season-pack torrent shows
+        # up as several records sharing the same downloadId. Group those into one row.
+        groups = {}
+        group_order = []
         for record in records:
             item_id = str(record.get("id"))
             strikes = strike_data.get(item_id, {}).get("strikes", 0)
-            torrent_hash = (record.get("downloadId") or "").lower()
-            queue.append({
-                "id": item_id,
-                "name": record.get("title") or record.get("name") or "Unknown",
-                "size": record.get("size"),
-                "sizeleft": record.get("sizeleft"),
-                "sonarr_status": _summarize_sonarr_status(record),
-                "strikes": strikes,
-                "max_strikes": max_strikes,
-                "torrent_status": torrent_statuses.get(torrent_hash)
-            })
+            group_key = record.get("downloadId") or f"__no_download_id_{item_id}"
+
+            if group_key not in groups:
+                groups[group_key] = {
+                    "id": item_id,
+                    "name": record.get("title") or record.get("name") or "Unknown",
+                    "size": record.get("size"),
+                    "sizeleft": record.get("sizeleft"),
+                    "sonarr_status": _summarize_sonarr_status(record),
+                    "strikes": strikes,
+                    "max_strikes": max_strikes,
+                    "torrent_status": torrent_statuses.get((record.get("downloadId") or "").lower()),
+                    "episode_count": 1
+                }
+                group_order.append(group_key)
+            else:
+                groups[group_key]["episode_count"] += 1
+                groups[group_key]["strikes"] = max(groups[group_key]["strikes"], strikes)
+
+        queue = [groups[key] for key in group_order]
 
         return jsonify({"success": True, "queue": queue, "max_strikes": max_strikes})
     except Exception as e:
