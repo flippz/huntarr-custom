@@ -241,6 +241,18 @@ PROWLARR_DEFAULTS = {
     "enabled": False
 }
 
+# NZBDav default configuration - 3rd party Usenet download client status integration.
+# NZBDav exposes a SABnzbd-compatible API at /api requiring its own api_key (separate
+# from any *arr download client config, which always masks the key on read).
+NZBDAV_DEFAULTS = {
+    "name": "NZBDav",
+    "host": "",
+    "port": 3123,
+    "api_key": "",
+    "use_ssl": False,
+    "enabled": False
+}
+
 # Swaparr default configuration
 SWAPARR_DEFAULTS = {
     "enabled": False,
@@ -342,6 +354,7 @@ def get_default_config(app_type: str) -> Dict[str, Any]:
         'whisparr': WHISPARR_DEFAULTS,
         'eros': EROS_DEFAULTS,
         'prowlarr': PROWLARR_DEFAULTS,
+        'nzbdav': NZBDAV_DEFAULTS,
         'swaparr': SWAPARR_DEFAULTS,
         'movie_hunt': MOVIE_HUNT_DEFAULTS,
         'tv_hunt': TV_HUNT_DEFAULTS,
@@ -394,4 +407,4 @@ def get_tv_hunt_instance_settings_defaults() -> Dict[str, Any]:
 
 def get_all_app_types() -> list:
     """Get list of all supported app types."""
-    return ['sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'eros', 'swaparr', 'prowlarr', 'general']
+    return ['sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'eros', 'swaparr', 'prowlarr', 'nzbdav', 'general']

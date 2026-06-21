@@ -17,7 +17,8 @@
                 readarr: 'fa-book',
                 whisparr: 'fa-venus',
                 eros: 'fa-venus-mars',
-                prowlarr: 'fa-search'
+                prowlarr: 'fa-search',
+                nzbdav: 'fa-newspaper'
             };
             return icons[appType] || 'fa-server';
         },

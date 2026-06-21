@@ -35,7 +35,7 @@ from src.primary.routes.common import common_bp
 from src.primary.routes.media_hunt import movie_hunt_bp, tv_hunt_bp
 from src.primary.routes.plex_auth_routes import plex_auth_bp
 # Import blueprints for each app from the centralized blueprints module
-from src.primary.apps.blueprints import sonarr_bp, radarr_bp, lidarr_bp, readarr_bp, whisparr_bp, eros_bp, swaparr_bp, requestarr_bp, prowlarr_bp
+from src.primary.apps.blueprints import sonarr_bp, radarr_bp, lidarr_bp, readarr_bp, whisparr_bp, eros_bp, swaparr_bp, requestarr_bp, prowlarr_bp, nzbdav_bp
 
 # Import stateful blueprint
 from src.primary.stateful_routes import stateful_api
@@ -312,6 +312,7 @@ app.register_blueprint(whisparr_bp, url_prefix='/api/whisparr')
 app.register_blueprint(eros_bp, url_prefix='/api/eros')
 app.register_blueprint(swaparr_bp, url_prefix='/api/swaparr')
 app.register_blueprint(prowlarr_bp, url_prefix='/api/prowlarr')
+app.register_blueprint(nzbdav_bp, url_prefix='/api/nzbdav')
 app.register_blueprint(requestarr_bp)
 
 # Import and register Requestarr user management + services blueprints

@@ -178,6 +178,13 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
                 swaparr_logger.debug(f"Decypharr log lookup unavailable during history scan: {e}")
                 decypharr_errors = {}
 
+            try:
+                from src.primary.apps.nzbdav_routes import get_nzbdav_failure_context
+                nzbdav_errors = get_nzbdav_failure_context(failed_names)
+            except Exception as e:
+                swaparr_logger.debug(f"NZBDav history lookup unavailable during history scan: {e}")
+                nzbdav_errors = {}
+
             for record in new_events:
                 name = record.get("sourceTitle") or "Unknown"
                 if db.has_recent_swaparr_activity(app_name, instance_name, name, hours=2):
@@ -190,10 +197,20 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
                 if record.get("eventType") == "downloadFolderImported":
                     log_activity_event(app_name, instance_name, download_id, name, "completed")
                 else:
+                    # Sonarr's own message for this event is the most direct signal available
+                    # (e.g. a download client error or "Manually marked as failed"); surface it
+                    # before falling back to the generic label.
+                    sonarr_message = (record.get("data") or {}).get("message")
+                    base_reason = f"Failed in Sonarr: {sonarr_message}" if sonarr_message else "Failed in Sonarr"
+
                     decypharr_error = decypharr_errors.get(name)
                     decypharr_note = f"; Decypharr: {decypharr_error}" if decypharr_error else ""
+
+                    nzbdav_error = nzbdav_errors.get(name)
+                    nzbdav_note = f"; NZBDav: {nzbdav_error}" if nzbdav_error else ""
+
                     log_activity_event(app_name, instance_name, download_id, name, "removed",
-                                        f"Failed in Sonarr{torrent_note}{decypharr_note}")
+                                        f"{base_reason}{torrent_note}{decypharr_note}{nzbdav_note}")
 
         if not last_seen_date or newest_date > last_seen_date:
             db.set_swaparr_state_data(app_name, f"history_checkpoint_{instance_name}", {"last_date": newest_date})

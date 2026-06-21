@@ -48,6 +48,7 @@ BUNDLES = [
             "modules/features/settings/readarr.js",
             "modules/features/settings/whisparr.js",
             "modules/features/settings/prowlarr.js",
+            "modules/features/settings/nzbdav.js",
             "modules/features/settings/swaparr.js",
             "modules/features/settings/indexer-editor.js",
             "modules/features/settings/indexers.js",

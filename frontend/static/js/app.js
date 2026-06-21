@@ -1649,6 +1649,12 @@ let huntarrUI = {
         }
     },
 
+    initializeNzbdav: function () {
+        if (window.HuntarrInit) {
+            window.HuntarrInit.initializeNzbdav();
+        }
+    },
+
     initializeUser: function () {
         if (window.HuntarrInit) {
             window.HuntarrInit.initializeUser();

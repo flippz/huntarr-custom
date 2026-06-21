@@ -1651,6 +1651,12 @@ let huntarrUI = {
         }
     },
 
+    initializeNzbdav: function () {
+        if (window.HuntarrInit) {
+            window.HuntarrInit.initializeNzbdav();
+        }
+    },
+
     initializeUser: function () {
         if (window.HuntarrInit) {
             window.HuntarrInit.initializeUser();
@@ -1762,7 +1768,7 @@ Object.assign(huntarrUI, {
         var requestarrSections = ['requestarr', 'requestarr-discover', 'requestarr-movies', 'requestarr-tv', 'requestarr-smarthunt', 'requestarr-hidden', 'requestarr-personal-blacklist', 'requestarr-options', 'requestarr-filters', 'requestarr-settings', 'requestarr-smarthunt-settings', 'requestarr-users', 'requestarr-bundles', 'requestarr-requests', 'requestarr-global-blacklist'];
         var mediaHuntSections = ['media-hunt-collection', 'media-hunt-settings', 'media-hunt-instances', 'media-hunt-calendar', 'activity-queue', 'activity-history', 'activity-blocklist', 'activity-logs', 'logs-media-hunt', 'indexer-hunt', 'indexer-hunt-stats', 'indexer-hunt-history', 'settings-clients', 'settings-media-management', 'settings-profiles', 'settings-sizes', 'settings-custom-formats', 'settings-import-lists', 'settings-import-media', 'settings-root-folders', 'settings-instance-management', 'movie-hunt-instance-editor', 'profile-editor'];
         var nzbHuntSections = ['nzb-hunt-home', 'nzb-hunt-activity', 'nzb-hunt-folders', 'nzb-hunt-servers', 'nzb-hunt-advanced', 'nzb-hunt-server-editor'];
-        var thirdPartyAppSections = ['sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'eros', 'prowlarr', 'swaparr'];
+        var thirdPartyAppSections = ['sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'eros', 'prowlarr', 'swaparr', 'nzbdav'];
         if (this._enableRequestarr === false && requestarrSections.indexOf(section) !== -1) {
             console.log('[huntarrUI] Requests disabled - redirecting to home');
             this.switchSection('home'); return;
@@ -1822,6 +1828,14 @@ Object.assign(huntarrUI, {
             if (this.currentSection === 'prowlarr' && window.SettingsForms && typeof window.SettingsForms.checkUnsavedChanges === 'function') {
                 if (!window.SettingsForms.checkUnsavedChanges()) {
                     console.log(`[huntarrUI] Navigation cancelled due to unsaved Prowlarr changes`);
+                    return; // User chose to stay and save changes
+                }
+            }
+
+            // Check for unsaved NZBDav changes if leaving NZBDav section
+            if (this.currentSection === 'nzbdav' && window.SettingsForms && typeof window.SettingsForms.checkUnsavedChanges === 'function') {
+                if (!window.SettingsForms.checkUnsavedChanges()) {
+                    console.log(`[huntarrUI] Navigation cancelled due to unsaved NZBDav changes`);
                     return; // User chose to stay and save changes
                 }
             }
@@ -3227,6 +3241,18 @@ Object.assign(huntarrUI, {
 
             // Initialize prowlarr settings if not already done
             this.initializeProwlarr();
+        } else if (section === 'nzbdav' && document.getElementById('nzbdavSection')) {
+            document.getElementById('nzbdavSection').classList.add('active');
+            document.getElementById('nzbdavSection').style.display = 'block';
+            if (document.getElementById('appsNzbdavNav')) document.getElementById('appsNzbdavNav').classList.add('active');
+            newTitle = 'NZBDav';
+            this.currentSection = 'nzbdav';
+
+            // Switch to Apps sidebar for nzbdav
+            this.showAppsSidebar();
+
+            // Initialize nzbdav settings if not already done
+            this.initializeNzbdav();
         } else if (section === 'user' && document.getElementById('userSection')) {
             document.getElementById('userSection').classList.add('active');
             document.getElementById('userSection').style.display = 'block';

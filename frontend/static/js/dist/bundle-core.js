@@ -1298,6 +1298,30 @@ window.HuntarrInit = {
             });
     },
 
+    initializeNzbdav: function() {
+        console.log('[HuntarrInit] initializeNzbdav called');
+        const nzbdavContainer = document.getElementById('nzbdavContainer');
+        if (!nzbdavContainer) return;
+
+        const currentContent = nzbdavContainer.innerHTML.trim();
+        if (currentContent !== '' && !currentContent.includes('<!-- NZBDav content will be loaded here -->')) return;
+
+        fetch('./api/settings')
+            .then(response => response.json())
+            .then(settings => {
+                if (window.huntarrUI) window.huntarrUI.originalSettings.nzbdav = settings.nzbdav;
+                if (typeof SettingsForms !== 'undefined' && SettingsForms.generateNzbdavForm) {
+                    SettingsForms.generateNzbdavForm(nzbdavContainer, settings.nzbdav || {});
+                } else {
+                    nzbdavContainer.innerHTML = '<p>Error: NZBDav forms not loaded</p>';
+                }
+            })
+            .catch(error => {
+                console.error('[HuntarrInit] Error loading nzbdav settings:', error);
+                nzbdavContainer.innerHTML = '<p>Error loading nzbdav settings</p>';
+            });
+    },
+
     initializeUser: function() {
         console.log('[HuntarrInit] initializeUser called');
         if (typeof UserModule !== 'undefined') {
