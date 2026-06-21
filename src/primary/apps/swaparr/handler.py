@@ -117,44 +117,79 @@ def save_queue_snapshot(app_name, instance_name, snapshot):
     except Exception as e:
         swaparr_logger.error(f"Error saving queue snapshot for {app_name}/{instance_name}: {str(e)}")
 
-def determine_departure_outcome(app_name, instance_data, download_id):
-    """Figure out what actually happened to a download that left the queue, instead of just
-    assuming it completed. Checks Sonarr's history for an import/failure event for this
-    downloadId, falling back to the torrent client's last known status if history is
-    inconclusive (e.g. the user deleted it directly in the client).
+def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
+    """Poll Sonarr's own /history directly for completed imports and Sonarr-side failures,
+    logging them to the Activity history. This is the authoritative source for "did this
+    download actually finish" - a once-per-cycle queue snapshot comparison missed the vast
+    majority of real completions, since Decypharr/debrid downloads can enter and leave the
+    queue within seconds, well inside a single ~15 minute Swaparr cycle.
 
-    Returns (event_type, reason) where event_type is 'completed' or 'removed'.
+    Tracks a per-instance checkpoint (last event date seen) so each cycle only processes
+    new events. Best-effort: any failure here is logged and swallowed, never raised.
     """
-    if app_name == "sonarr" and download_id:
-        try:
-            from src.primary.apps.sonarr.api import get_history_for_download
-            history = get_history_for_download(
-                instance_data["api_url"], instance_data["api_key"],
-                instance_data.get("api_timeout", 120), download_id
-            )
-            for event in history:
-                event_type = event.get("eventType")
-                if event_type == "downloadFolderImported":
-                    return "completed", None
-                if event_type == "downloadFailed":
-                    return "removed", "Failed in Sonarr"
-        except Exception as e:
-            swaparr_logger.debug(f"Error checking Sonarr history for departed download {download_id}: {e}")
+    if app_name != "sonarr":
+        return
+    try:
+        db = get_database()
+        checkpoint = db.get_swaparr_state_data(app_name, f"history_checkpoint_{instance_name}") or {}
+        last_seen_date = checkpoint.get("last_date")
 
-        try:
-            from src.primary.apps.swaparr.torrent_status import get_torrent_statuses
-            statuses = get_torrent_statuses(instance_data, [download_id])
-            torrent = statuses.get(download_id.lower())
-            if torrent:
-                return "removed", f"Removed outside Swaparr (torrent client status: {torrent.get('state')})"
-        except Exception as e:
-            swaparr_logger.debug(f"Error checking torrent client for departed download {download_id}: {e}")
+        from src.primary.apps.sonarr.api import arr_request
+        response = arr_request(
+            instance_data["api_url"], instance_data["api_key"], instance_data.get("api_timeout", 120),
+            "history?pageSize=250&sortDirection=descending&sortKey=date", count_api=False
+        )
+        records = (response or {}).get("records", [])
+        if not records:
+            return
 
-        return "removed", "Removed outside Swaparr (no Sonarr import/failure event found)"
+        newest_date = records[0].get("date")
 
-    # No download_id to check, or an app type without history support yet - fall back to
-    # the previous best-effort assumption.
-    return "completed", None
+        # Collect the new, relevant events first so torrent client status can be looked up
+        # for all of them in a single batched call to Decypharr/qBittorrent, instead of one
+        # request per item - this gives the full Swaparr + Sonarr + torrent-client picture.
+        new_events = []
+        seen_download_ids = set()
+        for record in reversed(records):  # oldest first, so activity history reads chronologically
+            event_date = record.get("date")
+            if not event_date or (last_seen_date and event_date <= last_seen_date):
+                continue
+            event_type = record.get("eventType")
+            download_id = record.get("downloadId")
+            if event_type not in ("downloadFolderImported", "downloadFailed") or not download_id:
+                continue
+            if download_id in seen_download_ids:
+                continue
+            seen_download_ids.add(download_id)
+            new_events.append(record)
+
+        if new_events:
+            try:
+                from src.primary.apps.swaparr.torrent_status import get_torrent_statuses
+                torrent_statuses = get_torrent_statuses(instance_data, [r.get("downloadId") for r in new_events])
+            except Exception as e:
+                swaparr_logger.debug(f"Torrent status lookup unavailable during history scan: {e}")
+                torrent_statuses = {}
+
+            for record in new_events:
+                name = record.get("sourceTitle") or "Unknown"
+                if db.has_recent_swaparr_activity(app_name, instance_name, name, hours=2):
+                    continue
+
+                download_id = record.get("downloadId")
+                torrent = torrent_statuses.get((download_id or "").lower())
+                torrent_note = f" (torrent client status: {torrent.get('state')})" if torrent else ""
+
+                if record.get("eventType") == "downloadFolderImported":
+                    log_activity_event(app_name, instance_name, download_id, name, "completed")
+                else:
+                    log_activity_event(app_name, instance_name, download_id, name, "removed",
+                                        f"Failed in Sonarr{torrent_note}")
+
+        if not last_seen_date or newest_date > last_seen_date:
+            db.set_swaparr_state_data(app_name, f"history_checkpoint_{instance_name}", {"last_date": newest_date})
+    except Exception as e:
+        swaparr_logger.error(f"Error scanning Sonarr history for activity ({instance_name}): {e}")
 
 def log_activity_event(app_name, instance_name, item_id, item_name, event_type, reason=None, strikes_at_event=0):
     """Best-effort record of a Swaparr activity event (completed/removed) for the Activity history view."""
@@ -647,10 +682,14 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             swaparr_logger.warning(f"Swaparr was disabled during download processing for {app_name} instance: {instance_name}. Stopping processing.")
             return 0
         
+        # Scan Sonarr's own history for completions/failures regardless of current queue
+        # state - this is independent of the queue-watching logic below.
+        scan_sonarr_history_for_activity(app_name, instance_name, instance_data)
+
         # Get the download queue
         queue_response = get_queue_items(app_name, instance_data["api_url"], instance_data["api_key"])
         queue_items = queue_response
-        
+
         if len(queue_items) == 0:
             return 0
 
@@ -1046,25 +1085,21 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             swaparr_logger.debug(f"Processed download: {item['name']} - State: {item_state}")
         
         # Items that were in the previous snapshot but are no longer in the queue have left
-        # for good this cycle (imported/completed, removed by Swaparr, or removed some other
-        # way). Purge their strike_data entry now: Sonarr can reuse the same queue item id for
-        # a *later, unrelated* grab of the same episode, and leaving stale strike/age data
-        # behind caused fresh re-grabs to be immediately flagged as "8 days old" and removed
-        # by check_age_based_removal even though they'd only just started downloading.
+        # for good this cycle. Purge their strike_data entry now: Sonarr can reuse the same
+        # queue item id for a *later, unrelated* grab of the same episode, and leaving stale
+        # strike/age data behind caused fresh re-grabs to be immediately flagged as "8 days
+        # old" and removed by check_age_based_removal even though they'd only just started
+        # downloading.
+        #
+        # Note: completion/failure activity logging is handled separately by
+        # scan_sonarr_history_for_activity(), not here - items routinely enter and leave
+        # the queue within a single cycle (Decypharr/debrid downloads can complete in
+        # seconds), so a once-per-cycle queue snapshot comparison missed the vast majority
+        # of real completions. Sonarr's own /history is the authoritative, real-time source.
         if not settings.get("dry_run", False):
-            for prev_id, prev_value in previous_queue_snapshot.items():
-                if prev_id in current_queue_snapshot:
-                    continue
-                strike_data.pop(prev_id, None)
-                if prev_id in removed_ids_this_cycle:
-                    continue
-
-                # Snapshots saved before this lookup existed stored a plain name string
-                prev_name = prev_value.get("name") if isinstance(prev_value, dict) else prev_value
-                prev_download_id = prev_value.get("download_id") if isinstance(prev_value, dict) else None
-
-                event_type, reason = determine_departure_outcome(app_name, instance_data, prev_download_id)
-                log_activity_event(app_name, instance_name, prev_id, prev_name, event_type, reason)
+            for prev_id in previous_queue_snapshot:
+                if prev_id not in current_queue_snapshot:
+                    strike_data.pop(prev_id, None)
 
         # Save updated strike data
         save_strike_data(app_name, strike_data)

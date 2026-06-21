@@ -994,6 +994,18 @@ class StateMixin:
                 logger.info(f"Cleaned up {cursor.rowcount} old Swaparr activity history entries")
             return cursor.rowcount
 
+    def has_recent_swaparr_activity(self, app_name: str, instance_name: str, item_name: str, hours: int = 2) -> bool:
+        """Check if an activity event for this item was already logged recently, to avoid
+        double-logging the same departure from two different detection paths."""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                """SELECT 1 FROM swaparr_activity_history
+                   WHERE app_name = ? AND instance_name = ? AND item_name = ?
+                   AND occurred_at > datetime('now', ?) LIMIT 1""",
+                (app_name, instance_name, item_name, f'-{hours} hours')
+            )
+            return cursor.fetchone() is not None
+
     # Reset Request Management Methods (replaces file-based reset system)
     
     def create_reset_request(self, app_type: str, instance_name: Optional[str] = None) -> bool:
