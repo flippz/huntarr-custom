@@ -165,11 +165,18 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
 
         if new_events:
             try:
-                from src.primary.apps.swaparr.torrent_status import get_torrent_statuses
+                from src.primary.apps.swaparr.torrent_status import get_torrent_statuses, get_decypharr_failure_context
                 torrent_statuses = get_torrent_statuses(instance_data, [r.get("downloadId") for r in new_events])
             except Exception as e:
                 swaparr_logger.debug(f"Torrent status lookup unavailable during history scan: {e}")
                 torrent_statuses = {}
+
+            failed_names = [r.get("sourceTitle") for r in new_events if r.get("eventType") == "downloadFailed" and r.get("sourceTitle")]
+            try:
+                decypharr_errors = get_decypharr_failure_context(instance_data, failed_names)
+            except Exception as e:
+                swaparr_logger.debug(f"Decypharr log lookup unavailable during history scan: {e}")
+                decypharr_errors = {}
 
             for record in new_events:
                 name = record.get("sourceTitle") or "Unknown"
@@ -183,8 +190,10 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
                 if record.get("eventType") == "downloadFolderImported":
                     log_activity_event(app_name, instance_name, download_id, name, "completed")
                 else:
+                    decypharr_error = decypharr_errors.get(name)
+                    decypharr_note = f"; Decypharr: {decypharr_error}" if decypharr_error else ""
                     log_activity_event(app_name, instance_name, download_id, name, "removed",
-                                        f"Failed in Sonarr{torrent_note}")
+                                        f"Failed in Sonarr{torrent_note}{decypharr_note}")
 
         if not last_seen_date or newest_date > last_seen_date:
             db.set_swaparr_state_data(app_name, f"history_checkpoint_{instance_name}", {"last_date": newest_date})
