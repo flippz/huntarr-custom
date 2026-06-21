@@ -166,6 +166,32 @@ def check_grabbed(api_url: str, api_key: str, api_timeout: int,
         sonarr_logger.debug(f"check_grabbed error: {e}")
     return False
 
+def get_history_for_download(api_url: str, api_key: str, api_timeout: int, download_id: str) -> List[Dict]:
+    """
+    Get Sonarr history events for a specific download (by downloadId, the torrent/nzb hash).
+
+    Used to verify what actually happened to a download after it leaves the queue -
+    e.g. eventType 'downloadFolderImported' means it was imported successfully,
+    'downloadFailed' means Sonarr gave up on it.
+
+    Note: Sonarr's /history endpoint does not actually filter by a `downloadId` query
+    param (it's silently ignored, returning an empty page) - so this fetches a recent
+    page of history and matches by downloadId client-side instead.
+
+    Returns the matching history records (most recent first), or [] on any failure.
+    """
+    if not download_id:
+        return []
+    try:
+        qs = "history?pageSize=250&sortDirection=descending&sortKey=date"
+        response = arr_request(api_url, api_key, api_timeout, qs, count_api=False)
+        if not response or 'records' not in response:
+            return []
+        return [r for r in response.get('records', []) if r.get('downloadId') == download_id]
+    except Exception as e:
+        sonarr_logger.debug(f"get_history_for_download error: {e}")
+        return []
+
 def get_system_status(api_url: str, api_key: str, api_timeout: int) -> Dict:
     """
     Get Sonarr system status.

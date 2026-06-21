@@ -117,6 +117,45 @@ def save_queue_snapshot(app_name, instance_name, snapshot):
     except Exception as e:
         swaparr_logger.error(f"Error saving queue snapshot for {app_name}/{instance_name}: {str(e)}")
 
+def determine_departure_outcome(app_name, instance_data, download_id):
+    """Figure out what actually happened to a download that left the queue, instead of just
+    assuming it completed. Checks Sonarr's history for an import/failure event for this
+    downloadId, falling back to the torrent client's last known status if history is
+    inconclusive (e.g. the user deleted it directly in the client).
+
+    Returns (event_type, reason) where event_type is 'completed' or 'removed'.
+    """
+    if app_name == "sonarr" and download_id:
+        try:
+            from src.primary.apps.sonarr.api import get_history_for_download
+            history = get_history_for_download(
+                instance_data["api_url"], instance_data["api_key"],
+                instance_data.get("api_timeout", 120), download_id
+            )
+            for event in history:
+                event_type = event.get("eventType")
+                if event_type == "downloadFolderImported":
+                    return "completed", None
+                if event_type == "downloadFailed":
+                    return "removed", "Failed in Sonarr"
+        except Exception as e:
+            swaparr_logger.debug(f"Error checking Sonarr history for departed download {download_id}: {e}")
+
+        try:
+            from src.primary.apps.swaparr.torrent_status import get_torrent_statuses
+            statuses = get_torrent_statuses(instance_data, [download_id])
+            torrent = statuses.get(download_id.lower())
+            if torrent:
+                return "removed", f"Removed outside Swaparr (torrent client status: {torrent.get('state')})"
+        except Exception as e:
+            swaparr_logger.debug(f"Error checking torrent client for departed download {download_id}: {e}")
+
+        return "removed", "Removed outside Swaparr (no Sonarr import/failure event found)"
+
+    # No download_id to check, or an app type without history support yet - fall back to
+    # the previous best-effort assumption.
+    return "completed", None
+
 def log_activity_event(app_name, instance_name, item_id, item_name, event_type, reason=None, strikes_at_event=0):
     """Best-effort record of a Swaparr activity event (completed/removed) for the Activity history view."""
     try:
@@ -441,7 +480,8 @@ def parse_queue_items(records, item_type, app_name):
             "status": record.get("status", "unknown").lower(),
             "eta": eta_seconds,
             "protocol": record.get("protocol", "unknown").lower(),
-            "error_message": record.get("errorMessage", "")
+            "error_message": record.get("errorMessage", ""),
+            "download_id": record.get("downloadId")
         })
     
     return queue_items
@@ -621,7 +661,10 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
         # Snapshot of the queue from the previous cycle, used below to detect items that
         # left the queue on their own (completed) vs. were removed by Swaparr this cycle
         previous_queue_snapshot = load_queue_snapshot(app_name, instance_name)
-        current_queue_snapshot = {str(item["id"]): item["name"] for item in queue_items}
+        current_queue_snapshot = {
+            str(item["id"]): {"name": item["name"], "download_id": item.get("download_id")}
+            for item in queue_items
+        }
         removed_ids_this_cycle = set()
 
         # Process each queue item
@@ -1003,17 +1046,25 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             swaparr_logger.debug(f"Processed download: {item['name']} - State: {item_state}")
         
         # Items that were in the previous snapshot but are no longer in the queue have left
-        # for good this cycle (imported/completed, or removed by Swaparr or something else).
-        # Purge their strike_data entry now: Sonarr can reuse the same queue item id for a
-        # *later, unrelated* grab of the same episode, and leaving stale strike/age data
+        # for good this cycle (imported/completed, removed by Swaparr, or removed some other
+        # way). Purge their strike_data entry now: Sonarr can reuse the same queue item id for
+        # a *later, unrelated* grab of the same episode, and leaving stale strike/age data
         # behind caused fresh re-grabs to be immediately flagged as "8 days old" and removed
         # by check_age_based_removal even though they'd only just started downloading.
         if not settings.get("dry_run", False):
-            for prev_id, prev_name in previous_queue_snapshot.items():
-                if prev_id not in current_queue_snapshot:
-                    strike_data.pop(prev_id, None)
-                    if prev_id not in removed_ids_this_cycle:
-                        log_activity_event(app_name, instance_name, prev_id, prev_name, "completed")
+            for prev_id, prev_value in previous_queue_snapshot.items():
+                if prev_id in current_queue_snapshot:
+                    continue
+                strike_data.pop(prev_id, None)
+                if prev_id in removed_ids_this_cycle:
+                    continue
+
+                # Snapshots saved before this lookup existed stored a plain name string
+                prev_name = prev_value.get("name") if isinstance(prev_value, dict) else prev_value
+                prev_download_id = prev_value.get("download_id") if isinstance(prev_value, dict) else None
+
+                event_type, reason = determine_departure_outcome(app_name, instance_data, prev_download_id)
+                log_activity_event(app_name, instance_name, prev_id, prev_name, event_type, reason)
 
         # Save updated strike data
         save_strike_data(app_name, strike_data)
