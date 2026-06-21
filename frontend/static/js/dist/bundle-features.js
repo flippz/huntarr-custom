@@ -6977,15 +6977,99 @@ window.HuntarrSwaparrActivity = {
             return;
         }
 
-        tbody.innerHTML = entries.map(entry => {
-            const badgeClass = entry.event_type === 'removed' ? 'removed' : 'completed';
+        tbody.innerHTML = entries.map((entry, idx) => {
+            const badgeClass = entry.event_type === 'removed' ? 'removed' : (entry.event_type === 'failed' ? 'failed' : 'completed');
+            const label = entry.event_type === 'removed' ? 'Removed' : (entry.event_type === 'failed' ? 'Failed' : 'Completed');
+            const reasonHtml = entry.reason
+                ? `<span class="swaparr-activity-reason-link" data-incident-idx="${idx}">${entry.reason}</span>`
+                : '-';
             return `<tr>
                 <td>${entry.occurred_at}</td>
                 <td>${entry.item_name}</td>
-                <td><span class="swaparr-activity-badge ${badgeClass}">${entry.event_type}</span></td>
-                <td>${entry.reason || '-'}</td>
+                <td><span class="swaparr-activity-badge ${badgeClass}">${label}</span></td>
+                <td>${reasonHtml}</td>
             </tr>`;
         }).join('');
+
+        this._lastHistoryEntries = entries;
+        tbody.querySelectorAll('[data-incident-idx]').forEach(el => {
+            el.addEventListener('click', () => {
+                const entry = this._lastHistoryEntries[parseInt(el.dataset.incidentIdx, 10)];
+                if (entry) this.openIncident(entry);
+            });
+        });
+    },
+
+    openIncident: function (entry) {
+        let overlay = document.getElementById('swaparr-incident-overlay');
+        if (overlay) overlay.remove();
+
+        overlay = document.createElement('div');
+        overlay.id = 'swaparr-incident-overlay';
+        overlay.className = 'swaparr-incident-overlay';
+        overlay.innerHTML = `
+            <div class="swaparr-incident-modal">
+                <div class="swaparr-incident-header">
+                    <h3>${entry.item_name}</h3>
+                    <button type="button" class="swaparr-incident-close">&times;</button>
+                </div>
+                <div class="swaparr-incident-body">
+                    <div class="swaparr-incident-loading"><i class="fas fa-spinner fa-spin"></i> Gathering details from Sonarr, Decypharr, NZBDav and Swaparr...</div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        const close = () => overlay.remove();
+        overlay.querySelector('.swaparr-incident-close').addEventListener('click', close);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+        if (!this.currentInstanceId) return;
+        const params = new URLSearchParams({ name: entry.item_name, item_id: entry.item_id || '' });
+        HuntarrUtils.fetchWithTimeout(`./api/swaparr/activity/sonarr/${this.currentInstanceId}/incident?${params.toString()}`)
+            .then(response => response.json())
+            .then(data => this.renderIncident(overlay, data))
+            .catch(() => {
+                const body = overlay.querySelector('.swaparr-incident-body');
+                if (body) body.innerHTML = '<div class="swaparr-incident-empty">Failed to load details.</div>';
+            });
+    },
+
+    renderIncident: function (overlay, data) {
+        const body = overlay.querySelector('.swaparr-incident-body');
+        if (!body) return;
+
+        if (!data || !data.success) {
+            body.innerHTML = '<div class="swaparr-incident-empty">Failed to load details.</div>';
+            return;
+        }
+
+        const timeline = data.timeline || [];
+        const extra = data.additional_context || [];
+
+        let html = '';
+        if (timeline.length === 0) {
+            html += '<div class="swaparr-incident-empty">No timeline events found across Sonarr, Decypharr, NZBDav or Swaparr for this item.</div>';
+        } else {
+            html += '<ul class="swaparr-incident-timeline">' + timeline.map(t => `
+                <li>
+                    <span class="ts">${t.timestamp || ''}</span>
+                    <span class="src ${(t.source || '').toLowerCase().replace(/\s+/g, '-')}">${t.source}</span>
+                    <span class="msg">${t.message}</span>
+                </li>`).join('') + '</ul>';
+        }
+
+        if (extra.length > 0) {
+            html += '<div style="margin-top:16px; font-size:12.5px; color:rgba(160,168,184,0.9); font-weight:600;">Additional context (no timestamp available)</div>';
+            html += '<ul class="swaparr-incident-timeline">' + extra.map(t => `
+                <li>
+                    <span class="ts">-</span>
+                    <span class="src ${(t.source || '').toLowerCase().replace(/\s+/g, '-')}">${t.source}</span>
+                    <span class="msg">${t.message}</span>
+                </li>`).join('') + '</ul>';
+        }
+
+        body.innerHTML = html;
     }
 };
 

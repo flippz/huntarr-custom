@@ -209,7 +209,10 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
                     nzbdav_error = nzbdav_errors.get(name)
                     nzbdav_note = f"; NZBDav: {nzbdav_error}" if nzbdav_error else ""
 
-                    log_activity_event(app_name, instance_name, download_id, name, "removed",
+                    # "failed" (not "removed") - Swaparr didn't act here, Sonarr/the download
+                    # client reported the failure on its own. "removed" is reserved for Swaparr's
+                    # own active strike-based deletions below (malicious/quality/age/max-strikes).
+                    log_activity_event(app_name, instance_name, download_id, name, "failed",
                                         f"{base_reason}{torrent_note}{decypharr_note}{nzbdav_note}")
 
         if not last_seen_date or newest_date > last_seen_date:

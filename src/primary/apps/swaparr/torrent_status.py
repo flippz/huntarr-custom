@@ -161,6 +161,61 @@ def _fetch_decypharr_error_logs(client_config: Dict[str, Any], hours: int = 24) 
     return entries
 
 
+_DECYPHARR_GENERIC_LOG_RE = re.compile(
+    _TS_RE + r'\s*(?P<message>.*)$'
+)
+
+
+def get_decypharr_log_lines(instance_data: Dict[str, Any], name: str, hours: int = 72) -> List[Dict[str, Any]]:
+    """Best-effort: every line in Decypharr's own /logs (any level) that mentions this release,
+    for the incident detail view. Unlike get_decypharr_failure_context (errors only), this
+    surfaces the full lifecycle Decypharr saw for the item - grabbed, symlinked, errored, etc.
+    Returns [] on any failure; must never break the incident endpoint."""
+    if not name:
+        return []
+
+    client_config = instance_data.get("seed_check_torrent_client") or {}
+    if (client_config.get("type") or "").lower() != "qbittorrent":
+        return []
+
+    host = client_config.get("host")
+    if not host:
+        return []
+
+    scheme = "https" if client_config.get("use_ssl") else "http"
+    port = int(client_config.get("port", 8080))
+    url = f"{scheme}://{host}:{port}/logs"
+
+    try:
+        import requests
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+    except Exception as e:
+        logger.debug(f"Decypharr log fetch failed (non-fatal): {e}")
+        return []
+
+    target_norm = _normalize_name(name)
+    if not target_norm:
+        return []
+
+    cutoff = datetime.now() - timedelta(hours=hours)
+    matches = []
+    for line in response.text.splitlines():
+        if target_norm not in _normalize_name(line):
+            continue
+        match = _DECYPHARR_GENERIC_LOG_RE.match(line)
+        if not match:
+            continue
+        try:
+            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if ts < cutoff:
+            continue
+        matches.append({"timestamp": ts, "message": match.group("message").strip()})
+    return matches
+
+
 def _find_decypharr_error(error_logs: List[Dict[str, Any]], target_name: str) -> Optional[Dict[str, Any]]:
     target_norm = _normalize_name(target_name)
     if not target_norm:

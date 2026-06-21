@@ -997,6 +997,34 @@ class StateMixin:
                 "page_size": page_size
             }
 
+    def get_swaparr_activity_for_name(self, app_name: str, instance_name: str, item_name: str) -> List[Dict[str, Any]]:
+        """Get every Swaparr activity event ever logged for this exact item name (not paginated) -
+        used by the incident detail view to show Swaparr's own timeline for one specific item."""
+        with self.get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                """SELECT * FROM swaparr_activity_history
+                   WHERE app_name = ? AND instance_name = ? AND item_name = ?
+                   ORDER BY occurred_at ASC""",
+                (app_name, instance_name, item_name)
+            )
+            entries = [dict(row) for row in cursor.fetchall()]
+
+            try:
+                from datetime import datetime
+                import pytz
+                from src.primary.utils.timezone_utils import get_user_timezone
+                user_tz = get_user_timezone(prefer_database_for_display=True)
+                for entry in entries:
+                    occurred_at = entry.get("occurred_at")
+                    if occurred_at:
+                        utc_dt = pytz.UTC.localize(datetime.strptime(occurred_at, "%Y-%m-%d %H:%M:%S"))
+                        entry["occurred_at"] = utc_dt.astimezone(user_tz).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception as tz_err:
+                logger.debug(f"Could not convert Swaparr activity timestamps to user timezone: {tz_err}")
+
+            return entries
+
     def cleanup_swaparr_activity_history(self, days: int = 15) -> int:
         """Delete Swaparr activity history entries older than the given number of days."""
         with self.get_connection() as conn:

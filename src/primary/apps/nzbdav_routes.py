@@ -71,6 +71,44 @@ def _normalize_name(name: str) -> str:
     return re.sub(r'[^a-z0-9]+', '', (name or "").lower())
 
 
+def _fetch_nzbdav_history_slots(limit: int = 200) -> List[Dict[str, Any]]:
+    """Fetch NZBDav's SABnzbd-compatible history slots. Note: NZBDav currently ignores the
+    `limit` param and always returns its full history (observed ~15k entries, ~7MB) - kept here
+    in case that's fixed upstream. Returns [] if not configured/unreachable."""
+    settings = load_settings("nzbdav") or {}
+    if not settings.get("enabled") or not settings.get("host") or not settings.get("api_key"):
+        return []
+
+    try:
+        url = f"{_base_url(settings['host'], settings.get('port', 3123), settings.get('use_ssl', False))}/api"
+        verify_ssl = get_ssl_verify_setting()
+        response = requests.get(url, params={
+            "mode": "history", "apikey": settings["api_key"], "output": "json", "limit": limit
+        }, timeout=15, verify=verify_ssl)
+        response.raise_for_status()
+        return (response.json() or {}).get("history", {}).get("slots", [])
+    except Exception as e:
+        nzbdav_logger.debug(f"NZBDav history lookup failed (non-fatal): {e}")
+        return []
+
+
+def get_nzbdav_history_entry(name: str) -> Optional[Dict[str, Any]]:
+    """Best-effort: find NZBDav's history slot matching this release name, regardless of
+    status (completed or failed) - for the incident detail view. NZBDav's slots carry no
+    timestamp field, so this is surfaced as additional context, not part of the timeline.
+    Returns None on any failure or no match."""
+    target_norm = _normalize_name(name)
+    if not target_norm:
+        return None
+
+    for slot in _fetch_nzbdav_history_slots():
+        slot_name = slot.get("name") or slot.get("nzb_name") or ""
+        norm = _normalize_name(slot_name)
+        if norm and (norm in target_norm or target_norm in norm):
+            return slot
+    return None
+
+
 def get_nzbdav_failure_context(names: List[str], limit: int = 200) -> Dict[str, str]:
     """Best-effort: for the given Sonarr release titles, find the matching NZBDav history
     entry and return its real fail_message (e.g. a missing Usenet article), keyed by name.
@@ -80,20 +118,8 @@ def get_nzbdav_failure_context(names: List[str], limit: int = 200) -> Dict[str, 
     if not names:
         return {}
 
-    settings = load_settings("nzbdav") or {}
-    if not settings.get("enabled") or not settings.get("host") or not settings.get("api_key"):
-        return {}
-
-    try:
-        url = f"{_base_url(settings['host'], settings.get('port', 3123), settings.get('use_ssl', False))}/api"
-        verify_ssl = get_ssl_verify_setting()
-        response = requests.get(url, params={
-            "mode": "history", "apikey": settings["api_key"], "output": "json", "limit": limit
-        }, timeout=10, verify=verify_ssl)
-        response.raise_for_status()
-        slots = (response.json() or {}).get("history", {}).get("slots", [])
-    except Exception as e:
-        nzbdav_logger.debug(f"NZBDav history lookup failed (non-fatal): {e}")
+    slots = _fetch_nzbdav_history_slots(limit=limit)
+    if not slots:
         return {}
 
     by_norm_name = {}

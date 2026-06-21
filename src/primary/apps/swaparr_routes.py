@@ -490,3 +490,123 @@ def get_activity_history(app_name, instance_id):
     except Exception as e:
         swaparr_logger.error(f"Error fetching activity history for {app_name}/{instance_id}: {str(e)}")
         return jsonify({"success": False, "message": str(e)}), 500
+
+
+@swaparr_bp.route('/activity/<app_name>/<instance_id>/incident', methods=['GET'])
+def get_activity_incident(app_name, instance_id):
+    """Cross-reference every source Huntarr can reach for one specific item - Sonarr's own
+    history, Decypharr's logs, NZBDav's history, and Swaparr's own activity log - merged into
+    a single chronological timeline for the incident detail view."""
+    try:
+        instance = _find_instance(app_name, instance_id)
+        if not instance:
+            return jsonify({"success": False, "message": "Instance not found"}), 404
+        if app_name != "sonarr":
+            return jsonify({"success": False, "message": f"Unsupported app_name: {app_name}"}), 400
+
+        name = (request.args.get('name') or '').strip()
+        download_id = (request.args.get('item_id') or '').strip()
+        if not name:
+            return jsonify({"success": False, "message": "Missing 'name' parameter"}), 400
+
+        timeline = []
+        additional_context = []
+
+        # Swaparr's own record of what it saw/did for this item
+        try:
+            swaparr_events = get_database().get_swaparr_activity_for_name(
+                app_name, instance.get("instance_name"), name
+            )
+            for event in swaparr_events:
+                label = "completed" if event.get("event_type") == "completed" else (event.get("reason") or event.get("event_type"))
+                timeline.append({
+                    "timestamp": event.get("occurred_at"),
+                    "source": "Swaparr",
+                    "message": f"{event.get('event_type')}: {label}" if event.get("event_type") != "completed" else "Completed"
+                })
+        except Exception as e:
+            swaparr_logger.debug(f"Swaparr activity lookup failed for incident view: {e}")
+
+        # Sonarr's full history for this release (every event type, not just grabbed/failed)
+        try:
+            from src.primary.apps.sonarr.api import arr_request
+            response = arr_request(
+                instance["api_url"], instance["api_key"], instance.get("api_timeout", 120),
+                "history?pageSize=250&sortDirection=descending&sortKey=date", count_api=False
+            )
+            records = (response or {}).get("records", [])
+            name_norm = name.lower().replace(' ', '').replace('.', '')
+
+            from datetime import datetime
+            import pytz
+            from src.primary.utils.timezone_utils import get_user_timezone
+            user_tz = get_user_timezone(prefer_database_for_display=True)
+
+            for record in records:
+                source_title = record.get("sourceTitle") or ""
+                title_norm = source_title.lower().replace(' ', '').replace('.', '')
+                if record.get("downloadId") != download_id and title_norm != name_norm:
+                    continue
+                event_type = record.get("eventType") or "unknown"
+                msg = (record.get("data") or {}).get("message")
+                message = f"{event_type}: {msg}" if msg else event_type
+
+                raw_date = record.get("date") or ""
+                try:
+                    utc_dt = datetime.strptime(raw_date, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.UTC)
+                    local_ts = utc_dt.astimezone(user_tz).strftime("%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    local_ts = raw_date
+
+                timeline.append({
+                    "timestamp": local_ts,
+                    "source": "Sonarr",
+                    "message": message
+                })
+        except Exception as e:
+            swaparr_logger.debug(f"Sonarr history lookup failed for incident view: {e}")
+
+        # Decypharr's own logs - full lifecycle, not just errors
+        try:
+            from src.primary.apps.swaparr.torrent_status import get_decypharr_log_lines
+            for entry in get_decypharr_log_lines(instance, name):
+                timeline.append({
+                    "timestamp": entry["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
+                    "source": "Decypharr",
+                    "message": entry["message"]
+                })
+        except Exception as e:
+            swaparr_logger.debug(f"Decypharr log lookup failed for incident view: {e}")
+
+        # NZBDav - no timestamp field available, so this goes in additional context
+        try:
+            from src.primary.apps.nzbdav_routes import get_nzbdav_history_entry
+            nzbdav_entry = get_nzbdav_history_entry(name)
+            if nzbdav_entry:
+                status = nzbdav_entry.get("status") or "Unknown"
+                fail_message = nzbdav_entry.get("fail_message")
+                message = f"{status}" + (f": {fail_message}" if fail_message else "")
+                additional_context.append({"source": "NZBDav", "message": message})
+        except Exception as e:
+            swaparr_logger.debug(f"NZBDav lookup failed for incident view: {e}")
+
+        # Live torrent client status, if the download is still present
+        if download_id:
+            try:
+                from src.primary.apps.swaparr.torrent_status import get_torrent_statuses
+                statuses = get_torrent_statuses(instance, [download_id])
+                torrent = statuses.get(download_id.lower())
+                if torrent:
+                    additional_context.append({
+                        "source": "Torrent Client",
+                        "message": f"state: {torrent.get('state')}, progress: {torrent.get('progress')}, seeds: {torrent.get('num_seeds')}"
+                    })
+            except Exception as e:
+                swaparr_logger.debug(f"Torrent client lookup failed for incident view: {e}")
+
+        timeline.sort(key=lambda t: t.get("timestamp") or "")
+
+        return jsonify({"success": True, "timeline": timeline, "additional_context": additional_context})
+    except Exception as e:
+        swaparr_logger.error(f"Error building incident view for {app_name}/{instance_id}: {str(e)}")
+        return jsonify({"success": False, "message": str(e)}), 500
