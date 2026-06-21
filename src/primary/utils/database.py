@@ -323,19 +323,21 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
     
     def _handle_database_corruption(self):
         """Handle confirmed database corruption with recovery-first approach.
-        
+
         This is only called after WAL recovery and retries have failed.
-        It tries multiple recovery strategies before resorting to deletion:
-        1. SQLite .recover to dump and reload
-        2. Copy user data from corrupted DB to fresh DB
-        3. Only delete as last resort, always creating a backup first
+        Strategy: back up the corrupted file, then copy every table's rows over to a
+        freshly created database, generically (not a hardcoded list of "important"
+        tables) - past versions of this function only recovered users/settings/app
+        configs by name, which silently dropped any other table (e.g. swaparr_state,
+        swaparr_activity_history) on every corruption event. Only delete the corrupted
+        file after a backup exists.
         """
         logger.error(f"Handling confirmed database corruption for: {self.db_path}")
-        
+
         if not self.db_path.exists():
             logger.info("Database file does not exist, nothing to recover")
             return
-        
+
         # Always create a backup first - NEVER delete without backup
         backup_path = self.db_path.parent / f"huntarr_corrupted_backup_{int(time.time())}.db"
         try:
@@ -350,43 +352,37 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 return  # File moved, no need to delete
             except Exception:
                 pass
-        
-        # Strategy 1: Try to salvage critical data (users, settings, app configs) from corrupted DB
-        recovered_users = []
-        recovered_settings = []
-        recovered_app_configs = []
+
+        # Strategy 1: Salvage every table's rows from the corrupted DB, generically.
+        # {table_name: (column_names, rows)}
+        recovered_tables: Dict[str, Any] = {}
         try:
             conn = sqlite3.connect(backup_path, timeout=10)
             conn.execute('PRAGMA journal_mode = OFF')  # Don't use WAL on corrupted file
             try:
-                # Try to read users table
-                cursor = conn.execute("SELECT username, password, two_fa_secret, plex_token, plex_user_data FROM users")
-                recovered_users = cursor.fetchall()
-                logger.info(f"Recovered {len(recovered_users)} user(s) from corrupted database")
+                table_names = [
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                    ).fetchall()
+                ]
             except Exception as e:
-                logger.warning(f"Could not recover users: {e}")
+                logger.warning(f"Could not list tables in corrupted database: {e}")
+                table_names = []
 
-            try:
-                # Try to read general settings (including setting_type so typed values
-                # like booleans/ints/JSON objects aren't flattened into plain strings)
-                cursor = conn.execute("SELECT setting_key, setting_value, setting_type FROM general_settings")
-                recovered_settings = cursor.fetchall()
-                logger.info(f"Recovered {len(recovered_settings)} setting(s) from corrupted database")
-            except Exception as e:
-                logger.warning(f"Could not recover settings: {e}")
-
-            try:
-                # Try to read app configs (Sonarr/Radarr/etc instances) - critical user data
-                cursor = conn.execute("SELECT app_type, config_data FROM app_configs")
-                recovered_app_configs = cursor.fetchall()
-                logger.info(f"Recovered {len(recovered_app_configs)} app config(s) from corrupted database")
-            except Exception as e:
-                logger.warning(f"Could not recover app configs: {e}")
+            for table in table_names:
+                try:
+                    cursor = conn.execute(f"SELECT * FROM {table}")
+                    columns = [desc[0] for desc in cursor.description]
+                    rows = cursor.fetchall()
+                    recovered_tables[table] = (columns, rows)
+                    logger.info(f"Recovered {len(rows)} row(s) from table '{table}' in corrupted database")
+                except Exception as e:
+                    logger.warning(f"Could not recover table '{table}': {e}")
 
             conn.close()
         except Exception as e:
             logger.warning(f"Could not open corrupted database for recovery: {e}")
-        
+
         # Remove the corrupted database file (backup already exists)
         try:
             self.db_path.unlink()
@@ -399,48 +395,60 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 shm_path.unlink()
         except Exception as rm_error:
             logger.error(f"Error removing corrupted database: {rm_error}")
-        
-        # Strategy 2: Recreate database and restore recovered data
-        if recovered_users or recovered_settings or recovered_app_configs:
+
+        # Strategy 2: Recreate database (with the current schema) and restore every
+        # recovered table's rows into it.
+        if recovered_tables:
             try:
-                # Create fresh database with tables
                 self.ensure_database_exists()
 
                 conn = sqlite3.connect(self.db_path, timeout=30)
                 self._configure_connection(conn)
 
-                # Restore users
-                for user in recovered_users:
+                for table, (columns, rows) in recovered_tables.items():
+                    if not rows:
+                        continue
+                    # The fresh database may not have this table (e.g. it was dropped in
+                    # a newer version) - skip it rather than failing the whole restore.
                     try:
-                        conn.execute(
-                            "INSERT OR REPLACE INTO users (username, password, two_fa_secret, plex_token, plex_user_data) VALUES (?, ?, ?, ?, ?)",
-                            user
-                        )
-                        logger.info(f"Restored user: {user[0]}")
-                    except Exception as e:
-                        logger.warning(f"Failed to restore user {user[0]}: {e}")
+                        existing_cols = {
+                            row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                        }
+                    except Exception:
+                        existing_cols = set()
+                    if not existing_cols:
+                        logger.warning(f"Skipping restore of table '{table}': table no longer exists in current schema")
+                        continue
 
-                # Restore general settings (skip setup_progress to avoid stale state)
-                for key, value, setting_type in recovered_settings:
-                    if key != 'setup_progress':
+                    # Only restore columns that still exist, in case the schema changed
+                    usable_columns = [c for c in columns if c in existing_cols]
+                    if not usable_columns:
+                        logger.warning(f"Skipping restore of table '{table}': no matching columns in current schema")
+                        continue
+                    col_indices = [columns.index(c) for c in usable_columns]
+
+                    # setup_progress is intentionally excluded from general_settings restores
+                    # to avoid resurrecting a stale "setup in progress" state
+                    skip_key_col = None
+                    if table == 'general_settings' and 'setting_key' in usable_columns:
+                        skip_key_col = usable_columns.index('setting_key')
+
+                    placeholders = ", ".join(["?"] * len(usable_columns))
+                    col_list = ", ".join(usable_columns)
+                    restored = 0
+                    for row in rows:
+                        if skip_key_col is not None and row[col_indices[skip_key_col]] == 'setup_progress':
+                            continue
                         try:
+                            values = [row[i] for i in col_indices]
                             conn.execute(
-                                "INSERT OR REPLACE INTO general_settings (setting_key, setting_value, setting_type) VALUES (?, ?, ?)",
-                                (key, value, setting_type)
+                                f"INSERT OR REPLACE INTO {table} ({col_list}) VALUES ({placeholders})",
+                                values
                             )
+                            restored += 1
                         except Exception as e:
-                            logger.warning(f"Failed to restore setting {key}: {e}")
-
-                # Restore app configs (Sonarr/Radarr/etc instances) - prevents silent data loss
-                for app_type, config_data in recovered_app_configs:
-                    try:
-                        conn.execute(
-                            "INSERT OR REPLACE INTO app_configs (app_type, config_data, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                            (app_type, config_data)
-                        )
-                        logger.info(f"Restored app config: {app_type}")
-                    except Exception as e:
-                        logger.warning(f"Failed to restore app config {app_type}: {e}")
+                            logger.warning(f"Failed to restore a row in table '{table}': {e}")
+                    logger.info(f"Restored {restored} row(s) into table '{table}'")
 
                 conn.commit()
                 conn.close()
