@@ -14,11 +14,23 @@ from src.primary.utils.logger import get_logger
 
 logger = get_logger("swaparr")
 
-# Decypharr's own log lines look like:
-# 2026-06-21 01:57:30 | ERROR | [manager] Error checking status error="torrent: X has error" name="X"
+_TS_RE = r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*\w+\s*\|'
+
+# Decypharr's own log lines carry the real debrid-level failure reason in a few different
+# shapes - none of which Sonarr's history ever sees:
+#   ERROR | [manager] Error checking status error="torrent: X has error" name="X"
+#   DEBUG | [dfs] download error error="...marked as bad" count=1 entry=X filename=Y
 _DECYPHARR_ERROR_LOG_RE = re.compile(
-    r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*ERROR\s*\|.*?'
-    r'error="(?P<error>[^"]*)".*?name=(?:"(?P<name_q>[^"]*)"|(?P<name_bare>\S+))'
+    _TS_RE + r'.*?error="(?P<error>[^"]*)".*?(?:name|entry)=(?:"(?P<name_q>[^"]*)"|(?P<name_bare>\S+))'
+)
+
+# INFO | [manager] Creating symlinks for 0 files in /path/to/sonarr/<release name> component=...
+# A "0 files" symlink step means the debrid provider's cache had nothing usable for this
+# release (commonly a fake/dead torrent) - Sonarr only ever sees this as a generic import
+# failure. There's no name=/entry= field on this line - the release name is the final path
+# segment of the symlink destination.
+_DECYPHARR_ZERO_SYMLINK_RE = re.compile(
+    _TS_RE + r'.*?Creating symlinks for (?P<file_count>\d+) files in \S*/(?P<name_bare>[^/\s]+)\s'
 )
 
 
@@ -128,19 +140,24 @@ def _fetch_decypharr_error_logs(client_config: Dict[str, Any], hours: int = 24) 
     cutoff = datetime.now() - timedelta(hours=hours)
     entries = []
     for line in response.text.splitlines():
-        if "| ERROR |" not in line:
-            continue
         match = _DECYPHARR_ERROR_LOG_RE.match(line)
-        if not match:
-            continue
+        if match:
+            error_text = match.group("error")
+            name = match.group("name_q") or match.group("name_bare") or ""
+        else:
+            match = _DECYPHARR_ZERO_SYMLINK_RE.match(line)
+            if not match or match.group("file_count") != "0":
+                continue
+            error_text = "Decypharr created 0 symlinks (no usable files found in the debrid cache for this release)"
+            name = match.group("name_bare") or ""
+
         try:
             ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M:%S")
         except ValueError:
             continue
         if ts < cutoff:
             continue
-        name = match.group("name_q") or match.group("name_bare") or ""
-        entries.append({"timestamp": ts, "name": name, "error": match.group("error")})
+        entries.append({"timestamp": ts, "name": name, "error": error_text})
     return entries
 
 
