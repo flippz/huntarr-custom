@@ -1021,7 +1021,16 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
         # Save updated removed items list
         save_removed_items(app_name, removed_items)
 
-        save_queue_snapshot(app_name, instance_name, current_queue_snapshot)
+        # Don't carry items removed this cycle into the saved snapshot - current_queue_snapshot
+        # was built from the queue fetched at the *start* of this cycle, before this cycle's own
+        # removals took effect, so it still includes them. Leaving them in would make next
+        # cycle's diff think they "just left the queue" and log a duplicate, mislabeled
+        # 'completed' event for something already correctly logged as 'removed'.
+        snapshot_to_save = {
+            item_id: name for item_id, name in current_queue_snapshot.items()
+            if item_id not in removed_ids_this_cycle
+        }
+        save_queue_snapshot(app_name, instance_name, snapshot_to_save)
 
         # Update last run time
         SWAPARR_STATS['last_run_time'] = datetime.utcnow().isoformat()
