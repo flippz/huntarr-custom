@@ -974,6 +974,21 @@ class StateMixin:
             )
             entries = [dict(row) for row in cursor.fetchall()]
 
+            # occurred_at is stored as naive UTC (SQLite CURRENT_TIMESTAMP) - convert to the
+            # user's configured timezone for display, same approach as hunt history.
+            try:
+                from datetime import datetime
+                import pytz
+                from src.primary.utils.timezone_utils import get_user_timezone
+                user_tz = get_user_timezone(prefer_database_for_display=True)
+                for entry in entries:
+                    occurred_at = entry.get("occurred_at")
+                    if occurred_at:
+                        utc_dt = pytz.UTC.localize(datetime.strptime(occurred_at, "%Y-%m-%d %H:%M:%S"))
+                        entry["occurred_at"] = utc_dt.astimezone(user_tz).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception as tz_err:
+                logger.debug(f"Could not convert Swaparr activity timestamps to user timezone: {tz_err}")
+
             return {
                 "entries": entries,
                 "total_entries": total_entries,
