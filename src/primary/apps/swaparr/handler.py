@@ -1002,19 +1002,25 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             
             swaparr_logger.debug(f"Processed download: {item['name']} - State: {item_state}")
         
+        # Items that were in the previous snapshot but are no longer in the queue have left
+        # for good this cycle (imported/completed, or removed by Swaparr or something else).
+        # Purge their strike_data entry now: Sonarr can reuse the same queue item id for a
+        # *later, unrelated* grab of the same episode, and leaving stale strike/age data
+        # behind caused fresh re-grabs to be immediately flagged as "8 days old" and removed
+        # by check_age_based_removal even though they'd only just started downloading.
+        if not settings.get("dry_run", False):
+            for prev_id, prev_name in previous_queue_snapshot.items():
+                if prev_id not in current_queue_snapshot:
+                    strike_data.pop(prev_id, None)
+                    if prev_id not in removed_ids_this_cycle:
+                        log_activity_event(app_name, instance_name, prev_id, prev_name, "completed")
+
         # Save updated strike data
         save_strike_data(app_name, strike_data)
 
         # Save updated removed items list
         save_removed_items(app_name, removed_items)
 
-        # Items that were in the previous snapshot, are no longer in the queue, and weren't
-        # removed by Swaparr this cycle left on their own (imported/completed, or removed
-        # outside Swaparr) - record that for the Activity history view.
-        if not settings.get("dry_run", False):
-            for prev_id, prev_name in previous_queue_snapshot.items():
-                if prev_id not in current_queue_snapshot and prev_id not in removed_ids_this_cycle:
-                    log_activity_event(app_name, instance_name, prev_id, prev_name, "completed")
         save_queue_snapshot(app_name, instance_name, current_queue_snapshot)
 
         # Update last run time
