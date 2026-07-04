@@ -1,0 +1,225 @@
+<style>
+    /* DISABLE GLOWING RING ANIMATIONS - Magnetarr Section */
+    #magnetarrSection .styled-select {
+        animation: none !important;
+        box-shadow: none !important;
+    }
+
+    #magnetarrSection .styled-select:focus,
+    #magnetarrSection .styled-select:hover {
+        animation: none !important;
+        box-shadow: 0 0 5px rgba(255, 255, 255, 0.2) !important;
+        transform: none !important;
+    }
+</style>
+
+<section id="magnetarrSection" class="content-section">
+    <link rel="stylesheet" href="./static/css/instance-editor.css?v=1.0.2">
+    <div class="content-boundary-inner">
+        {% from 'components/page_header_partial.html' import page_header %}
+        {{ page_header(back_href='./#apps', parent_icon='fas fa-th-large', parent_name='Apps', current_name='Magnetarr', sponsor_section_id='magnetarr') }}
+        <!-- Single scrollable container for all content -->
+        <div class="single-scroll-container">
+        <div id="magnetarrContainer" class="magnetarr-container">
+            <!-- Magnetarr settings content will be shown here -->
+        </div>
+
+        <div id="magnetarrStatus" class="magnetarr-status"></div>
+
+        <!-- Magnetarr panel at the bottom -->
+        <div class="magnetarr-panels-container">
+            <div id="magnetarrApps" class="magnetarr-apps-panel magnetarr-content-panel active" style="display: block;"></div>
+        </div>
+        </div>
+    </div>
+</section>
+
+<style>
+    /* Magnetarr Section Layout */
+    .magnetarr-content-panel, .magnetarr-apps-panel {
+        background-color: transparent !important;
+        box-shadow: none !important;
+        border: none !important;
+    }
+
+    #magnetarrSection {
+        display: none;
+        width: 100%;
+        height: auto;
+        overflow: hidden; /* Prevent double scrollbar */
+        padding-bottom: 60px; /* Clear space at the bottom */
+    }
+
+    #magnetarrSection.active {
+        display: block;
+    }
+
+    #magnetarrSection .single-scroll-container {
+        display: block;
+        width: 100%;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding-bottom: 100px;
+        min-height: 100%;
+        height: auto;
+        max-height: unset;
+        scrollbar-width: thin;
+        position: relative;
+    }
+
+    #magnetarrSection .magnetarr-apps-panel, #magnetarrSection .magnetarr-content-panel, #magnetarrContainer,
+    .magnetarr-panels-container, #magnetarrStatus {
+        overflow: hidden !important;
+        scrollbar-width: none !important;
+        -ms-overflow-style: none !important;
+    }
+
+    .magnetarr-panels-container {
+        margin-top: auto;
+        padding: 10px 0 0;
+        display: block;
+        width: 100%;
+    }
+
+    .magnetarr-apps-panel {
+        display: none;
+        width: 100%;
+        margin: 0;
+        padding: 0;
+        background: none;
+    }
+
+    .magnetarr-apps-panel.active {
+        display: block;
+    }
+
+    .magnetarr-container {
+        padding: 20px 0;
+        min-height: 300px;
+        width: 100%;
+    }
+
+    .magnetarr-status {
+        padding: 10px 0;
+        width: 100%;
+    }
+
+    #magnetarrSection .single-scroll-container::-webkit-scrollbar {
+        width: 8px;
+    }
+
+    #magnetarrSection .single-scroll-container::-webkit-scrollbar-track {
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 4px;
+    }
+
+    #magnetarrSection .single-scroll-container::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, 0.3);
+        border-radius: 4px;
+    }
+
+    #magnetarrSection .single-scroll-container::-webkit-scrollbar-thumb:hover {
+        background: rgba(255, 255, 255, 0.5);
+    }
+
+    /* Magnetarr row action buttons */
+    .magnetarr-row-btn {
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(160, 168, 184, 0.25);
+        color: #d1d5db;
+        border-radius: 4px;
+        padding: 4px 8px;
+        margin-right: 4px;
+        cursor: pointer;
+        font-size: 12px;
+    }
+
+    .magnetarr-row-btn:hover {
+        background: rgba(255, 255, 255, 0.12);
+        color: #fff;
+    }
+
+    /* Magnetarr add/edit source modal */
+    .magnetarr-modal-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.6);
+        z-index: 3000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .magnetarr-modal {
+        background: #1a1f2e;
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        border-radius: 10px;
+        width: 90%;
+        max-width: 480px;
+        max-height: 85vh;
+        display: flex;
+        flex-direction: column;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+    }
+
+    .magnetarr-modal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 16px 20px;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+    }
+
+    .magnetarr-modal-header h3 {
+        margin: 0;
+        font-size: 15px;
+        color: #f1f5f9;
+    }
+
+    .magnetarr-modal-close {
+        background: none;
+        border: none;
+        color: #94a3b8;
+        font-size: 22px;
+        cursor: pointer;
+    }
+
+    .magnetarr-modal-close:hover {
+        color: #f1f5f9;
+    }
+
+    .magnetarr-modal-body {
+        padding: 16px 20px;
+        overflow-y: auto;
+    }
+
+    .magnetarr-modal-footer {
+        display: flex;
+        justify-content: flex-end;
+        gap: 10px;
+        padding: 14px 20px;
+        border-top: 1px solid rgba(148, 163, 184, 0.15);
+    }
+
+    .magnetarr-btn-primary {
+        background: #2563eb;
+        color: #fff;
+        border: 1px solid #1d4ed8;
+        padding: 8px 16px;
+        border-radius: 6px;
+        font-size: 14px;
+        font-weight: 500;
+        cursor: pointer;
+    }
+
+    .magnetarr-btn-secondary {
+        background: #374151;
+        color: #d1d5db;
+        border: 1px solid #4b5563;
+        padding: 8px 16px;
+        border-radius: 6px;
+        font-size: 14px;
+        font-weight: 500;
+        cursor: pointer;
+    }
+</style>

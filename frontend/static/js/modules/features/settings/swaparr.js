@@ -123,7 +123,7 @@
                     </label>
                     <input type="text" id="swaparr_max_download_time" value="${settings.max_download_time || "2h"
             }" placeholder="e.g., 2h, 120m, 7200s">
-                    <p class="setting-help">Maximum time before considering a download stalled (examples: 2h, 120m, 7200s)</p>
+                    <p class="setting-help">Max time a download can go without any new bytes downloaded before it's considered stalled (examples: 2h, 120m, 7200s)</p>
                 </div>
                 
                 <div class="setting-item">

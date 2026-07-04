@@ -6596,12 +6596,14 @@ window.HuntarrSwaparr = {
             .then(response => response.json())
             .then(data => {
                 const swaparrCard = document.getElementById('swaparrStatusCard');
+                const swaparrActivityCard = document.getElementById('swaparrActivityCard');
                 if (!swaparrCard) return;
 
-                // Show/hide card based on whether Swaparr is enabled
+                // Show/hide cards based on whether Swaparr is enabled
                 if (data.enabled && data.configured) {
                     swaparrCard.style.display = 'block';
-                    
+                    if (swaparrActivityCard) swaparrActivityCard.style.display = 'block';
+
                     // Update persistent statistics with large number formatting
                     const persistentStats = data.persistent_statistics || {};
                     const formatNumber = window.HuntarrStats ? 
@@ -6630,13 +6632,18 @@ window.HuntarrSwaparr = {
 
                 } else {
                     swaparrCard.style.display = 'none';
+                    if (swaparrActivityCard) swaparrActivityCard.style.display = 'none';
                 }
             })
             .catch(error => {
                 console.error('Error loading Swaparr status:', error);
                 const swaparrCard = document.getElementById('swaparrStatusCard');
+                const swaparrActivityCard = document.getElementById('swaparrActivityCard');
                 if (swaparrCard) {
                     swaparrCard.style.display = 'none';
+                }
+                if (swaparrActivityCard) {
+                    swaparrActivityCard.style.display = 'none';
                 }
             });
     },
@@ -6799,12 +6806,22 @@ window.HuntarrSwaparrActivity = {
     pollInterval: null,
     currentInstanceId: null,
     historyPage: 1,
+    storageKey: 'huntarr-swaparr-activity-expanded',
 
     init: function () {
         const toggleBtn = document.getElementById('toggle-swaparr-activity');
         if (toggleBtn && !toggleBtn.dataset.activityBound) {
             toggleBtn.dataset.activityBound = 'true';
             toggleBtn.addEventListener('click', () => this.togglePanel());
+        }
+
+        if (!this.stateRestored) {
+            this.stateRestored = true;
+            const saved = localStorage.getItem(this.storageKey);
+            const shouldExpand = saved === null ? true : saved === 'true';
+            if (shouldExpand) {
+                this.setExpanded(true);
+            }
         }
 
         const instanceSelect = document.getElementById('swaparr-activity-instance-select');
@@ -6856,11 +6873,16 @@ window.HuntarrSwaparrActivity = {
     },
 
     togglePanel: function () {
+        this.setExpanded(!this.expanded);
+        localStorage.setItem(this.storageKey, this.expanded ? 'true' : 'false');
+    },
+
+    setExpanded: function (expanded) {
         const panel = document.getElementById('swaparr-activity-panel');
         const chevron = document.getElementById('swaparr-activity-chevron');
         if (!panel) return;
 
-        this.expanded = !this.expanded;
+        this.expanded = expanded;
         panel.style.display = this.expanded ? 'block' : 'none';
         if (chevron) chevron.className = this.expanded ? 'fas fa-chevron-up' : 'fas fa-chevron-down';
 
@@ -7070,6 +7092,91 @@ window.HuntarrSwaparrActivity = {
         }
 
         body.innerHTML = html;
+    }
+};
+
+
+/* === modules/features/magnetarr-card.js === */
+/**
+ * Magnetarr Card Module
+ * Home-page status card for Magnetarr: total magnets discovered, sources count,
+ * last scan time, session stats, and a small recent-discoveries list.
+ */
+
+window.HuntarrMagnetarr = {
+
+    loadMagnetarrStatus: function () {
+        HuntarrUtils.fetchWithTimeout('./api/magnetarr/status')
+            .then(response => response.json())
+            .then(data => {
+                const magnetarrCard = document.getElementById('magnetarrStatusCard');
+                if (!magnetarrCard) return;
+
+                if (data.enabled && data.configured) {
+                    magnetarrCard.style.display = 'block';
+
+                    const formatNumber = window.HuntarrStats ?
+                        window.HuntarrStats.formatLargeNumber.bind(window.HuntarrStats) :
+                        (n => (n || 0).toString());
+
+                    const totalMagnetsEl = document.getElementById('magnetarr-total-magnets');
+                    const sourcesCountEl = document.getElementById('magnetarr-sources-count');
+                    if (totalMagnetsEl) totalMagnetsEl.textContent = formatNumber(data.total_magnets || 0);
+                    if (sourcesCountEl) sourcesCountEl.textContent = formatNumber(data.sources_count || 0);
+
+                    const sessionStats = data.session_stats || {};
+                    const scannedEl = document.getElementById('magnetarr-session-scanned');
+                    const foundEl = document.getElementById('magnetarr-session-found');
+                    if (scannedEl) scannedEl.textContent = formatNumber(sessionStats.scanned || 0);
+                    if (foundEl) foundEl.textContent = formatNumber(sessionStats.found || 0);
+
+                    this.loadRecentDiscoveries();
+                } else {
+                    magnetarrCard.style.display = 'none';
+                }
+            })
+            .catch(error => {
+                console.error('Error loading Magnetarr status:', error);
+                const magnetarrCard = document.getElementById('magnetarrStatusCard');
+                if (magnetarrCard) magnetarrCard.style.display = 'none';
+            });
+    },
+
+    loadRecentDiscoveries: function () {
+        const list = document.getElementById('magnetarr-recent-discoveries');
+        if (!list) return;
+
+        HuntarrUtils.fetchWithTimeout('./api/magnetarr/magnets?page_size=5')
+            .then(response => response.json())
+            .then(data => {
+                const items = (data && data.items) || [];
+                if (items.length === 0) {
+                    list.innerHTML = '<li class="magnetarr-card-empty">No discoveries yet.</li>';
+                    return;
+                }
+                list.innerHTML = items.map(item => `
+                    <li class="magnetarr-card-item">
+                        <span class="magnetarr-card-item-title" title="${item.title}">${item.title}</span>
+                        <span class="magnetarr-card-item-meta">${item.source_name || ''}</span>
+                    </li>
+                `).join('');
+            })
+            .catch(error => {
+                console.error('Error loading Magnetarr discoveries:', error);
+                list.innerHTML = '<li class="magnetarr-card-empty">Failed to load discoveries.</li>';
+            });
+    },
+
+    setupMagnetarrStatusPolling: function () {
+        // Load initial status
+        this.loadMagnetarrStatus();
+
+        // Set up polling to refresh Magnetarr status every 30 seconds
+        setInterval(() => {
+            if (window.huntarrUI && window.huntarrUI.currentSection === 'home') {
+                this.loadMagnetarrStatus();
+            }
+        }, 30000);
     }
 };
 

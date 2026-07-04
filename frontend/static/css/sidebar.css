@@ -710,6 +710,18 @@
     filter: drop-shadow(0 0 4px rgba(0, 188, 212, 0.5));
 }
 
+.magnetarr-app:hover .magnetarr-icon,
+.magnetarr-app.active .magnetarr-icon {
+    background: rgba(168, 85, 247, 0.15);
+    border-radius: 7px;
+}
+
+.magnetarr-app:hover .magnetarr-icon i,
+.magnetarr-app.active .magnetarr-icon i {
+    color: #a855f7;
+    filter: drop-shadow(0 0 4px rgba(168, 85, 247, 0.5));
+}
+
 /* ===== SIDEBAR SOCIAL LINKS ===== */
 .sidebar-social-group {
     display: flex;

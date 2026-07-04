@@ -15,6 +15,7 @@ from src.primary.apps.swaparr_routes import swaparr_bp
 from src.primary.apps.requestarr_routes import requestarr_bp
 from src.primary.apps.prowlarr_routes import prowlarr_bp
 from src.primary.apps.nzbdav_routes import nzbdav_bp
+from src.primary.apps.magnetarr_routes import magnetarr_bp
 
 __all__ = [
     "sonarr_bp",
@@ -26,5 +27,6 @@ __all__ = [
     "swaparr_bp",
     "requestarr_bp",
     "prowlarr_bp",
-    "nzbdav_bp"
+    "nzbdav_bp",
+    "magnetarr_bp"
 ]

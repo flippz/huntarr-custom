@@ -90,6 +90,82 @@ window.SettingsForms = {
         this.updateSwaparrFieldsDisabledState();
     },
 
+    // Check if Magnetarr is globally enabled
+    isMagnetarrGloballyEnabled: function () {
+        try {
+            const magnetarrToggle = document.querySelector("#magnetarr_enabled");
+            if (magnetarrToggle) {
+                return magnetarrToggle.checked;
+            }
+
+            const cachedSettings = localStorage.getItem("huntarr-settings-cache");
+            if (cachedSettings) {
+                const settings = JSON.parse(cachedSettings);
+                if (settings.magnetarr && settings.magnetarr.enabled !== undefined) {
+                    return settings.magnetarr.enabled === true;
+                }
+            }
+
+            if (window.huntarrUI && window.huntarrUI.originalSettings && window.huntarrUI.originalSettings.magnetarr) {
+                return window.huntarrUI.originalSettings.magnetarr.enabled === true;
+            }
+
+            this.fetchAndCacheMagnetarrState().then(() => {
+                setTimeout(() => {
+                    this.updateMagnetarrFieldsDisabledState();
+                }, 100);
+            });
+            return false;
+        } catch (e) {
+            console.warn("[SettingsForms] Error checking Magnetarr global status:", e);
+            return false;
+        }
+    },
+
+    // Fetch and cache current Magnetarr state from server
+    fetchAndCacheMagnetarrState: function () {
+        return fetch("./api/settings/magnetarr")
+            .then((response) => response.json())
+            .then((data) => {
+                try {
+                    let cachedSettings = {};
+                    const existing = localStorage.getItem("huntarr-settings-cache");
+                    if (existing) {
+                        cachedSettings = JSON.parse(existing);
+                    }
+                    if (!cachedSettings.magnetarr) cachedSettings.magnetarr = {};
+                    cachedSettings.magnetarr.enabled = data.enabled === true;
+                    localStorage.setItem("huntarr-settings-cache", JSON.stringify(cachedSettings));
+                } catch (e) {
+                    console.warn("[SettingsForms] Failed to update Magnetarr cache:", e);
+                }
+
+                if (window.huntarrUI && window.huntarrUI.originalSettings) {
+                    if (!window.huntarrUI.originalSettings.magnetarr) {
+                        window.huntarrUI.originalSettings.magnetarr = {};
+                    }
+                    window.huntarrUI.originalSettings.magnetarr.enabled = data.enabled === true;
+                }
+
+                return data.enabled === true;
+            })
+            .catch((error) => {
+                console.warn("[SettingsForms] Failed to fetch Magnetarr state:", error);
+                return false;
+            });
+    },
+
+    // Update Magnetarr fields visibility
+    updateMagnetarrFieldsDisabledState: function () {
+        this.fetchAndCacheMagnetarrState().then(() => {
+            const isEnabled = this.isMagnetarrGloballyEnabled();
+            const magnetarrFields = document.querySelectorAll('.magnetarr-field');
+            magnetarrFields.forEach(field => {
+                field.style.display = isEnabled ? '' : 'none';
+            });
+        });
+    },
+
     // Helper to save settings and refresh view. options: { section: 'main'|'notifications'|'logs' } for general only.
     saveAppSettings: function(appType, settings, successMessage, options) {
         if (typeof successMessage !== 'string') {

@@ -24,7 +24,7 @@ settings_logger = logging.getLogger("settings_manager")
 from src.primary.utils.database import get_database
 
 # Known app types
-KNOWN_APP_TYPES = ["sonarr", "radarr", "lidarr", "readarr", "whisparr", "eros", "swaparr", "prowlarr", "nzbdav", "movie_hunt", "tv_hunt", "general"]
+KNOWN_APP_TYPES = ["sonarr", "radarr", "lidarr", "readarr", "whisparr", "eros", "swaparr", "prowlarr", "nzbdav", "magnetarr", "movie_hunt", "tv_hunt", "general"]
 
 # Thread-safe settings cache with timestamps to avoid excessive database reads
 _settings_cache = {}  # Format: {app_name: {'timestamp': timestamp, 'data': settings_dict}}

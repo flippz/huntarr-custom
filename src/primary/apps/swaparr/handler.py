@@ -734,6 +734,12 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             for item in queue_items
         }
         removed_ids_this_cycle = set()
+        # A single download (e.g. a season pack) can produce multiple Sonarr/Radarr queue
+        # entries sharing the same name+size hash. Removing one via the API removes the whole
+        # underlying download, leaving the other entries (still in this cycle's in-memory
+        # queue_items snapshot) pointing at an already-deleted download. Without this, the loop
+        # would try to delete them too and get a 404 for every sibling entry.
+        removed_hashes_this_cycle = set()
 
         # Process each queue item
         items_processed_this_run = 0
@@ -748,37 +754,40 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             item_id = str(item["id"])
             item_state = "Normal"
             item_hash = generate_item_hash(item)
-            
+
             SWAPARR_STATS['total_processed'] += 1
             if not settings.get("dry_run", False):
                 increment_swaparr_stat("processed", 1)  # Track processed items in persistent system
             items_processed_this_run += 1
-            
-            # Check if this item has been previously removed
+
+            # Same underlying download already removed earlier this cycle via a sibling
+            # queue entry (see removed_hashes_this_cycle comment above) - skip it instead of
+            # calling delete on an id that's already gone.
+            if item_hash in removed_hashes_this_cycle:
+                item_state = "Skipped (same download already removed this cycle)"
+                swaparr_logger.debug(f"Skipping {item['name']} - same download already removed earlier this cycle")
+                continue
+
+            # A previously-removed download reappeared in the queue - this can happen because
+            # the *arr app re-grabbed it on its own, OR because the user manually re-added/
+            # re-searched it (e.g. after Swaparr removed it incorrectly). Auto-instant-removing
+            # it again here would silently undo a deliberate manual re-add with no way for the
+            # user to override it. So instead: clear the stale entry and let this attempt go
+            # through the normal strike pipeline fresh, just like any other download. If it's
+            # genuinely bad again it will accumulate strikes and get removed again normally;
+            # if it's a legitimate retry (or a manual re-add) it gets a real chance.
             if item_hash in removed_items:
-                last_removed_date = datetime.fromisoformat(removed_items[item_hash]["removed_time"].replace('Z', '+00:00'))
-                days_since_removal = (datetime.utcnow() - last_removed_date).days
-                
-                # Re-remove it automatically if it's been less than 7 days since last removal
-                if days_since_removal < 7:
-                    swaparr_logger.warning(f"Found previously removed download that reappeared: {item['name']} (removed {days_since_removal} days ago)")
-                    
-                    if not settings.get("dry_run", False):
-                        # Don't trigger search for re-removed items (they were already searched before)
-                        if delete_download(app_name, instance_data["api_url"], instance_data["api_key"], item["id"], True, item, False):
-                            swaparr_logger.info(f"Re-removed previously removed download: {item['name']}")
-                            # Update the removal time
-                            removed_items[item_hash]["removed_time"] = datetime.utcnow().isoformat()
-                            removed_ids_this_cycle.add(item_id)
-                            log_activity_event(app_name, instance_name, item_id, item['name'], "removed",
-                                                removed_items[item_hash].get("reason", "Re-appeared after previous removal"))
-                            # Note: Swaparr uses its own statistics system (SWAPARR_STATS), not the hunting stats manager
-                    else:
-                        swaparr_logger.info(f"DRY RUN: Would have re-removed previously removed download: {item['name']}")
-                    
-                    item_state = "Re-removed" if not settings.get("dry_run", False) else "Would Re-remove (Dry Run)"
-                    continue
-            
+                swaparr_logger.info(f"Previously removed download reappeared - giving it a fresh chance: {item['name']}")
+                del removed_items[item_hash]
+                # Sonarr/Radarr can reuse the same queue item_id for a re-grab of the same
+                # release, which means strike_data (strikes, first_strike_time, progress_tracking)
+                # would otherwise survive the round trip. That stale first_strike_time alone is
+                # enough to make age-based removal (and max-strikes) fire again immediately on
+                # the very next cycle, defeating the whole point of a manual re-add. Clear it so
+                # this item_id starts completely fresh, exactly like a brand new download.
+                if item_id in strike_data:
+                    del strike_data[item_id]
+
             # Skip large files if configured
             max_size = parse_size_string_to_bytes(settings.get("ignore_above_size", "25GB"))
             if item["size"] >= max_size:
@@ -847,6 +856,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                         }
                         save_removed_items(app_name, removed_items)
                         removed_ids_this_cycle.add(item_id)
+                        removed_hashes_this_cycle.add(item_hash)
                         log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Malicious: {malicious_reason}")
 
                         item_state = f"REMOVED (Malicious: {malicious_reason})"
@@ -880,6 +890,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                         }
                         save_removed_items(app_name, removed_items)
                         removed_ids_this_cycle.add(item_id)
+                        removed_hashes_this_cycle.add(item_hash)
                         log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Quality: {quality_reason}")
 
                         item_state = f"REMOVED (Quality: {quality_reason})"
@@ -926,6 +937,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                         strike_data[item_id]["removed"] = True
                         strike_data[item_id]["removed_time"] = datetime.utcnow().isoformat()
                         removed_ids_this_cycle.add(item_id)
+                        removed_hashes_this_cycle.add(item_hash)
                         log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Age: {age_reason}",
                                             strike_data[item_id].get("strikes", 0))
 
@@ -960,6 +972,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                         }
                         save_removed_items(app_name, removed_items)
                         removed_ids_this_cycle.add(item_id)
+                        removed_hashes_this_cycle.add(item_hash)
                         log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Failed Import: {import_reason}")
 
                         item_state = f"REMOVED (Failed Import: {import_reason})"
@@ -991,6 +1004,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                         }
                         save_removed_items(app_name, removed_items)
                         removed_ids_this_cycle.add(item_id)
+                        removed_hashes_this_cycle.add(item_hash)
                         log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Download error: {error_reason}")
 
                         item_state = f"REMOVED (Download error: {error_reason})"
@@ -1035,6 +1049,12 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             except (TypeError, ValueError):
                 sizeleft = 0
             is_completed = sizeleft == 0
+            raw_size = item.get("size")
+            try:
+                item_size = int(raw_size) if raw_size is not None else 0
+            except (TypeError, ValueError):
+                item_size = 0
+            bytes_downloaded = max(item_size - sizeleft, 0)
             remove_completed_stalled = settings.get("remove_completed_stalled", True)
             if is_completed and not remove_completed_stalled:
                 swaparr_logger.debug(f"Ignoring completed download (100% - waiting for import): {item['name']}")
@@ -1054,16 +1074,89 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                     exceeded_max_download_time = time_downloading_seconds >= max_dl_seconds
                 except (ValueError, TypeError):
                     exceeded_max_download_time = False
+
+            # Byte-based stall detection. Debrid-backed clients (e.g. Decypharr/AllDebrid)
+            # can legitimately report eta=0 while a release is still being fetched/cached
+            # server-side - that produced false "No progress" strikes on downloads that
+            # were actually progressing fine (bytes were moving, only the eta field was
+            # meaningless). Track actual bytes downloaded instead: only flag "no progress"
+            # if the downloaded-byte count hasn't increased for max_download_time, regardless
+            # of what eta says.
+            no_progress_stalled = False
+            made_progress = False
+            stalled_seconds = 0
+            if item_size > 0:
+                progress = strike_data[item_id].setdefault("progress_tracking", {
+                    "bytes_downloaded": bytes_downloaded,
+                    "last_progress_time": datetime.utcnow().isoformat()
+                })
+                if bytes_downloaded > progress.get("bytes_downloaded", 0):
+                    made_progress = True
+                    progress["bytes_downloaded"] = bytes_downloaded
+                    progress["last_progress_time"] = datetime.utcnow().isoformat()
+                else:
+                    last_progress_str = progress.get("last_progress_time")
+                    if last_progress_str:
+                        try:
+                            last_progress_time = datetime.fromisoformat(last_progress_str.replace("Z", "+00:00"))
+                            stalled_seconds = (datetime.utcnow() - last_progress_time.replace(tzinfo=None)).total_seconds()
+                            no_progress_stalled = stalled_seconds >= max_dl_seconds
+                        except (ValueError, TypeError):
+                            no_progress_stalled = False
+
+            # Items whose total size is still unknown (e.g. some debrid/usenet sources before
+            # metadata resolves) never get a bytes_downloaded measurement, so the byte-progress
+            # check above never runs for them. Without a fallback they could sit at "size unknown"
+            # forever and never strike. Fall back to wall-clock time since first seen for these.
+            size_unknown_stalled = item_size <= 0 and exceeded_max_download_time
+
+            # Stall-based strikes (ETA too long / No progress / size unknown) all key off
+            # max_download_time as the staleness threshold, but that threshold stays satisfied
+            # every cycle once crossed (e.g. exceeded_max_download_time or no_progress_stalled
+            # don't reset themselves) - without a separate cooldown, a fast cycle interval would
+            # hand out a new strike every single cycle. max_download_time also defines the
+            # minimum time that must pass between two stall-based strikes on the same item.
+            last_strike_str = strike_data[item_id].get("last_strike_time")
+            time_since_last_strike_ok = True
+            if last_strike_str:
+                try:
+                    last_strike_time = datetime.fromisoformat(last_strike_str.replace("Z", "+00:00"))
+                    seconds_since_last_strike = (datetime.utcnow() - last_strike_time.replace(tzinfo=None)).total_seconds()
+                    time_since_last_strike_ok = seconds_since_last_strike >= max_dl_seconds
+                except (ValueError, TypeError):
+                    time_since_last_strike_ok = True
+
             if metadata_issue:
                 should_strike = True
                 strike_reason = "Metadata"
-            elif item["eta"] >= max_dl_seconds and exceeded_max_download_time:
+            elif item["eta"] >= max_dl_seconds and exceeded_max_download_time and time_since_last_strike_ok:
                 should_strike = True
                 strike_reason = "ETA too long"
-            elif item["eta"] == 0 and item["status"] not in ["queued", "delay"] and exceeded_max_download_time:
+            elif no_progress_stalled and item["status"] not in ["queued", "delay"] and time_since_last_strike_ok:
                 should_strike = True
                 strike_reason = "No progress"
-            
+            elif size_unknown_stalled and item["status"] not in ["queued", "delay"] and time_since_last_strike_ok:
+                should_strike = True
+                strike_reason = "No progress (size unknown)"
+            else:
+                # Log why this item did NOT get a strike, so it's possible to tell from the
+                # logs whether Swaparr is actively watching a download and why it's holding off.
+                if item["status"] in ["queued", "delay"]:
+                    no_strike_reason = f"status is '{item['status']}' (queued/delayed)"
+                elif made_progress:
+                    no_strike_reason = f"actively progressing ({bytes_downloaded}/{item_size} bytes downloaded)"
+                elif not time_since_last_strike_ok:
+                    no_strike_reason = f"struck recently, minimum time between strikes ({int(max_dl_seconds)}s) not yet reached"
+                elif item_size <= 0:
+                    no_strike_reason = f"total size unknown, within grace period (max_download_time not yet reached, {int(max_dl_seconds)}s)"
+                elif no_progress_stalled is False and stalled_seconds > 0:
+                    no_strike_reason = f"no new bytes for {int(stalled_seconds)}s, within max_download_time ({int(max_dl_seconds)}s)"
+                elif not exceeded_max_download_time:
+                    no_strike_reason = f"within grace period (max_download_time not yet reached)"
+                else:
+                    no_strike_reason = "no stall conditions met"
+                swaparr_logger.debug(f"No strike for {item['name']} - Reason: {no_strike_reason}")
+
             # If we should strike this item, add a strike
             if should_strike:
                 strike_data[item_id]["strikes"] += 1
@@ -1100,6 +1193,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                                 "reason": strike_reason
                             }
                             removed_ids_this_cycle.add(item_id)
+                            removed_hashes_this_cycle.add(item_hash)
                             log_activity_event(app_name, instance_name, item_id, item['name'], "removed",
                                                 f"Max strikes ({strike_reason})", current_strikes)
 

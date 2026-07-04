@@ -11,12 +11,14 @@ window.HuntarrSwaparr = {
             .then(response => response.json())
             .then(data => {
                 const swaparrCard = document.getElementById('swaparrStatusCard');
+                const swaparrActivityCard = document.getElementById('swaparrActivityCard');
                 if (!swaparrCard) return;
 
-                // Show/hide card based on whether Swaparr is enabled
+                // Show/hide cards based on whether Swaparr is enabled
                 if (data.enabled && data.configured) {
                     swaparrCard.style.display = 'block';
-                    
+                    if (swaparrActivityCard) swaparrActivityCard.style.display = 'block';
+
                     // Update persistent statistics with large number formatting
                     const persistentStats = data.persistent_statistics || {};
                     const formatNumber = window.HuntarrStats ? 
@@ -45,13 +47,18 @@ window.HuntarrSwaparr = {
 
                 } else {
                     swaparrCard.style.display = 'none';
+                    if (swaparrActivityCard) swaparrActivityCard.style.display = 'none';
                 }
             })
             .catch(error => {
                 console.error('Error loading Swaparr status:', error);
                 const swaparrCard = document.getElementById('swaparrStatusCard');
+                const swaparrActivityCard = document.getElementById('swaparrActivityCard');
                 if (swaparrCard) {
                     swaparrCard.style.display = 'none';
+                }
+                if (swaparrActivityCard) {
+                    swaparrActivityCard.style.display = 'none';
                 }
             });
     },

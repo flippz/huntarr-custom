@@ -1354,5 +1354,29 @@ window.HuntarrInit = {
                 console.error('[HuntarrInit] Error loading Swaparr settings:', error);
                 swaparrContainer.innerHTML = '<p>Error loading Swaparr settings</p>';
             });
+    },
+
+    initializeMagnetarr: function() {
+        console.log('[HuntarrInit] initializeMagnetarr called');
+        const magnetarrContainer = document.getElementById('magnetarrContainer');
+        if (!magnetarrContainer) return;
+
+        const currentContent = magnetarrContainer.innerHTML.trim();
+        if (currentContent !== '' && !currentContent.includes('<!-- Magnetarr settings content will be shown here -->')) return;
+
+        fetch('./api/settings/magnetarr')
+            .then(response => response.json())
+            .then(settings => {
+                if (window.huntarrUI) window.huntarrUI.originalSettings.magnetarr = settings;
+                if (typeof SettingsForms !== 'undefined' && SettingsForms.generateMagnetarrForm) {
+                    SettingsForms.generateMagnetarrForm(magnetarrContainer, settings || {});
+                } else {
+                    magnetarrContainer.innerHTML = '<p>Error: Magnetarr forms not loaded</p>';
+                }
+            })
+            .catch(error => {
+                console.error('[HuntarrInit] Error loading Magnetarr settings:', error);
+                magnetarrContainer.innerHTML = '<p>Error loading Magnetarr settings</p>';
+            });
     }
 };

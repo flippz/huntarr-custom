@@ -241,6 +241,13 @@ PROWLARR_DEFAULTS = {
     "enabled": False
 }
 
+# Magnetarr default configuration - scrapes a URL/subreddit for magnet links and
+# exposes them as a Torznab-compatible indexer (e.g. for Prowlarr to consume).
+MAGNETARR_DEFAULTS = {
+    "enabled": False,
+    "torznab_api_key": ""
+}
+
 # NZBDav default configuration - 3rd party Usenet download client status integration.
 # NZBDav exposes a SABnzbd-compatible API at /api requiring its own api_key (separate
 # from any *arr download client config, which always masks the key on read).
@@ -356,6 +363,7 @@ def get_default_config(app_type: str) -> Dict[str, Any]:
         'prowlarr': PROWLARR_DEFAULTS,
         'nzbdav': NZBDAV_DEFAULTS,
         'swaparr': SWAPARR_DEFAULTS,
+        'magnetarr': MAGNETARR_DEFAULTS,
         'movie_hunt': MOVIE_HUNT_DEFAULTS,
         'tv_hunt': TV_HUNT_DEFAULTS,
         'general': GENERAL_DEFAULTS
@@ -407,4 +415,4 @@ def get_tv_hunt_instance_settings_defaults() -> Dict[str, Any]:
 
 def get_all_app_types() -> list:
     """Get list of all supported app types."""
-    return ['sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'eros', 'swaparr', 'prowlarr', 'nzbdav', 'general']
+    return ['sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'eros', 'swaparr', 'prowlarr', 'nzbdav', 'magnetarr', 'general']

@@ -42,6 +42,9 @@ hourly_cap_scheduler_thread = None
 # Swaparr processing thread
 swaparr_thread = None
 
+# Magnetarr processing thread
+magnetarr_thread = None
+
 # Background refresher for Prowlarr statistics
 prowlarr_stats_thread = None
 
@@ -1180,7 +1183,17 @@ def shutdown_threads():
             logger.warning("Swaparr thread did not stop gracefully")
         else:
             logger.info("Swaparr thread stopped")
-    
+
+    # Stop the Magnetarr processing thread
+    global magnetarr_thread
+    if magnetarr_thread and magnetarr_thread.is_alive():
+        logger.info("Waiting for Magnetarr thread to stop...")
+        magnetarr_thread.join(timeout=5.0)
+        if magnetarr_thread.is_alive():
+            logger.warning("Magnetarr thread did not stop gracefully")
+        else:
+            logger.info("Magnetarr thread stopped")
+
     # Stop the scheduler engine
     try:
         logger.info("Stopping schedule action engine...")
@@ -1396,6 +1409,53 @@ def swaparr_app_loop():
         swaparr_logger.error(f"Fatal error in Swaparr thread: {e}", exc_info=True)
     
     swaparr_logger.info("Swaparr thread stopped")
+
+def magnetarr_app_loop():
+    """Dedicated Magnetarr processing loop. Unlike Swaparr, sources each have their
+    own scan interval, so this polls on a short fixed cadence and lets run_magnetarr()
+    decide which sources are actually due."""
+    magnetarr_logger = get_logger("magnetarr")
+    magnetarr_logger.debug("Magnetarr thread started")
+
+    try:
+        from src.primary.apps.magnetarr.handler import run_magnetarr
+        from src.primary.settings_manager import load_settings
+        from src.primary.utils.database import get_database
+
+        while not stop_event.is_set():
+            try:
+                magnetarr_settings = load_settings("magnetarr")
+
+                if not magnetarr_settings or not magnetarr_settings.get("enabled", False):
+                    if stop_event.wait(30):
+                        break
+                    continue
+
+                try:
+                    db = get_database()
+                    reset_timestamp = db.get_pending_reset_request("magnetarr")
+                    if reset_timestamp:
+                        magnetarr_logger.info("Reset request detected for magnetarr. Scanning now.")
+                        db.mark_reset_request_processed("magnetarr")
+                except Exception as e:
+                    magnetarr_logger.error(f"Error checking reset request for magnetarr: {e}", exc_info=True)
+
+                try:
+                    run_magnetarr()
+                except Exception as e:
+                    magnetarr_logger.error(f"Error during Magnetarr processing: {e}", exc_info=True)
+
+                if stop_event.wait(60):
+                    break
+
+            except Exception as e:
+                magnetarr_logger.error(f"Unexpected error in Magnetarr loop: {e}", exc_info=True)
+                time.sleep(60)
+
+    except Exception as e:
+        magnetarr_logger.error(f"Fatal error in Magnetarr thread: {e}", exc_info=True)
+
+    magnetarr_logger.info("Magnetarr thread stopped")
 
 def start_hourly_cap_scheduler():
     """Start the hourly API cap scheduler thread"""
@@ -1846,6 +1906,23 @@ def start_swaparr_thread():
     
     logger.info(f"Swaparr thread started. Thread is alive: {swaparr_thread.is_alive()}")
 
+def start_magnetarr_thread():
+    """Start the dedicated Magnetarr processing thread"""
+    global magnetarr_thread
+
+    if magnetarr_thread and magnetarr_thread.is_alive():
+        logger.info("Magnetarr thread already running")
+        return
+
+    magnetarr_thread = threading.Thread(
+        target=magnetarr_app_loop,
+        name="MagnetarrApp",
+        daemon=True
+    )
+    magnetarr_thread.start()
+
+    logger.info(f"Magnetarr thread started. Thread is alive: {magnetarr_thread.is_alive()}")
+
 def start_huntarr():
     """Main entry point for Huntarr background tasks."""
     logger.info(f"--- Starting Huntarr Background Tasks v{__version__} --- ")
@@ -1866,7 +1943,14 @@ def start_huntarr():
         logger.info("Swaparr thread started successfully")
     except Exception as e:
         logger.error(f"Failed to start Swaparr thread: {e}")
-    
+
+    # Start the Magnetarr processing thread
+    try:
+        start_magnetarr_thread()
+        logger.info("Magnetarr thread started successfully")
+    except Exception as e:
+        logger.error(f"Failed to start Magnetarr thread: {e}")
+
     # Start the Prowlarr stats refresher
     try:
         start_prowlarr_stats_thread()

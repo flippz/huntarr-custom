@@ -35,7 +35,7 @@ from src.primary.routes.common import common_bp
 from src.primary.routes.media_hunt import movie_hunt_bp, tv_hunt_bp
 from src.primary.routes.plex_auth_routes import plex_auth_bp
 # Import blueprints for each app from the centralized blueprints module
-from src.primary.apps.blueprints import sonarr_bp, radarr_bp, lidarr_bp, readarr_bp, whisparr_bp, eros_bp, swaparr_bp, requestarr_bp, prowlarr_bp, nzbdav_bp
+from src.primary.apps.blueprints import sonarr_bp, radarr_bp, lidarr_bp, readarr_bp, whisparr_bp, eros_bp, swaparr_bp, requestarr_bp, prowlarr_bp, nzbdav_bp, magnetarr_bp
 
 # Import stateful blueprint
 from src.primary.stateful_routes import stateful_api
@@ -313,6 +313,7 @@ app.register_blueprint(eros_bp, url_prefix='/api/eros')
 app.register_blueprint(swaparr_bp, url_prefix='/api/swaparr')
 app.register_blueprint(prowlarr_bp, url_prefix='/api/prowlarr')
 app.register_blueprint(nzbdav_bp, url_prefix='/api/nzbdav')
+app.register_blueprint(magnetarr_bp, url_prefix='/api/magnetarr')
 app.register_blueprint(requestarr_bp)
 
 # Import and register Requestarr user management + services blueprints
@@ -1256,18 +1257,17 @@ def reset_app_cycle(app_name):
     web_logger.info(f"Manual cycle reset requested for {app_name} via API")
     
     # Check if app name is valid
-    if app_name not in ['sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'eros', 'swaparr', 'movie_hunt', 'tv_hunt']:
+    if app_name not in ['sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'eros', 'swaparr', 'magnetarr', 'movie_hunt', 'tv_hunt']:
         return jsonify({
             'success': False,
             'error': f"Invalid app name: {app_name}"
         }), 400
-    
-    # Check if the app is configured (special handling for Swaparr)
-    if app_name == 'swaparr':
-        # For Swaparr, check if it's enabled in settings
+
+    # Check if the app is configured (special handling for Swaparr/Magnetarr, which have no instances)
+    if app_name in ('swaparr', 'magnetarr'):
         from src.primary.settings_manager import load_settings
-        swaparr_settings = load_settings("swaparr")
-        if not swaparr_settings or not swaparr_settings.get("enabled", False):
+        app_settings = load_settings(app_name)
+        if not app_settings or not app_settings.get("enabled", False):
             return jsonify({
                 'success': False,
                 'error': f"{app_name} is not enabled"
@@ -1291,11 +1291,11 @@ def reset_app_cycle(app_name):
                 instance_name = j.get('instance_name') if j else None
             except Exception:
                 pass
-        if app_name == 'swaparr':
+        if app_name in ('swaparr', 'magnetarr'):
             instance_name = None
         instance_identifier = instance_name
         # Resolve display name to stable instance_id so reset is keyed correctly
-        if instance_name and app_name != 'swaparr':
+        if instance_name and app_name not in ('swaparr', 'magnetarr'):
             try:
                 app_module = __import__(f"src.primary.apps.{app_name}", fromlist=["get_configured_instances"])
                 get_instances = getattr(app_module, "get_configured_instances", None)

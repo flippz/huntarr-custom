@@ -105,6 +105,67 @@
                 </div>
             </div>
         </div>
+
+        <!-- Swaparr Activity (Active Queue + History) - only shows when Swaparr is enabled -->
+        <div class="card stats-card" id="swaparrActivityCard" style="display: none;">
+            <div class="home-section-bar">
+                <div class="home-section-bar-left">
+                    <i class="fas fa-list home-section-icon"></i>
+                    <span class="home-section-title">Swaparr Activity</span>
+                </div>
+                <button id="toggle-swaparr-activity" class="home-section-btn" title="Show Activity">
+                    <i class="fas fa-list"></i> Activity <i class="fas fa-chevron-down" id="swaparr-activity-chevron"></i>
+                </button>
+            </div>
+
+            <div id="swaparr-activity-panel" class="swaparr-activity-panel" style="display: none;">
+                <div class="swaparr-activity-instance-row">
+                    <label for="swaparr-activity-instance-select">Sonarr instance:</label>
+                    <select id="swaparr-activity-instance-select"></select>
+                </div>
+
+                <h4 class="swaparr-activity-heading">Active Queue</h4>
+                <div class="swaparr-activity-table-wrap">
+                    <table class="swaparr-activity-table" id="swaparr-activity-queue-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Size</th>
+                                <th>Sonarr Status</th>
+                                <th>Strikes</th>
+                                <th>Torrent Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr><td colspan="5" class="swaparr-activity-empty">No data loaded yet.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h4 class="swaparr-activity-heading">History (last 15 days)</h4>
+                <div class="swaparr-activity-table-wrap">
+                    <table class="swaparr-activity-table" id="swaparr-activity-history-table">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Name</th>
+                                <th>Event</th>
+                                <th>Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr><td colspan="4" class="swaparr-activity-empty">No data loaded yet.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="swaparr-activity-history-pagination">
+                    <button id="swaparr-activity-history-prev" class="cycle-reset-button"><i class="fas fa-chevron-left"></i></button>
+                    <span id="swaparr-activity-history-page-label">Page 1</span>
+                    <button id="swaparr-activity-history-next" class="cycle-reset-button"><i class="fas fa-chevron-right"></i></button>
+                </div>
+            </div>
+        </div>
+
         <!-- Hunt Activity -->
         <div class="card stats-card">
             <div class="home-section-bar">
@@ -460,9 +521,6 @@
                     <i class="fas fa-download home-section-icon"></i>
                     <span class="home-section-title">Swaparr Status</span>
                 </div>
-                <button id="toggle-swaparr-activity" class="home-section-btn" title="Show Activity">
-                    <i class="fas fa-list"></i> Activity <i class="fas fa-chevron-down" id="swaparr-activity-chevron"></i>
-                </button>
                 <button id="reset-swaparr-data" class="home-section-btn" title="Reset">
                     <i class="fas fa-trash"></i> Reset
                 </button>
@@ -496,53 +554,43 @@
                     </div>
                 </div>
             </div>
+        </div>
 
-            <!-- Swaparr Activity Panel (Sonarr) - collapsed by default -->
-            <div id="swaparr-activity-panel" class="swaparr-activity-panel" style="display: none;">
-                <div class="swaparr-activity-instance-row">
-                    <label for="swaparr-activity-instance-select">Sonarr instance:</label>
-                    <select id="swaparr-activity-instance-select"></select>
+        <!-- Magnetarr Status Card (only shows when Magnetarr is enabled) -->
+        <div class="card stats-card" id="magnetarrStatusCard" style="display: none;">
+            <div class="home-section-bar">
+                <div class="home-section-bar-left">
+                    <i class="fas fa-magnet home-section-icon"></i>
+                    <span class="home-section-title">Magnetarr Status</span>
                 </div>
-
-                <h4 class="swaparr-activity-heading">Active Queue</h4>
-                <div class="swaparr-activity-table-wrap">
-                    <table class="swaparr-activity-table" id="swaparr-activity-queue-table">
-                        <thead>
-                            <tr>
-                                <th>Name</th>
-                                <th>Size</th>
-                                <th>Sonarr Status</th>
-                                <th>Strikes</th>
-                                <th>Torrent Status</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr><td colspan="5" class="swaparr-activity-empty">No data loaded yet.</td></tr>
-                        </tbody>
-                    </table>
+            </div>
+            <div class="media-stats-container">
+                <div class="swaparr-stats-grid">
+                    <div class="app-stats-card magnetarr">
+                        <div class="stats-numbers">
+                            <div class="stat-box">
+                                <div class="stat-number" id="magnetarr-total-magnets">0</div>
+                                <div class="stat-label">Total Magnets</div>
+                            </div>
+                            <div class="stat-box">
+                                <div class="stat-number" id="magnetarr-sources-count">0</div>
+                                <div class="stat-label">Sources</div>
+                            </div>
+                            <div class="stat-box">
+                                <div class="stat-number" id="magnetarr-session-scanned">0</div>
+                                <div class="stat-label">Session Scanned</div>
+                            </div>
+                            <div class="stat-box">
+                                <div class="stat-number" id="magnetarr-session-found">0</div>
+                                <div class="stat-label">Session Found</div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
-
-                <h4 class="swaparr-activity-heading">History (last 15 days)</h4>
-                <div class="swaparr-activity-table-wrap">
-                    <table class="swaparr-activity-table" id="swaparr-activity-history-table">
-                        <thead>
-                            <tr>
-                                <th>Time</th>
-                                <th>Name</th>
-                                <th>Event</th>
-                                <th>Reason</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr><td colspan="4" class="swaparr-activity-empty">No data loaded yet.</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-                <div class="swaparr-activity-history-pagination">
-                    <button id="swaparr-activity-history-prev" class="cycle-reset-button"><i class="fas fa-chevron-left"></i></button>
-                    <span id="swaparr-activity-history-page-label">Page 1</span>
-                    <button id="swaparr-activity-history-next" class="cycle-reset-button"><i class="fas fa-chevron-right"></i></button>
-                </div>
+                <h4 class="swaparr-activity-heading">Recent Discoveries</h4>
+                <ul class="magnetarr-card-list" id="magnetarr-recent-discoveries">
+                    <li class="magnetarr-card-empty">No discoveries yet.</li>
+                </ul>
             </div>
         </div>
 
@@ -1123,6 +1171,53 @@
         -webkit-background-clip: text;
         background-clip: text;
         -webkit-text-fill-color: transparent;
+    }
+
+    .app-stats-card.magnetarr .stat-number {
+        background: linear-gradient(to bottom right, #a855f7, #c084fc);
+        -webkit-background-clip: text;
+        background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+
+    .magnetarr-card-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+    }
+
+    .magnetarr-card-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 0;
+        border-top: 1px solid rgba(160, 168, 184, 0.1);
+        font-size: 12.5px;
+    }
+
+    .magnetarr-card-item:first-child {
+        border-top: none;
+    }
+
+    .magnetarr-card-item-title {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        flex: 1;
+        min-width: 0;
+    }
+
+    .magnetarr-card-item-meta {
+        color: rgba(160, 168, 184, 0.9);
+        flex-shrink: 0;
+    }
+
+    .magnetarr-card-empty {
+        text-align: center;
+        color: rgba(160, 168, 184, 0.7);
+        padding: 10px 0;
+        list-style: none;
     }
 
     .swaparr-activity-panel {

@@ -10,12 +10,22 @@ window.HuntarrSwaparrActivity = {
     pollInterval: null,
     currentInstanceId: null,
     historyPage: 1,
+    storageKey: 'huntarr-swaparr-activity-expanded',
 
     init: function () {
         const toggleBtn = document.getElementById('toggle-swaparr-activity');
         if (toggleBtn && !toggleBtn.dataset.activityBound) {
             toggleBtn.dataset.activityBound = 'true';
             toggleBtn.addEventListener('click', () => this.togglePanel());
+        }
+
+        if (!this.stateRestored) {
+            this.stateRestored = true;
+            const saved = localStorage.getItem(this.storageKey);
+            const shouldExpand = saved === null ? true : saved === 'true';
+            if (shouldExpand) {
+                this.setExpanded(true);
+            }
         }
 
         const instanceSelect = document.getElementById('swaparr-activity-instance-select');
@@ -67,11 +77,16 @@ window.HuntarrSwaparrActivity = {
     },
 
     togglePanel: function () {
+        this.setExpanded(!this.expanded);
+        localStorage.setItem(this.storageKey, this.expanded ? 'true' : 'false');
+    },
+
+    setExpanded: function (expanded) {
         const panel = document.getElementById('swaparr-activity-panel');
         const chevron = document.getElementById('swaparr-activity-chevron');
         if (!panel) return;
 
-        this.expanded = !this.expanded;
+        this.expanded = expanded;
         panel.style.display = this.expanded ? 'block' : 'none';
         if (chevron) chevron.className = this.expanded ? 'fas fa-chevron-up' : 'fas fa-chevron-down';
 

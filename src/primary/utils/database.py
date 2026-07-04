@@ -17,9 +17,9 @@ import shutil
 
 logger = logging.getLogger(__name__)
 
-from src.primary.utils.db_mixins import ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, ExtrasMixin
+from src.primary.utils.db_mixins import ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, ExtrasMixin, MagnetarrMixin
 
-class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, ExtrasMixin):
+class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, ExtrasMixin, MagnetarrMixin):
     """Database manager for all Huntarr configurations and settings"""
     
     # Class-level corruption recovery lock — ensures only one thread recovers at a time
@@ -1329,6 +1329,52 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
             conn.execute('CREATE INDEX IF NOT EXISTS idx_ih_history_indexer ON indexer_hunt_history(indexer_id)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_ih_history_type ON indexer_hunt_history(event_type)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_ih_history_date ON indexer_hunt_history(created_at)')
+
+            # ── Magnetarr tables (URL/subreddit magnet scraper) ──────────
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS magnetarr_sources (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    source_type TEXT DEFAULT 'reddit',
+                    enabled INTEGER DEFAULT 1,
+                    interval_minutes INTEGER DEFAULT 20,
+                    last_scanned_at TIMESTAMP,
+                    last_after_token TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS magnetarr_magnets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    info_hash TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL,
+                    magnet_uri TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    source_name TEXT DEFAULT '',
+                    source_url TEXT DEFAULT '',
+                    category TEXT DEFAULT 'other',
+                    size_bytes INTEGER DEFAULT 0,
+                    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_magnetarr_magnets_hash ON magnetarr_magnets(info_hash)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_magnetarr_magnets_discovered ON magnetarr_magnets(discovered_at)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_magnetarr_magnets_source ON magnetarr_magnets(source_id)')
+
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS magnetarr_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id TEXT NOT NULL,
+                    stat_type TEXT NOT NULL,
+                    stat_value REAL DEFAULT 0,
+                    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(source_id, stat_type)
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_magnetarr_stats_source ON magnetarr_stats(source_id)')
 
             # ── Requestarr Users (multi-user request system) ────────────
             conn.execute('''

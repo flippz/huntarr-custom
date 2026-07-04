@@ -29,7 +29,7 @@ Object.assign(huntarrUI, {
         var requestarrSections = ['requestarr', 'requestarr-discover', 'requestarr-movies', 'requestarr-tv', 'requestarr-smarthunt', 'requestarr-hidden', 'requestarr-personal-blacklist', 'requestarr-options', 'requestarr-filters', 'requestarr-settings', 'requestarr-smarthunt-settings', 'requestarr-users', 'requestarr-bundles', 'requestarr-requests', 'requestarr-global-blacklist'];
         var mediaHuntSections = ['media-hunt-collection', 'media-hunt-settings', 'media-hunt-instances', 'media-hunt-calendar', 'activity-queue', 'activity-history', 'activity-blocklist', 'activity-logs', 'logs-media-hunt', 'indexer-hunt', 'indexer-hunt-stats', 'indexer-hunt-history', 'settings-clients', 'settings-media-management', 'settings-profiles', 'settings-sizes', 'settings-custom-formats', 'settings-import-lists', 'settings-import-media', 'settings-root-folders', 'settings-instance-management', 'movie-hunt-instance-editor', 'profile-editor'];
         var nzbHuntSections = ['nzb-hunt-home', 'nzb-hunt-activity', 'nzb-hunt-folders', 'nzb-hunt-servers', 'nzb-hunt-advanced', 'nzb-hunt-server-editor'];
-        var thirdPartyAppSections = ['sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'eros', 'prowlarr', 'swaparr', 'nzbdav'];
+        var thirdPartyAppSections = ['sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'eros', 'prowlarr', 'swaparr', 'nzbdav', 'magnetarr'];
         if (this._enableRequestarr === false && requestarrSections.indexOf(section) !== -1) {
             console.log('[huntarrUI] Requests disabled - redirecting to home');
             this.switchSection('home'); return;
@@ -231,6 +231,8 @@ Object.assign(huntarrUI, {
             this.checkAppConnections();
             // Load Swaparr status
             this.loadSwaparrStatus();
+            // Load Magnetarr status
+            this.loadMagnetarrStatus();
             // Refresh stats when returning to home section
             this.loadMediaStats();
             // Initialize view toggle and start live polling
@@ -1130,6 +1132,18 @@ Object.assign(huntarrUI, {
 
             // Initialize Swaparr section
             this.initializeSwaparr();
+        } else if (section === 'magnetarr' && document.getElementById('magnetarrSection')) {
+            document.getElementById('magnetarrSection').classList.add('active');
+            document.getElementById('magnetarrSection').style.display = 'block';
+            if (document.getElementById('appsMagnetarrNav')) document.getElementById('appsMagnetarrNav').classList.add('active');
+            newTitle = 'Magnetarr';
+            this.currentSection = 'magnetarr';
+
+            // Show Apps sidebar (Magnetarr lives under Apps)
+            this.showAppsSidebar();
+
+            // Initialize Magnetarr section
+            this.initializeMagnetarr();
         } else if (section === 'settings' && document.getElementById('settingsSection')) {
             document.getElementById('settingsSection').classList.add('active');
             document.getElementById('settingsSection').style.display = 'block';

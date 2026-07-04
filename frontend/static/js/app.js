@@ -243,6 +243,9 @@ let huntarrUI = {
         // Setup Swaparr status polling (refresh every 30 seconds)
         this.setupSwaparrStatusPolling();
 
+        // Setup Magnetarr status polling (refresh every 30 seconds)
+        this.setupMagnetarrStatusPolling();
+
         // Setup Prowlarr status polling (refresh every 30 seconds)
         this.setupProwlarrStatusPolling();
 
@@ -1108,6 +1111,22 @@ let huntarrUI = {
         }
     },
 
+    // Load and update Magnetarr status card
+    loadMagnetarrStatus: function () {
+        // Delegate to Magnetarr module
+        if (window.HuntarrMagnetarr) {
+            window.HuntarrMagnetarr.loadMagnetarrStatus();
+        }
+    },
+
+    // Setup Magnetarr status polling
+    setupMagnetarrStatusPolling: function () {
+        // Delegate to Magnetarr module
+        if (window.HuntarrMagnetarr) {
+            window.HuntarrMagnetarr.setupMagnetarrStatusPolling();
+        }
+    },
+
     // Prowlarr delegates — implementations in modules/features/prowlarr.js
     loadProwlarrStatus: function () { if (window.HuntarrProwlarr) window.HuntarrProwlarr.loadProwlarrStatus(); },
     loadProwlarrIndexers: function () { if (window.HuntarrProwlarr) window.HuntarrProwlarr.loadProwlarrIndexers(); },
@@ -1670,6 +1689,12 @@ let huntarrUI = {
     loadSwaparrApps: function () {
         if (window.HuntarrSwaparr) {
             window.HuntarrSwaparr.loadSwaparrApps();
+        }
+    },
+
+    initializeMagnetarr: function () {
+        if (window.HuntarrInit) {
+            window.HuntarrInit.initializeMagnetarr();
         }
     },
 
