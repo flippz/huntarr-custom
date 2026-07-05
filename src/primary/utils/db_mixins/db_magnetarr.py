@@ -55,7 +55,7 @@ class MagnetarrMixin:
     def update_magnetarr_source(self, src_id: str, updates: Dict[str, Any]) -> bool:
         """Update fields on a scrape source. Returns True if a row was updated."""
         allowed = ['name', 'url', 'source_type', 'enabled', 'interval_minutes',
-                   'last_scanned_at', 'last_after_token']
+                   'last_scanned_at', 'last_after_token', 'last_error']
         sets = []
         vals = []
         for k in allowed:
@@ -87,14 +87,14 @@ class MagnetarrMixin:
             conn.commit()
             return cur.rowcount > 0
 
-    def mark_source_scanned(self, src_id: str, after_token: str = '') -> None:
-        """Update last_scanned_at (now) and the pagination cursor for a source."""
+    def mark_source_scanned(self, src_id: str, after_token: str = '', last_error: str = '') -> None:
+        """Update last_scanned_at (now), the pagination cursor, and last error (if any) for a source."""
         with self.get_connection() as conn:
             conn.execute('''
                 UPDATE magnetarr_sources
-                SET last_scanned_at = CURRENT_TIMESTAMP, last_after_token = ?
+                SET last_scanned_at = CURRENT_TIMESTAMP, last_after_token = ?, last_error = ?
                 WHERE id = ?
-            ''', (after_token or '', src_id))
+            ''', (after_token or '', last_error or '', src_id))
             conn.commit()
 
     # ── Magnets ───────────────────────────────────────────────────────

@@ -16,6 +16,7 @@ import requests
 
 from src.primary.utils.logger import get_logger
 from src.primary.utils.database import get_database
+from src.primary.settings_manager import load_settings
 
 magnetarr_logger = get_logger("magnetarr")
 
@@ -26,6 +27,12 @@ INFO_HASH_RE = re.compile(r'xt=urn:btih:([A-Za-z0-9]+)')
 SIZE_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(GB|MB|TB)', re.IGNORECASE)
 
 SIZE_MULTIPLIERS = {'MB': 1024 ** 2, 'GB': 1024 ** 3, 'TB': 1024 ** 4}
+
+# Reddit now blocks unauthenticated .json scraping from most IPs (post-2023 API
+# changes) regardless of headers, so we go through the official OAuth API
+# (oauth.reddit.com) whenever credentials are configured. In-memory token cache
+# — one process-wide app-only token, refreshed on expiry or a 401.
+_REDDIT_TOKEN_CACHE = {'access_token': None, 'expires_at': 0}
 
 # Simple in-memory session stats, reset on process restart
 MAGNETARR_STATS = {
@@ -73,53 +80,130 @@ def guess_category(post_data: Dict[str, Any]) -> str:
     return flair
 
 
-def _request_with_backoff(url: str, timeout: int = 15, max_retries: int = 3) -> Optional[requests.Response]:
-    """GET a URL with a descriptive User-Agent and exponential backoff on HTTP 429."""
-    headers = {'User-Agent': USER_AGENT}
+def _get_reddit_credentials() -> Tuple[str, str]:
+    settings = load_settings("magnetarr")
+    return (settings.get("reddit_client_id", "") or "").strip(), \
+           (settings.get("reddit_client_secret", "") or "").strip()
+
+
+def _get_reddit_oauth_token(force_refresh: bool = False) -> Optional[str]:
+    """Get a cached app-only OAuth token, fetching/refreshing one if needed.
+    Returns None if no credentials are configured or the token request fails."""
+    client_id, client_secret = _get_reddit_credentials()
+    if not client_id or not client_secret:
+        return None
+
+    if not force_refresh and _REDDIT_TOKEN_CACHE['access_token'] and time.time() < _REDDIT_TOKEN_CACHE['expires_at']:
+        return _REDDIT_TOKEN_CACHE['access_token']
+
+    try:
+        resp = requests.post(
+            "https://www.reddit.com/api/v1/access_token",
+            auth=(client_id, client_secret),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": USER_AGENT},
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
+        magnetarr_logger.warning(f"Reddit OAuth token request failed: {e}")
+        return None
+
+    if resp.status_code != 200:
+        magnetarr_logger.warning(f"Reddit OAuth token request returned HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+
+    try:
+        payload = resp.json()
+        token = payload["access_token"]
+        expires_in = int(payload.get("expires_in", 3600))
+    except (ValueError, KeyError):
+        magnetarr_logger.warning("Reddit OAuth token response was not valid JSON")
+        return None
+
+    _REDDIT_TOKEN_CACHE['access_token'] = token
+    _REDDIT_TOKEN_CACHE['expires_at'] = time.time() + expires_in - 60  # refresh a minute early
+    return token
+
+
+def _request_with_backoff(url: str, timeout: int = 15, max_retries: int = 3,
+                           use_oauth: bool = False) -> Tuple[Optional[requests.Response], str]:
+    """GET a URL with a descriptive User-Agent and exponential backoff on HTTP 429.
+    Returns (response_or_none, error_message) — error_message is '' on success."""
     delay = 2
+    token = _get_reddit_oauth_token() if use_oauth else None
     for attempt in range(max_retries + 1):
+        headers = {'User-Agent': USER_AGENT}
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
         try:
             resp = requests.get(url, headers=headers, timeout=timeout)
         except requests.exceptions.RequestException as e:
             magnetarr_logger.warning(f"Request error fetching {url}: {e}")
-            return None
+            return None, f"Request error: {e}"
+
         if resp.status_code == 429:
             if attempt >= max_retries:
-                magnetarr_logger.warning(f"Rate limited fetching {url}, giving up after {max_retries} retries")
-                return None
+                return None, f"Rate limited (429) after {max_retries} retries"
             magnetarr_logger.debug(f"Rate limited fetching {url}, backing off {delay}s")
             time.sleep(delay)
             delay *= 2
             continue
-        return resp
-    return None
+
+        if resp.status_code == 401 and use_oauth and token:
+            # Token may have been revoked/expired early — refresh once and retry.
+            token = _get_reddit_oauth_token(force_refresh=True)
+            if token:
+                continue
+            return None, "Reddit OAuth token invalid/expired and refresh failed"
+
+        if resp.status_code == 403:
+            hint = "" if use_oauth else " - configure a Reddit client ID/secret in Magnetarr settings to fix this"
+            return None, f"Blocked by Reddit (HTTP 403){hint}"
+
+        if resp.status_code != 200:
+            return None, f"Unexpected HTTP {resp.status_code} from Reddit"
+
+        return resp, ""
+    return None, "Exhausted retries"
 
 
-def fetch_reddit_listing(url: str, after: str = None, limit: int = 100) -> Optional[Dict[str, Any]]:
-    """Fetch a page of a Reddit listing (subreddit) as JSON."""
-    base = url.rstrip('/')
+def fetch_reddit_listing(url: str, after: str = None, limit: int = 100) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Fetch a page of a Reddit listing (subreddit) as JSON. Returns (data_or_none, error_message)."""
+    client_id, client_secret = _get_reddit_credentials()
+    use_oauth = bool(client_id and client_secret)
+    base_host = "https://oauth.reddit.com" if use_oauth else "https://www.reddit.com"
+
+    parsed_path = url.rstrip('/')
+    for prefix in ("https://www.reddit.com", "https://old.reddit.com", "https://reddit.com"):
+        if parsed_path.startswith(prefix):
+            parsed_path = parsed_path[len(prefix):]
+            break
     query = f"?limit={limit}"
     if after:
         query += f"&after={after}"
-    resp = _request_with_backoff(f"{base}/.json{query}")
-    if resp is None or resp.status_code != 200:
-        return None
+
+    resp, err = _request_with_backoff(f"{base_host}{parsed_path}/.json{query}", use_oauth=use_oauth)
+    if resp is None:
+        return None, err
     try:
-        return resp.json()
+        return resp.json(), ""
     except ValueError:
-        magnetarr_logger.warning(f"Invalid JSON from {url}")
-        return None
+        return None, "Invalid JSON response from Reddit"
 
 
-def fetch_reddit_comments(permalink: str) -> Optional[Dict[str, Any]]:
+def fetch_reddit_comments(permalink: str) -> Tuple[Optional[Dict[str, Any]], str]:
     """Fetch a post's comments JSON (used only when no magnet is found in the post body/link)."""
-    resp = _request_with_backoff(f"https://www.reddit.com{permalink.rstrip('/')}.json")
-    if resp is None or resp.status_code != 200:
-        return None
+    client_id, client_secret = _get_reddit_credentials()
+    use_oauth = bool(client_id and client_secret)
+    base_host = "https://oauth.reddit.com" if use_oauth else "https://www.reddit.com"
+
+    resp, err = _request_with_backoff(f"{base_host}{permalink.rstrip('/')}.json", use_oauth=use_oauth)
+    if resp is None:
+        return None, err
     try:
-        return resp.json()
+        return resp.json(), ""
     except ValueError:
-        return None
+        return None, "Invalid JSON response from Reddit"
 
 
 def extract_magnets_from_post(post_data: Dict[str, Any]) -> Tuple[List[str], bool]:
@@ -140,7 +224,7 @@ def extract_magnets_from_post(post_data: Dict[str, Any]) -> Tuple[List[str], boo
     permalink = post_data.get('permalink')
     if not permalink:
         return [], False
-    comments_data = fetch_reddit_comments(permalink)
+    comments_data, _err = fetch_reddit_comments(permalink)
     if not comments_data:
         return [], True
     try:
@@ -161,12 +245,15 @@ def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
     scanned = 0
     found = 0
     last_after = after
+    last_error = ''
 
     try:
-        listing = fetch_reddit_listing(source_url, after=after)
+        listing, fetch_err = fetch_reddit_listing(source_url, after=after)
         if not listing:
+            last_error = fetch_err or 'Unknown fetch error'
+            magnetarr_logger.warning(f"Scan failed for source {source_name} ({source_url}): {last_error}")
             db.record_magnetarr_event(source_id, 'errors')
-            return {'scanned': 0, 'found': 0}
+            return {'scanned': 0, 'found': 0, 'error': last_error}
 
         children = listing.get('data', {}).get('children', [])
         for child in children:
@@ -200,10 +287,14 @@ def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
     except Exception as e:
         magnetarr_logger.error(f"Error scanning source {source_name} ({source_url}): {e}", exc_info=True)
         db.record_magnetarr_event(source_id, 'errors')
+        last_error = str(e)
     finally:
-        db.mark_source_scanned(source_id, last_after or '')
+        db.mark_source_scanned(source_id, last_after or '', last_error)
 
-    return {'scanned': scanned, 'found': found}
+    result = {'scanned': scanned, 'found': found}
+    if last_error:
+        result['error'] = last_error
+    return result
 
 
 def run_magnetarr() -> None:

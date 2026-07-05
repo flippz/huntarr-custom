@@ -1341,10 +1341,15 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                     interval_minutes INTEGER DEFAULT 20,
                     last_scanned_at TIMESTAMP,
                     last_after_token TEXT DEFAULT '',
+                    last_error TEXT DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            try:
+                conn.execute("ALTER TABLE magnetarr_sources ADD COLUMN last_error TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS magnetarr_magnets (

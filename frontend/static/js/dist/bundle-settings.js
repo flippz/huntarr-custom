@@ -4318,6 +4318,26 @@ document.head.appendChild(styleEl);
             </div>
 
             <div class="settings-group">
+                <h3>Reddit API Credentials</h3>
+                <p class="setting-help" style="margin-bottom: 20px; color: #9ca3af;">
+                    Reddit blocks unauthenticated scraping of its .json endpoints for most callers. Create a free
+                    "script" app at <a href="https://www.reddit.com/prefs/apps" target="_blank" rel="noopener">reddit.com/prefs/apps</a>
+                    and paste its client ID and secret here (no bot account/password needed) so Magnetarr can use Reddit's
+                    official OAuth API instead. Without these, scans of Reddit sources will likely fail with "Blocked by Reddit (403)".
+                </p>
+
+                <div class="setting-item">
+                    <label for="magnetarr_reddit_client_id">Client ID:</label>
+                    <input type="text" id="magnetarr_reddit_client_id" value="${escapeHtml(settings.reddit_client_id || '')}" placeholder="e.g. AbCdEfGhIjKlMn">
+                </div>
+
+                <div class="setting-item">
+                    <label for="magnetarr_reddit_client_secret">Client Secret:</label>
+                    <input type="password" id="magnetarr_reddit_client_secret" value="${escapeHtml(settings.reddit_client_secret || '')}" placeholder="Client secret">
+                </div>
+            </div>
+
+            <div class="settings-group">
                 <h3>Torznab Indexer</h3>
                 <p class="setting-help" style="margin-bottom: 20px; color: #9ca3af;">
                     Add this as a custom Torznab indexer in Prowlarr so Sonarr/Radarr/etc. can search magnets discovered by Magnetarr.
@@ -4383,11 +4403,12 @@ document.head.appendChild(styleEl);
                                 <th style="text-align:left; padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.2);">Interval</th>
                                 <th style="text-align:left; padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.2);">Enabled</th>
                                 <th style="text-align:left; padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.2);">Last Scanned</th>
+                                <th style="text-align:left; padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.2);">Status</th>
                                 <th style="text-align:left; padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.2);">Actions</th>
                             </tr>
                         </thead>
                         <tbody id="magnetarr-sources-tbody">
-                            <tr><td colspan="6" style="text-align:center; padding: 14px; color: rgba(160,168,184,0.7);">Loading sources...</td></tr>
+                            <tr><td colspan="7" style="text-align:center; padding: 14px; color: rgba(160,168,184,0.7);">Loading sources...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -4557,7 +4578,7 @@ document.head.appendChild(styleEl);
             .then(data => window.SettingsForms.renderMagnetarrSources((data && data.sources) || []))
             .catch(error => {
                 console.error('[Magnetarr] Error loading sources:', error);
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 14px; color: rgba(160,168,184,0.7);">Failed to load sources.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 14px; color: rgba(160,168,184,0.7);">Failed to load sources.</td></tr>';
             });
     };
 
@@ -4566,7 +4587,7 @@ document.head.appendChild(styleEl);
         if (!tbody) return;
 
         if (!sources || sources.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 14px; color: rgba(160,168,184,0.7);">No sources configured yet.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 14px; color: rgba(160,168,184,0.7);">No sources configured yet.</td></tr>';
             return;
         }
 
@@ -4574,6 +4595,9 @@ document.head.appendChild(styleEl);
 
         tbody.innerHTML = sources.map(src => {
             const lastScanned = src.last_scanned_at ? escapeHtml(src.last_scanned_at) : 'Never';
+            const status = src.last_error
+                ? `<span style="color:#ef4444;" title="${escapeHtml(src.last_error)}"><i class="fas fa-exclamation-triangle"></i> Error</span>`
+                : (src.last_scanned_at ? '<span style="color:#22c55e;"><i class="fas fa-check"></i> OK</span>' : '<span style="color:rgba(160,168,184,0.7);">-</span>');
             return `
                 <tr data-source-id="${escapeHtml(src.id)}">
                     <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(src.name)}</td>
@@ -4581,6 +4605,7 @@ document.head.appendChild(styleEl);
                     <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(src.interval_minutes)} min</td>
                     <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${src.enabled ? '<span style="color:#22c55e;">Yes</span>' : '<span style="color:#ef4444;">No</span>'}</td>
                     <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${lastScanned}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${status}</td>
                     <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1); white-space: nowrap;">
                         <button type="button" class="magnetarr-row-btn" data-action="scan" data-id="${escapeHtml(src.id)}" title="Scan Now"><i class="fas fa-sync-alt"></i></button>
                         <button type="button" class="magnetarr-row-btn" data-action="edit" data-id="${escapeHtml(src.id)}" title="Edit"><i class="fas fa-edit"></i></button>
@@ -4845,6 +4870,12 @@ document.head.appendChild(styleEl);
             enabledToggle.addEventListener('change', () => updateSaveButtonState(true));
         }
 
+        const clientIdInput = container.querySelector('#magnetarr_reddit_client_id');
+        const clientSecretInput = container.querySelector('#magnetarr_reddit_client_secret');
+        [clientIdInput, clientSecretInput].forEach(input => {
+            if (input) input.addEventListener('input', () => updateSaveButtonState(true));
+        });
+
         const newSaveButton = saveButton.cloneNode(true);
         saveButton.parentNode.replaceChild(newSaveButton, saveButton);
 
@@ -4857,6 +4888,10 @@ document.head.appendChild(styleEl);
             const settings = { ...originalSettings };
             const enabled = document.getElementById('magnetarr_enabled');
             if (enabled) settings.enabled = enabled.checked;
+            const clientId = document.getElementById('magnetarr_reddit_client_id');
+            if (clientId) settings.reddit_client_id = clientId.value.trim();
+            const clientSecret = document.getElementById('magnetarr_reddit_client_secret');
+            if (clientSecret) settings.reddit_client_secret = clientSecret.value.trim();
 
             window.SettingsForms.saveAppSettings('magnetarr', settings);
 

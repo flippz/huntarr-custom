@@ -112,7 +112,7 @@ def scan_now(src_id):
         return jsonify({"success": False, "error": "Source not found"}), 404
     try:
         result = scan_source(source)
-        return jsonify({"success": True, **result})
+        return jsonify({"success": not result.get("error"), **result})
     except Exception as e:
         magnetarr_logger.error(f"Manual scan failed for {src_id}: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
