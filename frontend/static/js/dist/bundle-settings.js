@@ -4318,26 +4318,6 @@ document.head.appendChild(styleEl);
             </div>
 
             <div class="settings-group">
-                <h3>Reddit API Credentials</h3>
-                <p class="setting-help" style="margin-bottom: 20px; color: #9ca3af;">
-                    Reddit blocks unauthenticated scraping of its .json endpoints for most callers. Create a free
-                    "script" app at <a href="https://www.reddit.com/prefs/apps" target="_blank" rel="noopener">reddit.com/prefs/apps</a>
-                    and paste its client ID and secret here (no bot account/password needed) so Magnetarr can use Reddit's
-                    official OAuth API instead. Without these, scans of Reddit sources will likely fail with "Blocked by Reddit (403)".
-                </p>
-
-                <div class="setting-item">
-                    <label for="magnetarr_reddit_client_id">Client ID:</label>
-                    <input type="text" id="magnetarr_reddit_client_id" value="${escapeHtml(settings.reddit_client_id || '')}" placeholder="e.g. AbCdEfGhIjKlMn">
-                </div>
-
-                <div class="setting-item">
-                    <label for="magnetarr_reddit_client_secret">Client Secret:</label>
-                    <input type="password" id="magnetarr_reddit_client_secret" value="${escapeHtml(settings.reddit_client_secret || '')}" placeholder="Client secret">
-                </div>
-            </div>
-
-            <div class="settings-group">
                 <h3>Torznab Indexer</h3>
                 <p class="setting-help" style="margin-bottom: 20px; color: #9ca3af;">
                     Add this as a custom Torznab indexer in Prowlarr so Sonarr/Radarr/etc. can search magnets discovered by Magnetarr.
@@ -4870,12 +4850,6 @@ document.head.appendChild(styleEl);
             enabledToggle.addEventListener('change', () => updateSaveButtonState(true));
         }
 
-        const clientIdInput = container.querySelector('#magnetarr_reddit_client_id');
-        const clientSecretInput = container.querySelector('#magnetarr_reddit_client_secret');
-        [clientIdInput, clientSecretInput].forEach(input => {
-            if (input) input.addEventListener('input', () => updateSaveButtonState(true));
-        });
-
         const newSaveButton = saveButton.cloneNode(true);
         saveButton.parentNode.replaceChild(newSaveButton, saveButton);
 
@@ -4888,10 +4862,6 @@ document.head.appendChild(styleEl);
             const settings = { ...originalSettings };
             const enabled = document.getElementById('magnetarr_enabled');
             if (enabled) settings.enabled = enabled.checked;
-            const clientId = document.getElementById('magnetarr_reddit_client_id');
-            if (clientId) settings.reddit_client_id = clientId.value.trim();
-            const clientSecret = document.getElementById('magnetarr_reddit_client_secret');
-            if (clientSecret) settings.reddit_client_secret = clientSecret.value.trim();
 
             window.SettingsForms.saveAppSettings('magnetarr', settings);
 

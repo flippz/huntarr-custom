@@ -243,14 +243,12 @@ PROWLARR_DEFAULTS = {
 
 # Magnetarr default configuration - scrapes a URL/subreddit for magnet links and
 # exposes them as a Torznab-compatible indexer (e.g. for Prowlarr to consume).
-# reddit_client_id/reddit_client_secret are optional Reddit "app" OAuth credentials
-# (from reddit.com/prefs/apps) — without them, Magnetarr falls back to Reddit's
-# unauthenticated .json endpoint, which Reddit blocks for most callers since 2023.
+# Scrapes Reddit's Atom RSS feed (.rss) rather than the .json API — Reddit blocks
+# unauthenticated .json access for most callers since 2023 and now requires a
+# multi-week manual approval process for API app credentials, but RSS remains open.
 MAGNETARR_DEFAULTS = {
     "enabled": False,
-    "torznab_api_key": "",
-    "reddit_client_id": "",
-    "reddit_client_secret": ""
+    "torznab_api_key": ""
 }
 
 # NZBDav default configuration - 3rd party Usenet download client status integration.

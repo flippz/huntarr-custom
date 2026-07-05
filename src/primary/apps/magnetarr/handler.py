@@ -1,14 +1,19 @@
 """
 Magnetarr scraping logic.
 
-Fetches Reddit listing JSON (no HTML parsing needed — appending `.json` to any
-reddit listing/comments URL returns structured data), extracts magnet: URIs
-from post bodies and linked URLs, dedupes them by BTIH info-hash, and stores
-them in the database for the Torznab endpoint to serve.
+Fetches Reddit's Atom RSS feed (appending `.rss` to any listing/comments URL) —
+Reddit blocks the unauthenticated `.json` API for most callers since its 2023
+API changes, but its RSS endpoints remain openly accessible and require no
+developer app/approval. Extracts magnet: URIs (including text-obfuscated ones,
+since some communities mask links to dodge Reddit's spam filter) from post
+bodies, dedupes them by BTIH info-hash, and stores them in the database for
+the Torznab endpoint to serve.
 """
 
 import re
 import time
+import html as html_module
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -16,23 +21,29 @@ import requests
 
 from src.primary.utils.logger import get_logger
 from src.primary.utils.database import get_database
-from src.primary.settings_manager import load_settings
 
 magnetarr_logger = get_logger("magnetarr")
 
 USER_AGENT = "Mozilla/5.0 (compatible; Huntarr-Magnetarr/1.0; +https://github.com/plexguide/Huntarr)"
 
+ATOM_NS = "http://www.w3.org/2005/Atom"
+
 MAGNET_RE = re.compile(r'magnet:\?xt=urn:btih:[A-Za-z0-9]+[^\s"\'<>\\]*')
 INFO_HASH_RE = re.compile(r'xt=urn:btih:([A-Za-z0-9]+)')
 SIZE_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(GB|MB|TB)', re.IGNORECASE)
+HTML_TAG_RE = re.compile(r'<[^>]+>')
 
 SIZE_MULTIPLIERS = {'MB': 1024 ** 2, 'GB': 1024 ** 3, 'TB': 1024 ** 4}
 
-# Reddit now blocks unauthenticated .json scraping from most IPs (post-2023 API
-# changes) regardless of headers, so we go through the official OAuth API
-# (oauth.reddit.com) whenever credentials are configured. In-memory token cache
-# — one process-wide app-only token, refreshed on expiry or a 401.
-_REDDIT_TOKEN_CACHE = {'access_token': None, 'expires_at': 0}
+# Some communities mask links (e.g. "magnet (colon) ?xt=urn (colon) btih (colon) ...",
+# "mega (dot) nz") to dodge Reddit's spam/domain filters. Undo the common patterns
+# before scanning for magnet URIs so masked links are still caught.
+_DEOBFUSCATE_PATTERNS = [
+    (re.compile(r'\s*[\(\[]\s*dot\s*[\)\]]\s*', re.IGNORECASE), '.'),
+    (re.compile(r'\s+dot\s+', re.IGNORECASE), '.'),
+    (re.compile(r'\s*[\(\[]\s*colon\s*[\)\]]\s*', re.IGNORECASE), ':'),
+    (re.compile(r'\s*[\(\[]\s*at\s*[\)\]]\s*', re.IGNORECASE), '@'),
+]
 
 # Simple in-memory session stats, reset on process restart
 MAGNETARR_STATS = {
@@ -72,69 +83,33 @@ def parse_size_from_title(title: str) -> int:
     return int(value * SIZE_MULTIPLIERS.get(unit, 0))
 
 
-def guess_category(post_data: Dict[str, Any]) -> str:
-    """Best-effort category guess from link flair; defaults to 'other'."""
-    flair = (post_data.get('link_flair_text') or '').strip().lower()
-    if not flair:
-        return 'other'
-    return flair
+def deobfuscate_text(text: str) -> str:
+    """Undo common link-masking patterns (e.g. 'mega (dot) nz') so masked magnet
+    links posted to dodge spam filters are still detected."""
+    for pattern, replacement in _DEOBFUSCATE_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
-def _get_reddit_credentials() -> Tuple[str, str]:
-    settings = load_settings("magnetarr")
-    return (settings.get("reddit_client_id", "") or "").strip(), \
-           (settings.get("reddit_client_secret", "") or "").strip()
+def find_magnets_in_text(text: str) -> List[str]:
+    """Find magnet URIs in raw text, including common obfuscated forms."""
+    if not text:
+        return []
+    found = list(MAGNET_RE.findall(text))
+    deobfuscated = deobfuscate_text(text)
+    if deobfuscated != text:
+        for candidate in MAGNET_RE.findall(deobfuscated):
+            if candidate not in found:
+                found.append(candidate)
+    return found
 
 
-def _get_reddit_oauth_token(force_refresh: bool = False) -> Optional[str]:
-    """Get a cached app-only OAuth token, fetching/refreshing one if needed.
-    Returns None if no credentials are configured or the token request fails."""
-    client_id, client_secret = _get_reddit_credentials()
-    if not client_id or not client_secret:
-        return None
-
-    if not force_refresh and _REDDIT_TOKEN_CACHE['access_token'] and time.time() < _REDDIT_TOKEN_CACHE['expires_at']:
-        return _REDDIT_TOKEN_CACHE['access_token']
-
-    try:
-        resp = requests.post(
-            "https://www.reddit.com/api/v1/access_token",
-            auth=(client_id, client_secret),
-            data={"grant_type": "client_credentials"},
-            headers={"User-Agent": USER_AGENT},
-            timeout=15,
-        )
-    except requests.exceptions.RequestException as e:
-        magnetarr_logger.warning(f"Reddit OAuth token request failed: {e}")
-        return None
-
-    if resp.status_code != 200:
-        magnetarr_logger.warning(f"Reddit OAuth token request returned HTTP {resp.status_code}: {resp.text[:200]}")
-        return None
-
-    try:
-        payload = resp.json()
-        token = payload["access_token"]
-        expires_in = int(payload.get("expires_in", 3600))
-    except (ValueError, KeyError):
-        magnetarr_logger.warning("Reddit OAuth token response was not valid JSON")
-        return None
-
-    _REDDIT_TOKEN_CACHE['access_token'] = token
-    _REDDIT_TOKEN_CACHE['expires_at'] = time.time() + expires_in - 60  # refresh a minute early
-    return token
-
-
-def _request_with_backoff(url: str, timeout: int = 15, max_retries: int = 3,
-                           use_oauth: bool = False) -> Tuple[Optional[requests.Response], str]:
+def _request_with_backoff(url: str, timeout: int = 15, max_retries: int = 3) -> Tuple[Optional[requests.Response], str]:
     """GET a URL with a descriptive User-Agent and exponential backoff on HTTP 429.
     Returns (response_or_none, error_message) — error_message is '' on success."""
+    headers = {'User-Agent': USER_AGENT}
     delay = 2
-    token = _get_reddit_oauth_token() if use_oauth else None
     for attempt in range(max_retries + 1):
-        headers = {'User-Agent': USER_AGENT}
-        if token:
-            headers['Authorization'] = f'Bearer {token}'
         try:
             resp = requests.get(url, headers=headers, timeout=timeout)
         except requests.exceptions.RequestException as e:
@@ -149,16 +124,8 @@ def _request_with_backoff(url: str, timeout: int = 15, max_retries: int = 3,
             delay *= 2
             continue
 
-        if resp.status_code == 401 and use_oauth and token:
-            # Token may have been revoked/expired early — refresh once and retry.
-            token = _get_reddit_oauth_token(force_refresh=True)
-            if token:
-                continue
-            return None, "Reddit OAuth token invalid/expired and refresh failed"
-
         if resp.status_code == 403:
-            hint = "" if use_oauth else " - configure a Reddit client ID/secret in Magnetarr settings to fix this"
-            return None, f"Blocked by Reddit (HTTP 403){hint}"
+            return None, "Blocked by Reddit (HTTP 403)"
 
         if resp.status_code != 200:
             return None, f"Unexpected HTTP {resp.status_code} from Reddit"
@@ -167,71 +134,90 @@ def _request_with_backoff(url: str, timeout: int = 15, max_retries: int = 3,
     return None, "Exhausted retries"
 
 
-def fetch_reddit_listing(url: str, after: str = None, limit: int = 100) -> Tuple[Optional[Dict[str, Any]], str]:
-    """Fetch a page of a Reddit listing (subreddit) as JSON. Returns (data_or_none, error_message)."""
-    client_id, client_secret = _get_reddit_credentials()
-    use_oauth = bool(client_id and client_secret)
-    base_host = "https://oauth.reddit.com" if use_oauth else "https://www.reddit.com"
-
-    parsed_path = url.rstrip('/')
+def _to_reddit_path(url: str) -> str:
+    """Strip the reddit.com host prefix from a configured source URL, leaving just the path."""
+    path = url.rstrip('/')
     for prefix in ("https://www.reddit.com", "https://old.reddit.com", "https://reddit.com"):
-        if parsed_path.startswith(prefix):
-            parsed_path = parsed_path[len(prefix):]
-            break
+        if path.startswith(prefix):
+            return path[len(prefix):]
+    return path
+
+
+def _parse_atom_entries(xml_text: str) -> List[Dict[str, Any]]:
+    """Parse a Reddit Atom RSS feed into a list of post dicts:
+    {id, name (fullname), title, permalink, content_html}."""
+    root = ET.fromstring(xml_text)
+    posts = []
+    for entry in root.findall(f'{{{ATOM_NS}}}entry'):
+        entry_id = (entry.findtext(f'{{{ATOM_NS}}}id') or '').strip()  # e.g. "t3_abc123"
+        title = (entry.findtext(f'{{{ATOM_NS}}}title') or 'Untitled').strip()
+        content_el = entry.find(f'{{{ATOM_NS}}}content')
+        content_html = content_el.text if content_el is not None and content_el.text else ''
+
+        permalink = ''
+        for link_el in entry.findall(f'{{{ATOM_NS}}}link'):
+            href = link_el.get('href', '')
+            if href:
+                permalink = href
+                break
+
+        posts.append({
+            'id': entry_id,
+            'title': title,
+            'permalink': permalink,
+            'content_html': html_module.unescape(content_html),
+        })
+    return posts
+
+
+def fetch_reddit_listing(url: str, after: str = None, limit: int = 100) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """Fetch a page of a Reddit listing (subreddit) via its Atom RSS feed.
+    Returns (posts_or_none, error_message)."""
+    path = _to_reddit_path(url)
     query = f"?limit={limit}"
     if after:
         query += f"&after={after}"
 
-    resp, err = _request_with_backoff(f"{base_host}{parsed_path}/.json{query}", use_oauth=use_oauth)
+    resp, err = _request_with_backoff(f"https://www.reddit.com{path}/.rss{query}")
     if resp is None:
         return None, err
     try:
-        return resp.json(), ""
-    except ValueError:
-        return None, "Invalid JSON response from Reddit"
+        return _parse_atom_entries(resp.text), ""
+    except ET.ParseError as e:
+        return None, f"Invalid RSS/XML response from Reddit: {e}"
 
 
-def fetch_reddit_comments(permalink: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    """Fetch a post's comments JSON (used only when no magnet is found in the post body/link)."""
-    client_id, client_secret = _get_reddit_credentials()
-    use_oauth = bool(client_id and client_secret)
-    base_host = "https://oauth.reddit.com" if use_oauth else "https://www.reddit.com"
-
-    resp, err = _request_with_backoff(f"{base_host}{permalink.rstrip('/')}.json", use_oauth=use_oauth)
+def fetch_reddit_comments_text(permalink: str) -> Tuple[str, str]:
+    """Fetch a post's comments feed as raw text (used only when no magnet is found
+    in the post body). Returns (raw_text, error_message)."""
+    resp, err = _request_with_backoff(f"https://www.reddit.com{_to_reddit_path(permalink)}/.rss")
     if resp is None:
-        return None, err
-    try:
-        return resp.json(), ""
-    except ValueError:
-        return None, "Invalid JSON response from Reddit"
+        return '', err
+    return resp.text, ""
 
 
-def extract_magnets_from_post(post_data: Dict[str, Any]) -> Tuple[List[str], bool]:
-    """Find magnet URIs in a post's selftext or linked URL.
-    Falls back to fetching comments if none found there.
+def guess_category(title: str) -> str:
+    """Best-effort category guess — RSS doesn't expose link flair, so this is a light heuristic."""
+    return 'other'
+
+
+def extract_magnets_from_post(post: Dict[str, Any]) -> Tuple[List[str], bool]:
+    """Find magnet URIs in a post's body/content (including obfuscated ones).
+    Falls back to fetching the comments feed if none found there.
     Returns (magnet_uris, fetched_comments) — callers use the second value to pace requests."""
-    candidates = []
-    selftext = post_data.get('selftext') or ''
-    candidates.extend(MAGNET_RE.findall(selftext))
-
-    link_url = post_data.get('url_overridden_by_dest') or post_data.get('url') or ''
-    if link_url.startswith('magnet:'):
-        candidates.extend(MAGNET_RE.findall(link_url))
-
+    content_html = post.get('content_html') or ''
+    content_text = HTML_TAG_RE.sub(' ', content_html)
+    candidates = find_magnets_in_text(content_text)
     if candidates:
         return candidates, False
 
-    permalink = post_data.get('permalink')
+    permalink = post.get('permalink')
     if not permalink:
         return [], False
-    comments_data, _err = fetch_reddit_comments(permalink)
-    if not comments_data:
+    comments_text, _err = fetch_reddit_comments_text(permalink)
+    if not comments_text:
         return [], True
-    try:
-        comments_text = str(comments_data)
-        return MAGNET_RE.findall(comments_text), True
-    except Exception:
-        return [], True
+    return find_magnets_in_text(HTML_TAG_RE.sub(' ', html_module.unescape(comments_text))), True
 
 
 def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
@@ -248,23 +234,21 @@ def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
     last_error = ''
 
     try:
-        listing, fetch_err = fetch_reddit_listing(source_url, after=after)
-        if not listing:
+        posts, fetch_err = fetch_reddit_listing(source_url, after=after)
+        if posts is None:
             last_error = fetch_err or 'Unknown fetch error'
             magnetarr_logger.warning(f"Scan failed for source {source_name} ({source_url}): {last_error}")
             db.record_magnetarr_event(source_id, 'errors')
             return {'scanned': 0, 'found': 0, 'error': last_error}
 
-        children = listing.get('data', {}).get('children', [])
-        for child in children:
-            post_data = child.get('data', {})
+        for post in posts:
             scanned += 1
-            magnets, fetched_comments = extract_magnets_from_post(post_data)
+            magnets, fetched_comments = extract_magnets_from_post(post)
             for magnet_uri in magnets:
                 info_hash = extract_info_hash(magnet_uri)
                 if not info_hash:
                     continue
-                title = post_data.get('title', 'Untitled')
+                title = post.get('title', 'Untitled')
                 record = {
                     'info_hash': info_hash,
                     'title': title,
@@ -272,7 +256,7 @@ def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
                     'source_id': source_id,
                     'source_name': source_name,
                     'source_url': source_url,
-                    'category': guess_category(post_data),
+                    'category': guess_category(title),
                     'size_bytes': parse_size_from_title(title),
                 }
                 if db.insert_magnet_if_new(record):
@@ -280,7 +264,8 @@ def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
             if fetched_comments:
                 time.sleep(1.1)  # pace the comments-fallback request we just made
 
-        last_after = listing.get('data', {}).get('after') or ''
+        if posts:
+            last_after = posts[-1].get('id') or ''
         db.record_magnetarr_event(source_id, 'scans')
         if found:
             db.record_magnetarr_event(source_id, 'found', found)
