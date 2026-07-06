@@ -145,6 +145,14 @@ def _get_torznab_api_key():
     return key
 
 
+@magnetarr_bp.route('/torznab-key', methods=['GET'])
+def torznab_key():
+    """Ensure the Torznab API key exists and return it, so the settings page can
+    display it immediately instead of waiting for an external tool to query the
+    Torznab endpoint first."""
+    return jsonify({"api_key": _get_torznab_api_key()})
+
+
 def _torznab_error(message, code=900):
     root = ET.Element("error", {"code": str(code), "description": message})
     xml_bytes = b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding='utf-8')

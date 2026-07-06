@@ -252,6 +252,7 @@
         window.SettingsForms.setupMagnetarrSourceModal();
         window.SettingsForms.loadMagnetarrSources();
         window.SettingsForms.loadMagnetarrMagnets();
+        window.SettingsForms.loadMagnetarrTorznabKey();
 
         const searchBtn = document.getElementById('magnetarr-magnets-search-btn');
         const searchInput = document.getElementById('magnetarr-magnets-search');
@@ -318,10 +319,24 @@
                 if (input && input.value) {
                     copyToClipboard(input.value, 'API Key');
                 } else {
-                    notify('API key has not been generated yet. Query the Torznab endpoint once to generate it.', 'warning');
+                    notify('API key not loaded yet, try again in a moment.', 'warning');
                 }
             });
         }
+    };
+
+    window.SettingsForms.loadMagnetarrTorznabKey = function () {
+        HuntarrUtils.fetchWithTimeout('./api/magnetarr/torznab-key')
+            .then(response => response.json())
+            .then(data => {
+                const input = document.getElementById('magnetarr_torznab_apikey');
+                if (input && data && data.api_key) {
+                    input.value = data.api_key;
+                }
+            })
+            .catch(error => {
+                console.error('[Magnetarr] Error loading Torznab API key:', error);
+            });
     };
 
     // ---------------------------------------------------------------------
