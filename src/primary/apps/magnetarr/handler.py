@@ -12,6 +12,7 @@ the Torznab endpoint to serve.
 
 import re
 import time
+import hashlib
 import html as html_module
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -21,6 +22,8 @@ import requests
 
 from src.primary.utils.logger import get_logger
 from src.primary.utils.database import get_database
+from src.primary.settings_manager import load_settings
+from src.primary.apps.magnetarr.realdebrid import rd_add_and_select, rd_get_status, rd_delete_torrent
 
 magnetarr_logger = get_logger("magnetarr")
 
@@ -201,6 +204,40 @@ def guess_category(title: str) -> str:
     return 'other'
 
 
+def _hash_post_content(content_html: str) -> str:
+    """Hash a post's raw body so we can detect when the uploader edits it
+    (e.g. adds a new session to a 'live' torrent's Contains: list)."""
+    return hashlib.sha256((content_html or '').encode('utf-8', errors='ignore')).hexdigest()
+
+
+def _submit_to_realdebrid(source_id: str, post: Dict[str, Any], magnet_uri: str, info_hash: str, title: str) -> None:
+    """Send a newly discovered magnet to Real-Debrid and start tracking its post
+    for content changes (see recheck_realdebrid_watched_posts)."""
+    settings = load_settings("magnetarr")
+    api_token = (settings.get("realdebrid_api_token") or "").strip()
+    if not api_token:
+        magnetarr_logger.warning("Real-Debrid auto-add is enabled for a source but no API token is configured")
+        return
+
+    db = get_database()
+    torrent_id, err = rd_add_and_select(magnet_uri, api_token)
+    if err:
+        magnetarr_logger.warning(f"Real-Debrid submission failed for '{title}': {err}")
+
+    db.upsert_realdebrid_submission({
+        'info_hash': info_hash,
+        'magnet_uri': magnet_uri,
+        'title': title,
+        'permalink': post.get('permalink', ''),
+        'source_id': source_id,
+        'rd_torrent_id': torrent_id or '',
+        'content_hash': _hash_post_content(post.get('content_html', '')),
+        'status': 'error' if err else 'submitted',
+        'last_error': err,
+        'active': True,
+    })
+
+
 def extract_magnets_from_post(post: Dict[str, Any]) -> Tuple[List[str], bool]:
     """Find magnet URIs in a post's body/content (including obfuscated ones).
     Falls back to fetching the comments feed if none found there.
@@ -261,6 +298,8 @@ def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
                 }
                 if db.insert_magnet_if_new(record):
                     found += 1
+                    if source.get('realdebrid_auto_add'):
+                        _submit_to_realdebrid(source_id, post, magnet_uri, info_hash, title)
             if fetched_comments:
                 time.sleep(1.1)  # pace the comments-fallback request we just made
 
@@ -312,3 +351,91 @@ def run_magnetarr() -> None:
         except Exception as e:
             magnetarr_logger.error(f"Unhandled error scanning source {source.get('name')}: {e}", exc_info=True)
             MAGNETARR_STATS['total_errors'] += 1
+
+
+def fetch_single_post(permalink: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Fetch a single post's own entry (title/content) via its permalink RSS feed —
+    the same feed also carries the post's comments, but the post itself is always
+    the first entry."""
+    resp, err = _request_with_backoff(f"https://www.reddit.com{_to_reddit_path(permalink)}/.rss")
+    if resp is None:
+        return None, err
+    try:
+        posts = _parse_atom_entries(resp.text)
+    except ET.ParseError as e:
+        return None, f"Invalid RSS/XML response from Reddit: {e}"
+    if not posts:
+        return None, "Post not found (may have been deleted)"
+    return posts[0], ""
+
+
+def recheck_realdebrid_watched_posts() -> None:
+    """Re-check posts we've already submitted to Real-Debrid for content changes
+    (e.g. egortech adding a new session to a 'live' torrent's Contains: list).
+    If the post's content changed, delete the old Real-Debrid entry and re-add
+    the same magnet fresh so Real-Debrid re-fetches from the swarm. If nothing
+    changed, no Real-Debrid calls are made."""
+    settings = load_settings("magnetarr")
+    api_token = (settings.get("realdebrid_api_token") or "").strip()
+    if not api_token:
+        return
+
+    watch_days = settings.get("realdebrid_watch_days", 4)
+    recheck_minutes = settings.get("realdebrid_recheck_minutes", 20)
+    db = get_database()
+    now = datetime.utcnow()
+
+    for sub in db.get_active_realdebrid_submissions():
+        info_hash = sub['info_hash']
+        first_seen = sub.get('first_seen_at')
+        try:
+            first_seen_dt = datetime.fromisoformat(str(first_seen).replace('Z', ''))
+            age_days = (now - first_seen_dt).total_seconds() / 86400
+        except (ValueError, TypeError):
+            age_days = 0
+
+        if age_days > watch_days:
+            db.mark_realdebrid_submission_status(info_hash, 'expired', active=False)
+            continue
+
+        last_checked = sub.get('last_checked_at')
+        try:
+            last_checked_dt = datetime.fromisoformat(str(last_checked).replace('Z', ''))
+            if (now - last_checked_dt).total_seconds() / 60 < recheck_minutes:
+                continue
+        except (ValueError, TypeError):
+            pass  # never checked — go ahead
+
+        post, err = fetch_single_post(sub['permalink'])
+        if post is None:
+            magnetarr_logger.debug(f"Real-Debrid recheck: couldn't refetch post for '{sub.get('title')}': {err}")
+            continue
+
+        new_hash = _hash_post_content(post.get('content_html', ''))
+        if new_hash == sub.get('content_hash'):
+            # Nothing changed — just note we checked, without touching Real-Debrid at all.
+            db.mark_realdebrid_submission_status(info_hash, sub.get('status', 'submitted'), active=True)
+            status, _ = rd_get_status(sub['rd_torrent_id'], api_token) if sub.get('rd_torrent_id') else (None, '')
+            if status == 'downloaded':
+                db.mark_realdebrid_submission_status(info_hash, 'downloaded', active=False)
+            continue
+
+        # Post content changed — force Real-Debrid to re-fetch the same magnet.
+        magnetarr_logger.info(f"Post content changed for '{sub.get('title')}', re-adding to Real-Debrid")
+        del_err = rd_delete_torrent(sub.get('rd_torrent_id', ''), api_token)
+        if del_err:
+            magnetarr_logger.debug(f"Real-Debrid delete before re-add: {del_err}")
+
+        torrent_id, add_err = rd_add_and_select(sub['magnet_uri'], api_token)
+        db.upsert_realdebrid_submission({
+            'info_hash': info_hash,
+            'magnet_uri': sub['magnet_uri'],
+            'title': sub.get('title', ''),
+            'permalink': sub['permalink'],
+            'source_id': sub.get('source_id', ''),
+            'rd_torrent_id': torrent_id or '',
+            'content_hash': new_hash,
+            'status': 'error' if add_err else 'submitted',
+            'last_error': add_err,
+            'active': True,
+        })

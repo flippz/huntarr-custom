@@ -16,8 +16,8 @@ class MagnetarrMixin:
         with self.get_connection() as conn:
             conn.execute('''
                 INSERT INTO magnetarr_sources
-                    (id, name, url, source_type, enabled, interval_minutes)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (id, name, url, source_type, enabled, interval_minutes, realdebrid_auto_add)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', (
                 src_id,
                 data.get('name', 'Unnamed'),
@@ -25,6 +25,7 @@ class MagnetarrMixin:
                 data.get('source_type', 'reddit'),
                 1 if data.get('enabled', True) else 0,
                 max(5, int(data.get('interval_minutes', 20) or 20)),
+                1 if data.get('realdebrid_auto_add', False) else 0,
             ))
             conn.commit()
         return src_id
@@ -38,6 +39,7 @@ class MagnetarrMixin:
             for r in rows:
                 d = dict(r)
                 d['enabled'] = bool(d.get('enabled', 1))
+                d['realdebrid_auto_add'] = bool(d.get('realdebrid_auto_add', 0))
                 out.append(d)
             return out
 
@@ -50,18 +52,19 @@ class MagnetarrMixin:
                 return None
             d = dict(row)
             d['enabled'] = bool(d.get('enabled', 1))
+            d['realdebrid_auto_add'] = bool(d.get('realdebrid_auto_add', 0))
             return d
 
     def update_magnetarr_source(self, src_id: str, updates: Dict[str, Any]) -> bool:
         """Update fields on a scrape source. Returns True if a row was updated."""
         allowed = ['name', 'url', 'source_type', 'enabled', 'interval_minutes',
-                   'last_scanned_at', 'last_after_token', 'last_error']
+                   'last_scanned_at', 'last_after_token', 'last_error', 'realdebrid_auto_add']
         sets = []
         vals = []
         for k in allowed:
             if k in updates:
                 v = updates[k]
-                if k == 'enabled':
+                if k in ('enabled', 'realdebrid_auto_add'):
                     v = 1 if v else 0
                 if k == 'interval_minutes':
                     try:
@@ -213,3 +216,63 @@ class MagnetarrMixin:
         with self.get_connection() as conn:
             row = conn.execute('SELECT COUNT(*) FROM magnetarr_magnets').fetchone()
             return row[0] if row else 0
+
+    # ── Real-Debrid submissions ─────────────────────────────────────────
+
+    def upsert_realdebrid_submission(self, data: Dict[str, Any]) -> None:
+        """Create or update the tracked Real-Debrid submission for a magnet (keyed by info_hash)."""
+        with self.get_connection() as conn:
+            conn.execute('''
+                INSERT INTO magnetarr_realdebrid_submissions
+                    (info_hash, magnet_uri, title, permalink, source_id, rd_torrent_id,
+                     content_hash, status, last_error, last_checked_at, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                ON CONFLICT(info_hash) DO UPDATE SET
+                    rd_torrent_id = excluded.rd_torrent_id,
+                    content_hash = excluded.content_hash,
+                    status = excluded.status,
+                    last_error = excluded.last_error,
+                    last_checked_at = CURRENT_TIMESTAMP,
+                    active = excluded.active
+            ''', (
+                data['info_hash'].lower(),
+                data.get('magnet_uri', ''),
+                data.get('title', ''),
+                data.get('permalink', ''),
+                data.get('source_id', ''),
+                data.get('rd_torrent_id', ''),
+                data.get('content_hash', ''),
+                data.get('status', 'pending'),
+                data.get('last_error', ''),
+                1 if data.get('active', True) else 0,
+            ))
+            conn.commit()
+
+    def get_active_realdebrid_submissions(self) -> List[Dict[str, Any]]:
+        """Return all Real-Debrid submissions still being watched for post updates."""
+        with self.get_connection() as conn:
+            with self._use_row_factory(conn) as c:
+                rows = c.execute(
+                    'SELECT * FROM magnetarr_realdebrid_submissions WHERE active = 1 ORDER BY first_seen_at ASC'
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_realdebrid_submissions(self) -> List[Dict[str, Any]]:
+        """Return all tracked Real-Debrid submissions (active and inactive), newest first."""
+        with self.get_connection() as conn:
+            with self._use_row_factory(conn) as c:
+                rows = c.execute(
+                    'SELECT * FROM magnetarr_realdebrid_submissions ORDER BY first_seen_at DESC'
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_realdebrid_submission_status(self, info_hash: str, status: str,
+                                           active: bool = True, last_error: str = '') -> None:
+        """Update just the status/active flag on an existing submission (no post-content change)."""
+        with self.get_connection() as conn:
+            conn.execute('''
+                UPDATE magnetarr_realdebrid_submissions
+                SET status = ?, active = ?, last_error = ?, last_checked_at = CURRENT_TIMESTAMP
+                WHERE info_hash = ?
+            ''', (status, 1 if active else 0, last_error, info_hash.lower()))
+            conn.commit()

@@ -1342,12 +1342,17 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                     last_scanned_at TIMESTAMP,
                     last_after_token TEXT DEFAULT '',
                     last_error TEXT DEFAULT '',
+                    realdebrid_auto_add INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             try:
                 conn.execute("ALTER TABLE magnetarr_sources ADD COLUMN last_error TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                conn.execute("ALTER TABLE magnetarr_sources ADD COLUMN realdebrid_auto_add INTEGER DEFAULT 0")
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
@@ -1393,6 +1398,25 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 )
             ''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_magnetarr_stats_source ON magnetarr_stats(source_id)')
+
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS magnetarr_realdebrid_submissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    info_hash TEXT NOT NULL UNIQUE,
+                    magnet_uri TEXT NOT NULL,
+                    title TEXT DEFAULT '',
+                    permalink TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    rd_torrent_id TEXT DEFAULT '',
+                    content_hash TEXT DEFAULT '',
+                    status TEXT DEFAULT 'pending',
+                    last_error TEXT DEFAULT '',
+                    first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_checked_at TIMESTAMP,
+                    active INTEGER DEFAULT 1
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_magnetarr_rd_active ON magnetarr_realdebrid_submissions(active)')
 
             # ── Requestarr Users (multi-user request system) ────────────
             conn.execute('''

@@ -4351,6 +4351,55 @@ document.head.appendChild(styleEl);
             </div>
 
             <div class="settings-group">
+                <h3>Real-Debrid</h3>
+                <p class="setting-help" style="margin-bottom: 20px; color: #9ca3af;">
+                    Sources with "Send to Real-Debrid" enabled will have newly discovered magnets added to your
+                    Real-Debrid account automatically. Get an API token from
+                    <a href="https://real-debrid.com/apitoken" target="_blank" rel="noopener">real-debrid.com/apitoken</a>.
+                </p>
+
+                <div class="setting-item">
+                    <label for="magnetarr_rd_api_token">API Token:</label>
+                    <input type="password" id="magnetarr_rd_api_token" value="${escapeHtml(settings.realdebrid_api_token || '')}" placeholder="Real-Debrid API token">
+                </div>
+
+                <div class="setting-item">
+                    <label for="magnetarr_rd_recheck_minutes">Recheck Interval (minutes):</label>
+                    <input type="number" id="magnetarr_rd_recheck_minutes" min="5" value="${settings.realdebrid_recheck_minutes || 20}">
+                    <p class="setting-help">How often to check a submitted post for content changes (e.g. a new session added).</p>
+                </div>
+
+                <div class="setting-item">
+                    <label for="magnetarr_rd_watch_days">Watch Window (days):</label>
+                    <input type="number" id="magnetarr_rd_watch_days" min="1" value="${settings.realdebrid_watch_days || 4}">
+                    <p class="setting-help">Stop rechecking a post this many days after it was first discovered.</p>
+                </div>
+            </div>
+
+            <div class="settings-group">
+                <h3>Real-Debrid Submissions</h3>
+                <p class="setting-help" style="margin-bottom: 15px; color: #9ca3af;">
+                    Magnets sent to Real-Debrid and currently being watched for post content changes.
+                </p>
+
+                <div style="overflow-x: auto;">
+                    <table class="magnetarr-table" id="magnetarr-rd-submissions-table" style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                        <thead>
+                            <tr>
+                                <th style="text-align:left; padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.2);">Title</th>
+                                <th style="text-align:left; padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.2);">Status</th>
+                                <th style="text-align:left; padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.2);">First Seen</th>
+                                <th style="text-align:left; padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.2);">Last Checked</th>
+                            </tr>
+                        </thead>
+                        <tbody id="magnetarr-rd-submissions-tbody">
+                            <tr><td colspan="4" style="text-align:center; padding: 14px; color: rgba(160,168,184,0.7);">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="settings-group">
                 <h3>Sources</h3>
                 <p class="setting-help" style="margin-bottom: 15px; color: #9ca3af;">
                     Configure the sites/feeds Magnetarr should scan for magnet links.
@@ -4458,6 +4507,14 @@ document.head.appendChild(styleEl);
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
+                        <div class="setting-item">
+                            <label for="magnetarr_source_rd_auto_add">Send to Real-Debrid:</label>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="magnetarr_source_rd_auto_add">
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <p class="setting-help">Automatically add newly discovered magnets from this source to Real-Debrid.</p>
+                        </div>
                     </div>
                     <div class="magnetarr-modal-footer">
                         <button type="button" id="magnetarr-source-modal-cancel" class="magnetarr-btn-secondary">Cancel</button>
@@ -4474,6 +4531,7 @@ document.head.appendChild(styleEl);
         window.SettingsForms.loadMagnetarrSources();
         window.SettingsForms.loadMagnetarrMagnets();
         window.SettingsForms.loadMagnetarrTorznabKey();
+        window.SettingsForms.loadMagnetarrRealdebridSubmissions();
 
         const searchBtn = document.getElementById('magnetarr-magnets-search-btn');
         const searchInput = document.getElementById('magnetarr-magnets-search');
@@ -4558,6 +4616,56 @@ document.head.appendChild(styleEl);
             .catch(error => {
                 console.error('[Magnetarr] Error loading Torznab API key:', error);
             });
+    };
+
+    // ---------------------------------------------------------------------
+    // Real-Debrid submissions
+    // ---------------------------------------------------------------------
+
+    window.SettingsForms.loadMagnetarrRealdebridSubmissions = function () {
+        const tbody = document.getElementById('magnetarr-rd-submissions-tbody');
+        if (!tbody) return;
+
+        HuntarrUtils.fetchWithTimeout('./api/magnetarr/realdebrid/submissions')
+            .then(response => response.json())
+            .then(data => window.SettingsForms.renderMagnetarrRealdebridSubmissions((data && data.submissions) || []))
+            .catch(error => {
+                console.error('[Magnetarr] Error loading Real-Debrid submissions:', error);
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; padding: 14px; color: rgba(160,168,184,0.7);">Failed to load submissions.</td></tr>';
+            });
+    };
+
+    window.SettingsForms.renderMagnetarrRealdebridSubmissions = function (submissions) {
+        const tbody = document.getElementById('magnetarr-rd-submissions-tbody');
+        if (!tbody) return;
+
+        if (!submissions || submissions.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; padding: 14px; color: rgba(160,168,184,0.7);">No Real-Debrid submissions yet.</td></tr>';
+            return;
+        }
+
+        const statusColors = {
+            submitted: '#3b82f6',
+            downloaded: '#22c55e',
+            error: '#ef4444',
+            expired: 'rgba(160,168,184,0.7)',
+            pending: 'rgba(160,168,184,0.7)',
+        };
+
+        tbody.innerHTML = submissions.map(sub => {
+            const color = statusColors[sub.status] || 'rgba(160,168,184,0.7)';
+            const statusLabel = sub.last_error
+                ? `<span style="color:${color};" title="${escapeHtml(sub.last_error)}">${escapeHtml(sub.status)}</span>`
+                : `<span style="color:${color};">${escapeHtml(sub.status)}</span>`;
+            return `
+                <tr>
+                    <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(sub.title)}">${escapeHtml(sub.title)}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${statusLabel}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(sub.first_seen_at)}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(sub.last_checked_at || '-')}</td>
+                </tr>
+            `;
+        }).join('');
     };
 
     // ---------------------------------------------------------------------
@@ -4697,6 +4805,7 @@ document.head.appendChild(styleEl);
         const typeInput = document.getElementById('magnetarr_source_type');
         const intervalInput = document.getElementById('magnetarr_source_interval');
         const enabledInput = document.getElementById('magnetarr_source_enabled');
+        const rdAutoAddInput = document.getElementById('magnetarr_source_rd_auto_add');
 
         if (source) {
             if (title) title.textContent = 'Edit Source';
@@ -4706,6 +4815,7 @@ document.head.appendChild(styleEl);
             if (typeInput) typeInput.value = source.source_type || '';
             if (intervalInput) intervalInput.value = source.interval_minutes || 60;
             if (enabledInput) enabledInput.checked = source.enabled !== false;
+            if (rdAutoAddInput) rdAutoAddInput.checked = !!source.realdebrid_auto_add;
         } else {
             if (title) title.textContent = 'Add Source';
             if (idInput) idInput.value = '';
@@ -4714,6 +4824,7 @@ document.head.appendChild(styleEl);
             if (typeInput) typeInput.value = '';
             if (intervalInput) intervalInput.value = 60;
             if (enabledInput) enabledInput.checked = true;
+            if (rdAutoAddInput) rdAutoAddInput.checked = false;
         }
 
         modal.style.display = 'flex';
@@ -4726,6 +4837,7 @@ document.head.appendChild(styleEl);
         const typeInput = document.getElementById('magnetarr_source_type');
         const intervalInput = document.getElementById('magnetarr_source_interval');
         const enabledInput = document.getElementById('magnetarr_source_enabled');
+        const rdAutoAddInput = document.getElementById('magnetarr_source_rd_auto_add');
 
         const name = nameInput ? nameInput.value.trim() : '';
         const url = urlInput ? urlInput.value.trim() : '';
@@ -4741,6 +4853,7 @@ document.head.appendChild(styleEl);
             source_type: typeInput ? typeInput.value.trim() : '',
             interval_minutes: intervalInput ? parseInt(intervalInput.value) || 60 : 60,
             enabled: enabledInput ? enabledInput.checked : true,
+            realdebrid_auto_add: rdAutoAddInput ? rdAutoAddInput.checked : false,
         };
 
         const id = idInput ? idInput.value : '';
@@ -4865,6 +4978,15 @@ document.head.appendChild(styleEl);
             enabledToggle.addEventListener('change', () => updateSaveButtonState(true));
         }
 
+        const rdInputs = [
+            container.querySelector('#magnetarr_rd_api_token'),
+            container.querySelector('#magnetarr_rd_recheck_minutes'),
+            container.querySelector('#magnetarr_rd_watch_days'),
+        ];
+        rdInputs.forEach(input => {
+            if (input) input.addEventListener('input', () => updateSaveButtonState(true));
+        });
+
         const newSaveButton = saveButton.cloneNode(true);
         saveButton.parentNode.replaceChild(newSaveButton, saveButton);
 
@@ -4877,6 +4999,12 @@ document.head.appendChild(styleEl);
             const settings = { ...originalSettings };
             const enabled = document.getElementById('magnetarr_enabled');
             if (enabled) settings.enabled = enabled.checked;
+            const rdToken = document.getElementById('magnetarr_rd_api_token');
+            if (rdToken) settings.realdebrid_api_token = rdToken.value.trim();
+            const rdRecheckMinutes = document.getElementById('magnetarr_rd_recheck_minutes');
+            if (rdRecheckMinutes) settings.realdebrid_recheck_minutes = parseInt(rdRecheckMinutes.value) || 20;
+            const rdWatchDays = document.getElementById('magnetarr_rd_watch_days');
+            if (rdWatchDays) settings.realdebrid_watch_days = parseInt(rdWatchDays.value) || 4;
 
             window.SettingsForms.saveAppSettings('magnetarr', settings);
 

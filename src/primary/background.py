@@ -1418,7 +1418,7 @@ def magnetarr_app_loop():
     magnetarr_logger.debug("Magnetarr thread started")
 
     try:
-        from src.primary.apps.magnetarr.handler import run_magnetarr
+        from src.primary.apps.magnetarr.handler import run_magnetarr, recheck_realdebrid_watched_posts
         from src.primary.settings_manager import load_settings
         from src.primary.utils.database import get_database
 
@@ -1444,6 +1444,11 @@ def magnetarr_app_loop():
                     run_magnetarr()
                 except Exception as e:
                     magnetarr_logger.error(f"Error during Magnetarr processing: {e}", exc_info=True)
+
+                try:
+                    recheck_realdebrid_watched_posts()
+                except Exception as e:
+                    magnetarr_logger.error(f"Error during Real-Debrid recheck: {e}", exc_info=True)
 
                 if stop_event.wait(60):
                     break

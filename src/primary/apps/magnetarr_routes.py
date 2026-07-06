@@ -75,6 +75,7 @@ def add_source():
         "source_type": data.get("source_type", "reddit"),
         "enabled": data.get("enabled", True),
         "interval_minutes": data.get("interval_minutes", 20),
+        "realdebrid_auto_add": data.get("realdebrid_auto_add", False),
     })
     return jsonify({"success": True, "id": src_id})
 
@@ -87,7 +88,7 @@ def update_source(src_id):
         return jsonify({"success": False, "error": "Source not found"}), 404
 
     updates = {}
-    for field in ['name', 'url', 'source_type', 'enabled', 'interval_minutes']:
+    for field in ['name', 'url', 'source_type', 'enabled', 'interval_minutes', 'realdebrid_auto_add']:
         if field in data:
             updates[field] = data[field]
 
@@ -131,6 +132,14 @@ def list_magnets():
         page_size=min(200, int(request.args.get('page_size', 50))),
     )
     return jsonify(result)
+
+
+# ── Real-Debrid submissions ────────────────────────────────────────────
+
+@magnetarr_bp.route('/realdebrid/submissions', methods=['GET'])
+def list_realdebrid_submissions():
+    db = get_database()
+    return jsonify({"submissions": db.get_realdebrid_submissions()})
 
 
 # ── Torznab endpoint (external — API key query param auth) ───────────

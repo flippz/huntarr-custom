@@ -248,7 +248,14 @@ PROWLARR_DEFAULTS = {
 # multi-week manual approval process for API app credentials, but RSS remains open.
 MAGNETARR_DEFAULTS = {
     "enabled": False,
-    "torznab_api_key": ""
+    "torznab_api_key": "",
+    # Real-Debrid auto-add: per-source opt-in (magnetarr_sources.realdebrid_auto_add)
+    # submits newly discovered magnets to Real-Debrid automatically, then watches the
+    # source post for content changes (e.g. a new session added to a "live" torrent)
+    # and re-adds the same magnet when it changes, until realdebrid_watch_days elapses.
+    "realdebrid_api_token": "",
+    "realdebrid_recheck_minutes": 20,
+    "realdebrid_watch_days": 4
 }
 
 # NZBDav default configuration - 3rd party Usenet download client status integration.
