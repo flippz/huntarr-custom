@@ -23,7 +23,7 @@ import requests
 from src.primary.utils.logger import get_logger
 from src.primary.utils.database import get_database
 from src.primary.settings_manager import load_settings
-from src.primary.apps.magnetarr.realdebrid import rd_add_and_select, rd_get_status, rd_delete_torrent
+from src.primary.apps.magnetarr.realdebrid import rd_add_and_select, rd_get_status, rd_delete_torrent, RD_STATUS_DELETED
 
 magnetarr_logger = get_logger("magnetarr")
 
@@ -425,25 +425,37 @@ def recheck_realdebrid_watched_posts() -> None:
         except (ValueError, TypeError):
             pass  # never checked — go ahead
 
+        # Check the RD-side status first, independent of whether the post's content
+        # changed — the user (or Real-Debrid itself) may have removed the torrent
+        # from the account entirely, which we'd otherwise never notice since our own
+        # tracking row still says "submitted" and would block any future resubmission.
+        rd_status, status_err = rd_get_status(sub['rd_torrent_id'], api_token) if sub.get('rd_torrent_id') else (None, '')
+        rd_was_deleted = rd_status == RD_STATUS_DELETED
+        if rd_status == 'downloaded':
+            db.mark_realdebrid_submission_status(info_hash, 'downloaded', active=False)
+            continue
+
         post, err = fetch_single_post(sub['permalink'])
         if post is None:
             magnetarr_logger.debug(f"Real-Debrid recheck: couldn't refetch post for '{sub.get('title')}': {err}")
             continue
 
         new_hash = _hash_post_content(post.get('content_html', ''))
-        if new_hash == sub.get('content_hash'):
-            # Nothing changed — just note we checked, without touching Real-Debrid at all.
+        if new_hash == sub.get('content_hash') and not rd_was_deleted:
+            # Nothing changed and the RD entry is still there — just note we checked.
             db.mark_realdebrid_submission_status(info_hash, sub.get('status', 'submitted'), active=True)
-            status, _ = rd_get_status(sub['rd_torrent_id'], api_token) if sub.get('rd_torrent_id') else (None, '')
-            if status == 'downloaded':
-                db.mark_realdebrid_submission_status(info_hash, 'downloaded', active=False)
             continue
 
-        # Post content changed — force Real-Debrid to re-fetch the same magnet.
-        magnetarr_logger.info(f"Post content changed for '{sub.get('title')}', re-adding to Real-Debrid")
-        del_err = rd_delete_torrent(sub.get('rd_torrent_id', ''), api_token)
-        if del_err:
-            magnetarr_logger.debug(f"Real-Debrid delete before re-add: {del_err}")
+        # Either the post content changed (new session added) or the RD entry was
+        # removed from the account — either way, force Real-Debrid to re-fetch the
+        # same magnet fresh.
+        if rd_was_deleted:
+            magnetarr_logger.info(f"Real-Debrid entry for '{sub.get('title')}' is gone (deleted), re-adding")
+        else:
+            magnetarr_logger.info(f"Post content changed for '{sub.get('title')}', re-adding to Real-Debrid")
+            del_err = rd_delete_torrent(sub.get('rd_torrent_id', ''), api_token)
+            if del_err:
+                magnetarr_logger.debug(f"Real-Debrid delete before re-add: {del_err}")
 
         torrent_id, add_err = rd_add_and_select(sub['magnet_uri'], api_token)
         db.upsert_realdebrid_submission({

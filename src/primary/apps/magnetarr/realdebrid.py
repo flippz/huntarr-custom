@@ -80,9 +80,15 @@ def rd_add_and_select(magnet_uri: str, api_token: str) -> Tuple[Optional[str], s
     return torrent_id, ""
 
 
+RD_STATUS_DELETED = "__deleted__"  # sentinel: the torrent no longer exists in the account
+# (e.g. the user removed it manually via Real-Debrid's own UI) — distinct from a normal
+# lookup failure, since callers need to tell "gone, should resubmit" from "transient error".
+
+
 def rd_get_status(torrent_id: str, api_token: str) -> Tuple[Optional[str], str]:
     """Get the current status string for a Real-Debrid torrent (e.g. 'downloaded',
-    'downloading', 'magnet_error'). Returns (status_or_none, error_message)."""
+    'downloading', 'magnet_error', or RD_STATUS_DELETED if it no longer exists in the
+    account). Returns (status_or_none, error_message)."""
     resp, err = _with_backoff(lambda: requests.get(
         f"{RD_BASE_URL}/torrents/info/{torrent_id}",
         headers=_headers(api_token),
@@ -90,6 +96,8 @@ def rd_get_status(torrent_id: str, api_token: str) -> Tuple[Optional[str], str]:
     ))
     if resp is None:
         return None, err
+    if resp.status_code == 404:
+        return RD_STATUS_DELETED, ""
     if resp.status_code != 200:
         return None, f"Real-Debrid info failed (HTTP {resp.status_code}): {resp.text[:200]}"
 
