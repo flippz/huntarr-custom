@@ -309,9 +309,16 @@ def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
                 }
                 if db.insert_magnet_if_new(record):
                     found += 1
-                    if source.get('realdebrid_auto_add') and matches_realdebrid_keywords(title, source.get('realdebrid_keywords', '')):
-                        _submit_to_realdebrid(source_id, post, magnet_uri, info_hash, title)
-                        time.sleep(0.5)  # pace RD calls so a big backfill scan doesn't burst past its rate limit
+
+                # Checked independently of "is this magnet new to the catalog": another
+                # source may have already discovered (but not submitted) this same magnet
+                # under a keyword filter that excluded it. A source whose own filter
+                # matches should still be able to trigger the first submission.
+                if (source.get('realdebrid_auto_add')
+                        and matches_realdebrid_keywords(title, source.get('realdebrid_keywords', ''))
+                        and not db.has_realdebrid_submission(info_hash)):
+                    _submit_to_realdebrid(source_id, post, magnet_uri, info_hash, title)
+                    time.sleep(0.5)  # pace RD calls so a big backfill scan doesn't burst past its rate limit
             if fetched_comments:
                 time.sleep(1.1)  # pace the comments-fallback request we just made
 

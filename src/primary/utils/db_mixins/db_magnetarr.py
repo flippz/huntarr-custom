@@ -221,6 +221,18 @@ class MagnetarrMixin:
 
     # ── Real-Debrid submissions ─────────────────────────────────────────
 
+    def has_realdebrid_submission(self, info_hash: str) -> bool:
+        """True if this magnet has already been submitted to Real-Debrid (by any source).
+        Used to gate submission independently of whether the magnet is new to the catalog —
+        a second source scanning the same URL with different keywords should still be able
+        to submit a magnet another source already discovered (but didn't match its filter)."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                'SELECT 1 FROM magnetarr_realdebrid_submissions WHERE info_hash = ?',
+                (info_hash.lower(),)
+            ).fetchone()
+            return row is not None
+
     def upsert_realdebrid_submission(self, data: Dict[str, Any]) -> None:
         """Create or update the tracked Real-Debrid submission for a magnet (keyed by info_hash)."""
         with self.get_connection() as conn:
