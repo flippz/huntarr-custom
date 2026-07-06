@@ -210,6 +210,17 @@ def _hash_post_content(content_html: str) -> str:
     return hashlib.sha256((content_html or '').encode('utf-8', errors='ignore')).hexdigest()
 
 
+def matches_realdebrid_keywords(title: str, keywords_csv: str) -> bool:
+    """True if the title contains at least one of the comma-separated keywords
+    (case-insensitive). An empty/blank keyword list matches everything —
+    sources are only filtered when keywords are explicitly configured."""
+    keywords = [k.strip() for k in (keywords_csv or '').split(',') if k.strip()]
+    if not keywords:
+        return True
+    title_lower = (title or '').lower()
+    return any(k.lower() in title_lower for k in keywords)
+
+
 def _submit_to_realdebrid(source_id: str, post: Dict[str, Any], magnet_uri: str, info_hash: str, title: str) -> None:
     """Send a newly discovered magnet to Real-Debrid and start tracking its post
     for content changes (see recheck_realdebrid_watched_posts)."""
@@ -298,8 +309,9 @@ def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
                 }
                 if db.insert_magnet_if_new(record):
                     found += 1
-                    if source.get('realdebrid_auto_add'):
+                    if source.get('realdebrid_auto_add') and matches_realdebrid_keywords(title, source.get('realdebrid_keywords', '')):
                         _submit_to_realdebrid(source_id, post, magnet_uri, info_hash, title)
+                        time.sleep(0.5)  # pace RD calls so a big backfill scan doesn't burst past its rate limit
             if fetched_comments:
                 time.sleep(1.1)  # pace the comments-fallback request we just made
 

@@ -76,6 +76,7 @@ def add_source():
         "enabled": data.get("enabled", True),
         "interval_minutes": data.get("interval_minutes", 20),
         "realdebrid_auto_add": data.get("realdebrid_auto_add", False),
+        "realdebrid_keywords": data.get("realdebrid_keywords", ""),
     })
     return jsonify({"success": True, "id": src_id})
 
@@ -88,7 +89,8 @@ def update_source(src_id):
         return jsonify({"success": False, "error": "Source not found"}), 404
 
     updates = {}
-    for field in ['name', 'url', 'source_type', 'enabled', 'interval_minutes', 'realdebrid_auto_add']:
+    for field in ['name', 'url', 'source_type', 'enabled', 'interval_minutes',
+                  'realdebrid_auto_add', 'realdebrid_keywords']:
         if field in data:
             updates[field] = data[field]
 

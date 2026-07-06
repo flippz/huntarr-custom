@@ -294,6 +294,11 @@
                             </label>
                             <p class="setting-help">Automatically add newly discovered magnets from this source to Real-Debrid.</p>
                         </div>
+                        <div class="setting-item">
+                            <label for="magnetarr_source_rd_keywords">Real-Debrid Keywords:</label>
+                            <input type="text" id="magnetarr_source_rd_keywords" placeholder="e.g. Formula 1, F1">
+                            <p class="setting-help">Comma-separated keywords — only magnets whose title contains at least one are sent to Real-Debrid. Leave blank to send everything from this source. Discovery/storage/Torznab is unaffected either way.</p>
+                        </div>
                     </div>
                     <div class="magnetarr-modal-footer">
                         <button type="button" id="magnetarr-source-modal-cancel" class="magnetarr-btn-secondary">Cancel</button>
@@ -585,6 +590,7 @@
         const intervalInput = document.getElementById('magnetarr_source_interval');
         const enabledInput = document.getElementById('magnetarr_source_enabled');
         const rdAutoAddInput = document.getElementById('magnetarr_source_rd_auto_add');
+        const rdKeywordsInput = document.getElementById('magnetarr_source_rd_keywords');
 
         if (source) {
             if (title) title.textContent = 'Edit Source';
@@ -595,6 +601,7 @@
             if (intervalInput) intervalInput.value = source.interval_minutes || 60;
             if (enabledInput) enabledInput.checked = source.enabled !== false;
             if (rdAutoAddInput) rdAutoAddInput.checked = !!source.realdebrid_auto_add;
+            if (rdKeywordsInput) rdKeywordsInput.value = source.realdebrid_keywords || '';
         } else {
             if (title) title.textContent = 'Add Source';
             if (idInput) idInput.value = '';
@@ -604,6 +611,7 @@
             if (intervalInput) intervalInput.value = 60;
             if (enabledInput) enabledInput.checked = true;
             if (rdAutoAddInput) rdAutoAddInput.checked = false;
+            if (rdKeywordsInput) rdKeywordsInput.value = '';
         }
 
         modal.style.display = 'flex';
@@ -617,6 +625,7 @@
         const intervalInput = document.getElementById('magnetarr_source_interval');
         const enabledInput = document.getElementById('magnetarr_source_enabled');
         const rdAutoAddInput = document.getElementById('magnetarr_source_rd_auto_add');
+        const rdKeywordsInput = document.getElementById('magnetarr_source_rd_keywords');
 
         const name = nameInput ? nameInput.value.trim() : '';
         const url = urlInput ? urlInput.value.trim() : '';
@@ -633,6 +642,7 @@
             interval_minutes: intervalInput ? parseInt(intervalInput.value) || 60 : 60,
             enabled: enabledInput ? enabledInput.checked : true,
             realdebrid_auto_add: rdAutoAddInput ? rdAutoAddInput.checked : false,
+            realdebrid_keywords: rdKeywordsInput ? rdKeywordsInput.value.trim() : '',
         };
 
         const id = idInput ? idInput.value : '';

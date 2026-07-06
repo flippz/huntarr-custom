@@ -16,8 +16,8 @@ class MagnetarrMixin:
         with self.get_connection() as conn:
             conn.execute('''
                 INSERT INTO magnetarr_sources
-                    (id, name, url, source_type, enabled, interval_minutes, realdebrid_auto_add)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, name, url, source_type, enabled, interval_minutes, realdebrid_auto_add, realdebrid_keywords)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 src_id,
                 data.get('name', 'Unnamed'),
@@ -26,6 +26,7 @@ class MagnetarrMixin:
                 1 if data.get('enabled', True) else 0,
                 max(5, int(data.get('interval_minutes', 20) or 20)),
                 1 if data.get('realdebrid_auto_add', False) else 0,
+                data.get('realdebrid_keywords', '') or '',
             ))
             conn.commit()
         return src_id
@@ -58,7 +59,8 @@ class MagnetarrMixin:
     def update_magnetarr_source(self, src_id: str, updates: Dict[str, Any]) -> bool:
         """Update fields on a scrape source. Returns True if a row was updated."""
         allowed = ['name', 'url', 'source_type', 'enabled', 'interval_minutes',
-                   'last_scanned_at', 'last_after_token', 'last_error', 'realdebrid_auto_add']
+                   'last_scanned_at', 'last_after_token', 'last_error',
+                   'realdebrid_auto_add', 'realdebrid_keywords']
         sets = []
         vals = []
         for k in allowed:

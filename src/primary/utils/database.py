@@ -1343,6 +1343,7 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                     last_after_token TEXT DEFAULT '',
                     last_error TEXT DEFAULT '',
                     realdebrid_auto_add INTEGER DEFAULT 0,
+                    realdebrid_keywords TEXT DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -1353,6 +1354,10 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 pass  # Column already exists
             try:
                 conn.execute("ALTER TABLE magnetarr_sources ADD COLUMN realdebrid_auto_add INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                conn.execute("ALTER TABLE magnetarr_sources ADD COLUMN realdebrid_keywords TEXT DEFAULT ''")
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
