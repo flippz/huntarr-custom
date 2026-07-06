@@ -175,7 +175,7 @@ def _build_caps_xml():
 
 def _build_search_xml(magnets):
     ET.register_namespace('torznab', TORZNAB_NS)
-    rss = ET.Element("rss", {"version": "2.0", "xmlns:torznab": TORZNAB_NS})
+    rss = ET.Element("rss", {"version": "2.0"})
     channel = ET.SubElement(rss, "channel")
     ET.SubElement(channel, "title").text = "Huntarr Magnetarr"
 
