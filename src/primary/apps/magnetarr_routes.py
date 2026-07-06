@@ -199,6 +199,7 @@ def _build_search_xml(magnets):
 
 
 @magnetarr_bp.route('/torznab', methods=['GET'])
+@magnetarr_bp.route('/torznab/api', methods=['GET'])
 def torznab_endpoint():
     expected_key = _get_torznab_api_key()
     supplied_key = request.args.get('apikey', '')
