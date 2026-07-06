@@ -4517,8 +4517,8 @@ document.head.appendChild(styleEl);
                         </div>
                         <div class="setting-item">
                             <label for="magnetarr_source_rd_keywords">Real-Debrid Keywords:</label>
-                            <input type="text" id="magnetarr_source_rd_keywords" placeholder="e.g. Formula 1, F1">
-                            <p class="setting-help">Comma-separated keywords — only magnets whose title contains at least one are sent to Real-Debrid. Leave blank to send everything from this source. Discovery/storage/Torznab is unaffected either way.</p>
+                            <input type="text" id="magnetarr_source_rd_keywords" placeholder="e.g. Formula 1, Grand Prix">
+                            <p class="setting-help">Comma-separated keywords — only magnets whose title contains ALL of them are sent to Real-Debrid. Leave blank to send everything from this source. Discovery/storage/Torznab is unaffected either way.</p>
                         </div>
                     </div>
                     <div class="magnetarr-modal-footer">

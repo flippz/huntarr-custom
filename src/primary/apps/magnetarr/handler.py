@@ -211,14 +211,14 @@ def _hash_post_content(content_html: str) -> str:
 
 
 def matches_realdebrid_keywords(title: str, keywords_csv: str) -> bool:
-    """True if the title contains at least one of the comma-separated keywords
-    (case-insensitive). An empty/blank keyword list matches everything —
-    sources are only filtered when keywords are explicitly configured."""
+    """True if the title contains every one of the comma-separated keywords
+    (case-insensitive, all must match). An empty/blank keyword list matches
+    everything — sources are only filtered when keywords are explicitly configured."""
     keywords = [k.strip() for k in (keywords_csv or '').split(',') if k.strip()]
     if not keywords:
         return True
     title_lower = (title or '').lower()
-    return any(k.lower() in title_lower for k in keywords)
+    return all(k.lower() in title_lower for k in keywords)
 
 
 def _submit_to_realdebrid(source_id: str, post: Dict[str, Any], magnet_uri: str, info_hash: str, title: str) -> None:
