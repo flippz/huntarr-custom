@@ -1362,9 +1362,22 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                     source_url TEXT DEFAULT '',
                     category TEXT DEFAULT 'other',
                     size_bytes INTEGER DEFAULT 0,
+                    seeders INTEGER DEFAULT 1,
                     discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            try:
+                # Magnet URIs carry no real seeder/peer count, and some *arr clients
+                # filter out or deprioritize anything reporting 0 seeders, so we report
+                # a nominal 1. Adding the column backfills existing rows to 1 too
+                # (SQLite applies ADD COLUMN...DEFAULT to pre-existing rows).
+                conn.execute('ALTER TABLE magnetarr_magnets ADD COLUMN seeders INTEGER DEFAULT 1')
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                conn.execute('UPDATE magnetarr_magnets SET seeders = 1 WHERE seeders IS NULL OR seeders <= 0')
+            except sqlite3.OperationalError:
+                pass  # Table doesn't exist yet on a brand-new database
             conn.execute('CREATE INDEX IF NOT EXISTS idx_magnetarr_magnets_hash ON magnetarr_magnets(info_hash)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_magnetarr_magnets_discovered ON magnetarr_magnets(discovered_at)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_magnetarr_magnets_source ON magnetarr_magnets(source_id)')

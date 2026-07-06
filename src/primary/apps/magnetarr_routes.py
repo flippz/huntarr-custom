@@ -193,6 +193,11 @@ def _build_search_xml(magnets):
         ET.SubElement(item, f"{{{TORZNAB_NS}}}attr", {"name": "size", "value": str(m.get("size_bytes", 0) or 0)})
         ET.SubElement(item, f"{{{TORZNAB_NS}}}attr", {"name": "infohash", "value": m["info_hash"]})
         ET.SubElement(item, f"{{{TORZNAB_NS}}}attr", {"name": "category", "value": m.get("category", "other")})
+        # Magnet URIs carry no real seeder/peer count. Report a nominal 1 seeder
+        # so *arr clients that filter out or deprioritize 0-seeder results don't skip these.
+        seeders = m.get("seeders") or 1
+        ET.SubElement(item, f"{{{TORZNAB_NS}}}attr", {"name": "seeders", "value": str(seeders)})
+        ET.SubElement(item, f"{{{TORZNAB_NS}}}attr", {"name": "peers", "value": str(seeders)})
 
     xml_bytes = b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(rss, encoding='utf-8')
     return Response(xml_bytes, mimetype='application/rss+xml')

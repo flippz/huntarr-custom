@@ -105,8 +105,8 @@ class MagnetarrMixin:
         with self.get_connection() as conn:
             cur = conn.execute('''
                 INSERT INTO magnetarr_magnets
-                    (info_hash, title, magnet_uri, source_id, source_name, source_url, category, size_bytes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (info_hash, title, magnet_uri, source_id, source_name, source_url, category, size_bytes, seeders)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(info_hash) DO NOTHING
             ''', (
                 magnet['info_hash'].lower(),
@@ -117,9 +117,21 @@ class MagnetarrMixin:
                 magnet.get('source_url', ''),
                 magnet.get('category', 'other'),
                 magnet.get('size_bytes', 0),
+                magnet.get('seeders', 1),
             ))
             conn.commit()
             return cur.rowcount > 0
+
+    def backfill_magnetarr_seeders(self, seeders: int = 1) -> int:
+        """Set seeders to a nominal value on any existing rows missing it
+        (e.g. rows inserted before the seeders column existed). Returns rows updated."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                'UPDATE magnetarr_magnets SET seeders = ? WHERE seeders IS NULL OR seeders <= 0',
+                (seeders,)
+            )
+            conn.commit()
+            return cur.rowcount
 
     def get_recent_magnets(self, source_id: str = None, category: str = None,
                             q: str = None, page: int = 1, page_size: int = 50) -> Dict[str, Any]:
