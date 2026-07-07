@@ -4666,8 +4666,8 @@ document.head.appendChild(styleEl);
                 <tr>
                     <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(sub.title)}">${escapeHtml(sub.title)}</td>
                     <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${statusLabel}</td>
-                    <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(sub.first_seen_at)}</td>
-                    <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(sub.last_checked_at || '-')}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(sub.first_seen_at_readable || sub.first_seen_at)}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(sub.last_checked_at_readable || sub.last_checked_at || '-')}</td>
                 </tr>
             `;
         }).join('');
@@ -4702,7 +4702,7 @@ document.head.appendChild(styleEl);
         window.SettingsForms._magnetarrSources = sources;
 
         tbody.innerHTML = sources.map(src => {
-            const lastScanned = src.last_scanned_at ? escapeHtml(src.last_scanned_at) : 'Never';
+            const lastScanned = src.last_scanned_at ? escapeHtml(src.last_scanned_at_readable || src.last_scanned_at) : 'Never';
             const status = src.last_error
                 ? `<span style="color:#ef4444;" title="${escapeHtml(src.last_error)}"><i class="fas fa-exclamation-triangle"></i> Error</span>`
                 : (src.last_scanned_at ? '<span style="color:#22c55e;"><i class="fas fa-check"></i> OK</span>' : '<span style="color:rgba(160,168,184,0.7);">-</span>');
@@ -4930,7 +4930,7 @@ document.head.appendChild(styleEl);
                 <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(item.source_name)}</td>
                 <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(item.category || '-')}</td>
                 <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${formatBytes(item.size_bytes)}</td>
-                <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(item.discovered_at)}</td>
+                <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">${escapeHtml(item.discovered_at_readable || item.discovered_at)}</td>
                 <td style="padding: 8px; border-bottom: 1px solid rgba(160,168,184,0.1);">
                     <button type="button" class="magnetarr-row-btn" data-action="copy-magnet" data-id="${escapeHtml(item.id)}" title="Copy magnet link"><i class="fas fa-copy"></i></button>
                 </td>

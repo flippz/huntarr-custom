@@ -6,13 +6,16 @@ list, and a Torznab-compatible indexer endpoint for external tools (e.g. Prowlar
 
 import secrets
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from xml.sax.saxutils import escape
 
+import pytz
 from flask import Blueprint, request, jsonify, Response
 
 from src.primary.utils.logger import get_logger
 from src.primary.settings_manager import load_settings, save_settings
 from src.primary.utils.database import get_database
+from src.primary.utils.timezone_utils import get_user_timezone
 from src.primary.apps.magnetarr.handler import (
     scan_source,
     get_session_stats,
@@ -27,6 +30,24 @@ CATEGORIES = [
     {"id": "5000", "name": "TV"},
     {"id": "8000", "name": "Other"},
 ]
+
+
+def _localize_timestamps(row: dict, fields: list) -> dict:
+    """Add a `<field>_readable` version of each given UTC timestamp field, converted
+    to the user's configured timezone (falls back to the raw value if unparseable).
+    Mirrors the date_time_readable pattern used by Hunt Manager history."""
+    user_tz = get_user_timezone(prefer_database_for_display=True)
+    for field in fields:
+        raw = row.get(field)
+        if not raw:
+            row[f"{field}_readable"] = None
+            continue
+        try:
+            utc_dt = pytz.UTC.localize(datetime.strptime(str(raw), "%Y-%m-%d %H:%M:%S"))
+            row[f"{field}_readable"] = utc_dt.astimezone(user_tz).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            row[f"{field}_readable"] = raw
+    return row
 
 
 # ── Status ────────────────────────────────────────────────────────────
@@ -55,7 +76,9 @@ def get_status():
 @magnetarr_bp.route('/sources', methods=['GET'])
 def list_sources():
     db = get_database()
-    return jsonify({"sources": db.get_magnetarr_sources()})
+    sources = [_localize_timestamps(s, ['last_scanned_at', 'created_at', 'updated_at'])
+               for s in db.get_magnetarr_sources()]
+    return jsonify({"sources": sources})
 
 
 @magnetarr_bp.route('/sources', methods=['POST'])
@@ -133,6 +156,7 @@ def list_magnets():
         page=int(request.args.get('page', 1)),
         page_size=min(200, int(request.args.get('page_size', 50))),
     )
+    result['items'] = [_localize_timestamps(item, ['discovered_at']) for item in result['items']]
     return jsonify(result)
 
 
@@ -141,7 +165,9 @@ def list_magnets():
 @magnetarr_bp.route('/realdebrid/submissions', methods=['GET'])
 def list_realdebrid_submissions():
     db = get_database()
-    return jsonify({"submissions": db.get_realdebrid_submissions()})
+    submissions = [_localize_timestamps(s, ['first_seen_at', 'last_checked_at'])
+                   for s in db.get_realdebrid_submissions()]
+    return jsonify({"submissions": submissions})
 
 
 # ── Torznab endpoint (external — API key query param auth) ───────────
