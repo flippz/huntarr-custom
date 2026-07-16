@@ -45,6 +45,9 @@ swaparr_thread = None
 # Magnetarr processing thread
 magnetarr_thread = None
 
+# Magnetarr watchdog thread (detects a hung Magnetarr thread and restarts it)
+magnetarr_watchdog_thread = None
+
 # Background refresher for Prowlarr statistics
 prowlarr_stats_thread = None
 
@@ -1194,6 +1197,16 @@ def shutdown_threads():
         else:
             logger.info("Magnetarr thread stopped")
 
+    # Stop the Magnetarr watchdog thread
+    global magnetarr_watchdog_thread
+    if magnetarr_watchdog_thread and magnetarr_watchdog_thread.is_alive():
+        logger.info("Waiting for Magnetarr watchdog thread to stop...")
+        magnetarr_watchdog_thread.join(timeout=5.0)
+        if magnetarr_watchdog_thread.is_alive():
+            logger.warning("Magnetarr watchdog thread did not stop gracefully")
+        else:
+            logger.info("Magnetarr watchdog thread stopped")
+
     # Stop the scheduler engine
     try:
         logger.info("Stopping schedule action engine...")
@@ -1461,6 +1474,46 @@ def magnetarr_app_loop():
         magnetarr_logger.error(f"Fatal error in Magnetarr thread: {e}", exc_info=True)
 
     magnetarr_logger.info("Magnetarr thread stopped")
+
+def magnetarr_watchdog_loop():
+    """Detect a hung (not dead) Magnetarr background thread and start a replacement.
+
+    A hang can happen if the thread's long-lived thread-local DB connection goes
+    stale mid-operation -- e.g. the database corruption-recovery process rebuilds
+    the underlying file out from under it while it's mid-query. The thread then
+    blocks forever on the next I/O with no exception ever raised, so `is_alive()`
+    reports True indefinitely and none of the existing error-logging paths ever
+    fire. Python can't force-kill a stuck thread, so on detection this just starts
+    a fresh thread and abandons the old one (it leaks harmlessly until process exit).
+    """
+    watchdog_logger = get_logger("magnetarr")
+    stale_threshold_seconds = 15 * 60  # 5x the loop's normal ~60s poll cadence, plus margin
+
+    while not stop_event.is_set():
+        if stop_event.wait(300):  # check every 5 minutes
+            break
+        try:
+            magnetarr_settings = settings_manager.load_settings("magnetarr")
+            if not magnetarr_settings or not magnetarr_settings.get("enabled", False):
+                continue
+
+            from src.primary.apps.magnetarr.handler import get_session_stats
+            last_run = get_session_stats().get('last_run_time')
+            if last_run is None:
+                continue  # hasn't completed a first cycle yet
+
+            last_run_dt = datetime.datetime.fromisoformat(last_run)
+            age_seconds = (datetime.datetime.utcnow() - last_run_dt).total_seconds()
+
+            global magnetarr_thread
+            if age_seconds > stale_threshold_seconds and magnetarr_thread and magnetarr_thread.is_alive():
+                watchdog_logger.error(
+                    f"Magnetarr thread appears hung (no activity for {int(age_seconds)}s) — starting a replacement thread"
+                )
+                magnetarr_thread = None  # abandon the stuck thread; is_alive() would otherwise block a restart
+                start_magnetarr_thread()
+        except Exception as e:
+            watchdog_logger.error(f"Error in Magnetarr watchdog: {e}", exc_info=True)
 
 def start_hourly_cap_scheduler():
     """Start the hourly API cap scheduler thread"""
@@ -1928,6 +1981,23 @@ def start_magnetarr_thread():
 
     logger.info(f"Magnetarr thread started. Thread is alive: {magnetarr_thread.is_alive()}")
 
+def start_magnetarr_watchdog():
+    """Start the Magnetarr watchdog thread (restarts Magnetarr if it hangs)"""
+    global magnetarr_watchdog_thread
+
+    if magnetarr_watchdog_thread and magnetarr_watchdog_thread.is_alive():
+        logger.info("Magnetarr watchdog already running")
+        return
+
+    magnetarr_watchdog_thread = threading.Thread(
+        target=magnetarr_watchdog_loop,
+        name="MagnetarrWatchdog",
+        daemon=True
+    )
+    magnetarr_watchdog_thread.start()
+
+    logger.info(f"Magnetarr watchdog started. Thread is alive: {magnetarr_watchdog_thread.is_alive()}")
+
 def start_huntarr():
     """Main entry point for Huntarr background tasks."""
     logger.info(f"--- Starting Huntarr Background Tasks v{__version__} --- ")
@@ -1955,6 +2025,13 @@ def start_huntarr():
         logger.info("Magnetarr thread started successfully")
     except Exception as e:
         logger.error(f"Failed to start Magnetarr thread: {e}")
+
+    # Start the Magnetarr watchdog (restarts Magnetarr if its thread hangs)
+    try:
+        start_magnetarr_watchdog()
+        logger.info("Magnetarr watchdog started successfully")
+    except Exception as e:
+        logger.error(f"Failed to start Magnetarr watchdog: {e}")
 
     # Start the Prowlarr stats refresher
     try:
