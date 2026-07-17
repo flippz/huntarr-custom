@@ -19,9 +19,58 @@ logger = logging.getLogger(__name__)
 
 from src.primary.utils.db_mixins import ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, ExtrasMixin, MagnetarrMixin
 
+class _SerializedConnection:
+    """Thin wrapper around a thread-local sqlite3.Connection that serializes ALL
+    access through a single process-wide lock.
+
+    Why: Huntarr runs 16+ independent app background loops plus a ~32-thread web
+    server, each historically opening its own thread-local connection and writing
+    to the same SQLite file with no coordination beyond SQLite's own busy_timeout
+    retry. That's far more concurrent write pressure than a single-purpose app
+    (Sonarr/Radarr/Prowlarr) ever generates against its own database — those apps
+    serialize writes through an internal command pipeline by design, which is the
+    standard safe way to use SQLite under any real concurrency. More concurrent
+    writers means SQLite's WAL auto-checkpoint (the operation that rewrites the
+    actual bytes of the main .db file — the only part of a WAL-mode write that
+    touches the main file directly) fires far more often. Every extra checkpoint
+    is one more moment where an external interruption (host freeze, OOM, container
+    restart) can catch the file mid-write and produce the "file is not a database"
+    corruption Huntarr has been hitting. Serializing here removes that exposure
+    without changing the database engine, the schema, or any call site's SQL —
+    every one of the ~177 `with self.get_connection() as conn:` sites across the
+    codebase is covered automatically since they all go through get_connection().
+
+    Uses a re-entrant lock (RLock) because some methods call other self.*
+    methods that also acquire a connection from the same thread — a plain Lock
+    would deadlock a thread against itself in that case.
+    """
+    _write_lock = threading.RLock()
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        self._write_lock.acquire()
+        try:
+            self._conn.__enter__()
+        except Exception:
+            self._write_lock.release()
+            raise
+        return self._conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return self._conn.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self._write_lock.release()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, ExtrasMixin, MagnetarrMixin):
     """Database manager for all Huntarr configurations and settings"""
-    
+
     # Class-level corruption recovery lock — ensures only one thread recovers at a time
     _corruption_lock = threading.Lock()
     _corruption_recovering = False
@@ -62,7 +111,11 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
         """
         conn.execute('PRAGMA foreign_keys = ON')
         conn.execute('PRAGMA journal_mode = WAL')
-        conn.execute('PRAGMA synchronous = NORMAL')
+        # FULL (not NORMAL) — with writes now serialized through _SerializedConnection,
+        # the write volume this trades against is much lower than before, and FULL gives
+        # stronger protection against exactly the kind of interrupted-write corruption
+        # (host freeze, OOM, container restart) Huntarr has been hitting.
+        conn.execute('PRAGMA synchronous = FULL')
         conn.execute('PRAGMA cache_size = -2000')   # 2 MB per connection (was 16 MB — caused 600 MB+ RAM usage)
         conn.execute('PRAGMA temp_store = MEMORY')
         conn.execute('PRAGMA mmap_size = 0')         # DISABLED — mmap causes corruption on NAS/network storage
@@ -87,7 +140,7 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 cached_conn.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
                 # Reset row_factory to prevent leaking Row mode across callers
                 cached_conn.row_factory = None
-                return cached_conn
+                return _SerializedConnection(cached_conn)
             except Exception as e:
                 # Connection is stale/broken — check if it's corruption
                 if self._is_corruption_error(e):
@@ -118,7 +171,7 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 conn.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
                 # Cache for this thread
                 self._thread_local.conn = conn
-                return conn
+                return _SerializedConnection(conn)
             except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
                 last_error = e
                 error_str = str(e).lower()
@@ -148,7 +201,7 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                         conn = sqlite3.connect(self.db_path, timeout=30)
                         self._configure_connection(conn)
                         self._thread_local.conn = conn
-                        return conn
+                        return _SerializedConnection(conn)
                 elif "database is locked" in error_str:
                     logger.warning(f"Database locked on attempt {attempt + 1}, waiting...")
                     time.sleep(2)
@@ -321,6 +374,65 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
             logger.warning(f"WAL recovery attempt failed: {e}")
             return False
     
+    def _get_safe_snapshot_path(self) -> Path:
+        """Path to the periodically-refreshed, guaranteed-consistent database snapshot
+        (see write_safe_snapshot). Lives alongside the live db so it's covered by
+        whatever the host already backs up, without needing any external backup
+        config changes."""
+        return self.db_path.parent / "huntarr_safe_snapshot.db"
+
+    def write_safe_snapshot(self) -> bool:
+        """Write a guaranteed-consistent snapshot of the live database to a separate
+        file using SQLite's online backup API, then atomically replace any previous
+        snapshot (temp file + os.replace, so a reader/backup tool always sees either
+        the old complete snapshot or the new one, never a partial write).
+
+        This exists because an external file-level backup tool can catch huntarr.db
+        itself mid-write (e.g. mid-checkpoint) and copy a torn, corrupted snapshot —
+        that's a structural risk of copying any actively-written SQLite file, not
+        something fixable by timing alone. This snapshot file is never open for
+        writes except during this method's own atomic swap, so it's always safe for
+        an external tool to copy, and also serves as a better recovery source than
+        row-by-row salvage of an actually-corrupted file (see _handle_database_corruption).
+        Returns True on success.
+        """
+        snapshot_path = self._get_safe_snapshot_path()
+        tmp_path = snapshot_path.with_suffix(snapshot_path.suffix + '.tmp')
+        source_conn = None
+        dest_conn = None
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            source_conn = sqlite3.connect(str(self.db_path), timeout=30)
+            dest_conn = sqlite3.connect(str(tmp_path))
+            source_conn.backup(dest_conn)
+            dest_conn.close()
+            dest_conn = None
+            source_conn.close()
+            source_conn = None
+            os.replace(str(tmp_path), str(snapshot_path))
+            logger.debug(f"Wrote safe database snapshot to {snapshot_path}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to write safe database snapshot: {e}")
+            return False
+        finally:
+            if dest_conn is not None:
+                try:
+                    dest_conn.close()
+                except Exception:
+                    pass
+            if source_conn is not None:
+                try:
+                    source_conn.close()
+                except Exception:
+                    pass
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+
     def _handle_database_corruption(self):
         """Handle confirmed database corruption with recovery-first approach.
 
@@ -382,6 +494,43 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
             conn.close()
         except Exception as e:
             logger.warning(f"Could not open corrupted database for recovery: {e}")
+
+        # Strategy 1b: If a safe snapshot exists (written periodically while the
+        # database was healthy — see write_safe_snapshot), use it to fill in any
+        # table the row-by-row salvage above couldn't recover at all, or recovered
+        # fewer rows for. The corrupted file's own data is preferred when it salvaged
+        # successfully, since it's more recent than the periodic snapshot.
+        snapshot_path = self._get_safe_snapshot_path()
+        if snapshot_path.exists():
+            try:
+                snap_conn = sqlite3.connect(str(snapshot_path), timeout=10)
+                try:
+                    snap_tables = [
+                        row[0] for row in snap_conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                        ).fetchall()
+                    ]
+                    for table in snap_tables:
+                        existing_rows = recovered_tables.get(table, (None, []))[1]
+                        try:
+                            cursor = snap_conn.execute(f"SELECT * FROM {table}")
+                            columns = [desc[0] for desc in cursor.description]
+                            rows = cursor.fetchall()
+                        except Exception as e:
+                            logger.debug(f"Could not read table '{table}' from safe snapshot: {e}")
+                            continue
+                        if len(rows) > len(existing_rows):
+                            logger.info(
+                                f"Using safe snapshot for table '{table}' ({len(rows)} row(s) vs "
+                                f"{len(existing_rows)} salvaged from corrupted file)"
+                            )
+                            recovered_tables[table] = (columns, rows)
+                finally:
+                    snap_conn.close()
+            except Exception as e:
+                logger.warning(f"Could not open safe snapshot for recovery: {e}")
+        else:
+            logger.debug("No safe snapshot available for corruption recovery fallback")
 
         # Remove the corrupted database file (backup already exists)
         try:
@@ -583,6 +732,14 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
         import time
         
         def maintenance_worker():
+            # Write an initial safe snapshot right away so one exists even before
+            # the first 6-hour maintenance cycle completes (e.g. right after a
+            # fresh deploy, well before the next external backup window).
+            try:
+                self.write_safe_snapshot()
+            except Exception as e:
+                logger.warning(f"Initial safe snapshot failed: {e}")
+
             while True:
                 try:
                     # Wait 6 hours between maintenance cycles
@@ -635,7 +792,12 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                         conn.execute("PRAGMA optimize")
                         conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                         conn.execute("PRAGMA incremental_vacuum(100)")
-                    
+
+                    # Refresh the safe snapshot used as a corruption-recovery fallback
+                    # and as a stable copy for external backup tools to read instead
+                    # of the live, actively-written database file.
+                    self.write_safe_snapshot()
+
                     logger.info("Scheduled database maintenance completed")
                     
                 except Exception as e:
