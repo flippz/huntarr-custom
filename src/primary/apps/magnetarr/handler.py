@@ -389,11 +389,22 @@ def fetch_single_post(permalink: str) -> Tuple[Optional[Dict[str, Any]], str]:
 
 
 def recheck_realdebrid_watched_posts() -> None:
-    """Re-check posts we've already submitted to Real-Debrid for content changes
-    (e.g. egortech adding a new session to a 'live' torrent's Contains: list).
-    If the post's content changed, delete the old Real-Debrid entry and re-add
-    the same magnet fresh so Real-Debrid re-fetches from the swarm. If nothing
-    changed, no Real-Debrid calls are made."""
+    """Re-check posts we've already submitted to Real-Debrid for a genuinely new
+    magnet. The original design assumed an uploader like egortech keeps the same
+    magnet URI for the whole race weekend and just grows its content behind the
+    scenes — that's wrong. In practice he replaces it with a brand new magnet
+    (different info-hash, larger size) each time a new session airs (Practice 1
+    -> Practice 2 -> Quali -> Race...). So the real signal is "does this post
+    currently contain a different magnet than the one we have", not a hash of
+    the post body — hashing the body could also miss the change if unrelated
+    text shifted, and even when it did detect a change, re-submitting the old
+    stored magnet_uri would just re-fetch the same stale content again.
+
+    When a new magnet is found: the old Real-Debrid entry is cleaned up and its
+    tracking row marked superseded, the new magnet is added to the discoverable
+    catalog (same as a normal scan would), submitted to Real-Debrid fresh, and
+    tracked under its own new row (its own first_seen_at, so the watch window
+    restarts from the latest change rather than the original post date)."""
     settings = load_settings("magnetarr")
     api_token = (settings.get("realdebrid_api_token") or "").strip()
     if not api_token:
@@ -425,57 +436,80 @@ def recheck_realdebrid_watched_posts() -> None:
         except (ValueError, TypeError):
             pass  # never checked — go ahead
 
-        # Check the post's own content FIRST, before looking at Real-Debrid's status.
-        # A "downloaded" status from RD only means "fully fetched whatever was in the
-        # torrent as of the last add" — for a 'live' post egortech keeps editing over
-        # the weekend (Practice 1 -> Practice 2 -> Quali -> Race...), RD reporting
-        # "downloaded" is a snapshot-in-time, not "the weekend is over". Treating it as
-        # a stop-watching signal on its own (as this used to do) meant we permanently
-        # stopped checking the instant RD finished caching whatever was there first,
-        # and never noticed later sessions get added to the same post.
         post, err = fetch_single_post(sub['permalink'])
         if post is None:
             magnetarr_logger.debug(f"Real-Debrid recheck: couldn't refetch post for '{sub.get('title')}': {err}")
             continue
 
-        new_hash = _hash_post_content(post.get('content_html', ''))
-        content_changed = new_hash != sub.get('content_hash')
+        current_magnets, _fetched_comments = extract_magnets_from_post(post)
+        new_magnet_uri = None
+        new_info_hash = None
+        for candidate in current_magnets:
+            candidate_hash = extract_info_hash(candidate)
+            if candidate_hash:
+                new_magnet_uri = candidate
+                new_info_hash = candidate_hash
+                break
 
-        rd_status, status_err = rd_get_status(sub['rd_torrent_id'], api_token) if sub.get('rd_torrent_id') else (None, '')
+        rd_status, _status_err = rd_get_status(sub['rd_torrent_id'], api_token) if sub.get('rd_torrent_id') else (None, '')
         rd_was_deleted = rd_status == RD_STATUS_DELETED
+        magnet_changed = new_info_hash is not None and new_info_hash != info_hash
 
-        if not content_changed:
+        if not magnet_changed:
             if rd_was_deleted:
-                pass  # fall through to re-add below even though content didn't change
+                # Same magnet, but the RD entry vanished (e.g. manually deleted) — re-add it.
+                magnetarr_logger.info(f"Real-Debrid entry for '{sub.get('title')}' is gone (deleted), re-adding")
+                torrent_id, add_err = rd_add_and_select(sub['magnet_uri'], api_token)
+                db.upsert_realdebrid_submission({
+                    'info_hash': info_hash,
+                    'magnet_uri': sub['magnet_uri'],
+                    'title': sub.get('title', ''),
+                    'permalink': sub['permalink'],
+                    'source_id': sub.get('source_id', ''),
+                    'rd_torrent_id': torrent_id or '',
+                    'content_hash': sub.get('content_hash', ''),
+                    'status': 'error' if add_err else 'submitted',
+                    'last_error': add_err,
+                    'active': True,
+                })
             elif rd_status == 'downloaded':
-                # Content hasn't changed since we last synced, and RD has it all — safe to stop watching.
+                # Same magnet, RD has it all — safe to stop watching this specific hash.
                 db.mark_realdebrid_submission_status(info_hash, 'downloaded', active=False)
-                continue
             else:
-                # Nothing changed and the RD entry is still there — just note we checked.
                 db.mark_realdebrid_submission_status(info_hash, sub.get('status', 'submitted'), active=True)
-                continue
+            continue
 
-        # Either the post content changed (new session added) or the RD entry was
-        # removed from the account — either way, force Real-Debrid to re-fetch the
-        # same magnet fresh.
-        if rd_was_deleted:
-            magnetarr_logger.info(f"Real-Debrid entry for '{sub.get('title')}' is gone (deleted), re-adding")
-        else:
-            magnetarr_logger.info(f"Post content changed for '{sub.get('title')}', re-adding to Real-Debrid")
-            del_err = rd_delete_torrent(sub.get('rd_torrent_id', ''), api_token)
-            if del_err:
-                magnetarr_logger.debug(f"Real-Debrid delete before re-add: {del_err}")
+        # The post now points at a genuinely different magnet — e.g. a new session added.
+        magnetarr_logger.info(
+            f"New magnet detected for '{sub.get('title')}' ({info_hash} -> {new_info_hash}), submitting to Real-Debrid"
+        )
 
-        torrent_id, add_err = rd_add_and_select(sub['magnet_uri'], api_token)
+        del_err = rd_delete_torrent(sub.get('rd_torrent_id', ''), api_token)
+        if del_err:
+            magnetarr_logger.debug(f"Real-Debrid delete of superseded entry: {del_err}")
+        db.mark_realdebrid_submission_status(info_hash, 'superseded', active=False)
+
+        title = post.get('title', sub.get('title', 'Untitled'))
+        db.insert_magnet_if_new({
+            'info_hash': new_info_hash,
+            'title': title,
+            'magnet_uri': new_magnet_uri,
+            'source_id': sub.get('source_id', ''),
+            'source_name': '',
+            'source_url': '',
+            'category': guess_category(title),
+            'size_bytes': parse_size_from_title(title),
+        })
+
+        torrent_id, add_err = rd_add_and_select(new_magnet_uri, api_token)
         db.upsert_realdebrid_submission({
-            'info_hash': info_hash,
-            'magnet_uri': sub['magnet_uri'],
-            'title': sub.get('title', ''),
+            'info_hash': new_info_hash,
+            'magnet_uri': new_magnet_uri,
+            'title': title,
             'permalink': sub['permalink'],
             'source_id': sub.get('source_id', ''),
             'rd_torrent_id': torrent_id or '',
-            'content_hash': new_hash,
+            'content_hash': _hash_post_content(post.get('content_html', '')),
             'status': 'error' if add_err else 'submitted',
             'last_error': add_err,
             'active': True,
