@@ -425,26 +425,36 @@ def recheck_realdebrid_watched_posts() -> None:
         except (ValueError, TypeError):
             pass  # never checked — go ahead
 
-        # Check the RD-side status first, independent of whether the post's content
-        # changed — the user (or Real-Debrid itself) may have removed the torrent
-        # from the account entirely, which we'd otherwise never notice since our own
-        # tracking row still says "submitted" and would block any future resubmission.
-        rd_status, status_err = rd_get_status(sub['rd_torrent_id'], api_token) if sub.get('rd_torrent_id') else (None, '')
-        rd_was_deleted = rd_status == RD_STATUS_DELETED
-        if rd_status == 'downloaded':
-            db.mark_realdebrid_submission_status(info_hash, 'downloaded', active=False)
-            continue
-
+        # Check the post's own content FIRST, before looking at Real-Debrid's status.
+        # A "downloaded" status from RD only means "fully fetched whatever was in the
+        # torrent as of the last add" — for a 'live' post egortech keeps editing over
+        # the weekend (Practice 1 -> Practice 2 -> Quali -> Race...), RD reporting
+        # "downloaded" is a snapshot-in-time, not "the weekend is over". Treating it as
+        # a stop-watching signal on its own (as this used to do) meant we permanently
+        # stopped checking the instant RD finished caching whatever was there first,
+        # and never noticed later sessions get added to the same post.
         post, err = fetch_single_post(sub['permalink'])
         if post is None:
             magnetarr_logger.debug(f"Real-Debrid recheck: couldn't refetch post for '{sub.get('title')}': {err}")
             continue
 
         new_hash = _hash_post_content(post.get('content_html', ''))
-        if new_hash == sub.get('content_hash') and not rd_was_deleted:
-            # Nothing changed and the RD entry is still there — just note we checked.
-            db.mark_realdebrid_submission_status(info_hash, sub.get('status', 'submitted'), active=True)
-            continue
+        content_changed = new_hash != sub.get('content_hash')
+
+        rd_status, status_err = rd_get_status(sub['rd_torrent_id'], api_token) if sub.get('rd_torrent_id') else (None, '')
+        rd_was_deleted = rd_status == RD_STATUS_DELETED
+
+        if not content_changed:
+            if rd_was_deleted:
+                pass  # fall through to re-add below even though content didn't change
+            elif rd_status == 'downloaded':
+                # Content hasn't changed since we last synced, and RD has it all — safe to stop watching.
+                db.mark_realdebrid_submission_status(info_hash, 'downloaded', active=False)
+                continue
+            else:
+                # Nothing changed and the RD entry is still there — just note we checked.
+                db.mark_realdebrid_submission_status(info_hash, sub.get('status', 'submitted'), active=True)
+                continue
 
         # Either the post content changed (new session added) or the RD entry was
         # removed from the account — either way, force Real-Debrid to re-fetch the
