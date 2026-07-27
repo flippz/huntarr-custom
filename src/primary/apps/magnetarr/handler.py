@@ -473,8 +473,13 @@ def recheck_realdebrid_watched_posts() -> None:
                     'active': True,
                 })
             elif rd_status == 'downloaded':
-                # Same magnet, RD has it all — safe to stop watching this specific hash.
-                db.mark_realdebrid_submission_status(info_hash, 'downloaded', active=False)
+                # RD has fully fetched whatever was in the torrent as of the last add —
+                # but that's a snapshot-in-time, not "the weekend is over": egortech
+                # keeps editing the post with a brand new magnet as later sessions air
+                # (this exact post went Practice-only -> Race+Ted's Notebook hours after
+                # RD first reported it downloaded). Keep watching until the watch_days
+                # window naturally expires instead of stopping here.
+                db.mark_realdebrid_submission_status(info_hash, 'downloaded', active=True)
             else:
                 db.mark_realdebrid_submission_status(info_hash, sub.get('status', 'submitted'), active=True)
             continue
