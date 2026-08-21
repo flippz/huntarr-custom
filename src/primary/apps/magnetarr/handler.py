@@ -274,7 +274,13 @@ def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
     source_id = source['id']
     source_name = source.get('name', '')
     source_url = source.get('url', '')
-    after = source.get('last_after_token') or None
+    # Newest-watch source: always scan from the top of the feed (after=None).
+    # Reddit's .rss lists newest-first and the `after` cursor only pages *backwards*
+    # into old history. Persisting it made scan_source walk off the end of the feed
+    # and park on an ancient token, so it stopped seeing new top-of-feed posts.
+    # Dedup is already handled by insert_magnet_if_new() and has_realdebrid_submission(),
+    # so re-reading the top of the feed every scan is safe and cheap.
+    after = None
 
     scanned = 0
     found = 0
@@ -322,8 +328,9 @@ def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
             if fetched_comments:
                 time.sleep(1.1)  # pace the comments-fallback request we just made
 
-        if posts:
-            last_after = posts[-1].get('id') or ''
+        # Intentionally do NOT advance `last_after` here — see the note above.
+        # Leaving it as None means mark_source_scanned() persists '' and the next
+        # scan starts from the top of the feed again.
         db.record_magnetarr_event(source_id, 'scans')
         if found:
             db.record_magnetarr_event(source_id, 'found', found)
