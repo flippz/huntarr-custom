@@ -445,10 +445,15 @@ def recheck_realdebrid_watched_posts() -> None:
 
         post, err = fetch_single_post(sub['permalink'])
         if post is None:
+            # Reddit is probably rate-limiting (429). Without the post we can't detect
+            # a *new* magnet, but we can — and must — still keep the RD side of the
+            # existing submission healthy below, so don't skip the whole submission
+            # here (a Reddit hiccup used to freeze all Real-Debrid recovery).
             magnetarr_logger.debug(f"Real-Debrid recheck: couldn't refetch post for '{sub.get('title')}': {err}")
-            continue
+            current_magnets = []
+        else:
+            current_magnets, _fetched_comments = extract_magnets_from_post(post)
 
-        current_magnets, _fetched_comments = extract_magnets_from_post(post)
         new_magnet_uri = None
         new_info_hash = None
         for candidate in current_magnets:
@@ -463,9 +468,23 @@ def recheck_realdebrid_watched_posts() -> None:
         magnet_changed = new_info_hash is not None and new_info_hash != info_hash
 
         if not magnet_changed:
-            if rd_was_deleted:
-                # Same magnet, but the RD entry vanished (e.g. manually deleted) — re-add it.
-                magnetarr_logger.info(f"Real-Debrid entry for '{sub.get('title')}' is gone (deleted), re-adding")
+            # Re-add the stored magnet when the submission is broken: RD lost the entry
+            # (deleted), the last add errored (e.g. selectFiles fired before magnet
+            # conversion finished -> 404 unknown_ressource), or it's still stuck in a
+            # pre-download state past the recheck interval. This self-heal runs even
+            # when the Reddit refetch above failed.
+            rd_stuck = rd_status in ('waiting_files_selection', 'magnet_conversion', 'queued')
+            needs_readd = rd_was_deleted or sub.get('status') == 'error' or rd_stuck
+
+            if needs_readd:
+                reason = 'gone (deleted)' if rd_was_deleted else (f"stuck ('{rd_status}')" if rd_stuck else 'errored')
+                magnetarr_logger.info(f"Real-Debrid entry for '{sub.get('title')}' is {reason}, re-adding")
+                # Clean up the old entry first (unless it's already gone) so we don't
+                # leave duplicate stuck torrents piling up on the account.
+                if not rd_was_deleted and sub.get('rd_torrent_id'):
+                    del_err = rd_delete_torrent(sub.get('rd_torrent_id', ''), api_token)
+                    if del_err:
+                        magnetarr_logger.debug(f"Real-Debrid delete of stuck entry: {del_err}")
                 torrent_id, add_err = rd_add_and_select(sub['magnet_uri'], api_token)
                 db.upsert_realdebrid_submission({
                     'info_hash': info_hash,
