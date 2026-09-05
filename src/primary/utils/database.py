@@ -150,7 +150,7 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                     except Exception:
                         pass
                     self._thread_local.conn = None
-                    self._trigger_corruption_recovery()
+                    self._trigger_corruption_recovery(error=e)
                     # Fall through to create a new connection below
                 else:
                     try:
@@ -206,6 +206,21 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                     logger.warning(f"Database locked on attempt {attempt + 1}, waiting...")
                     time.sleep(2)
                     continue
+                elif self._is_transient_io_error(e):
+                    if attempt < max_retries - 1:
+                        backoff = 0.5 * (2 ** attempt)
+                        logger.warning(
+                            f"Transient disk I/O error on attempt {attempt + 1}/{max_retries}, "
+                            f"retrying in {backoff}s (not treated as corruption): {e}"
+                        )
+                        time.sleep(backoff)
+                        continue
+                    else:
+                        logger.error(
+                            f"Disk I/O error persisted after {max_retries} attempts, giving up "
+                            f"(not treated as corruption, no recovery triggered): {e}"
+                        )
+                        raise
                 else:
                     raise
         
@@ -224,81 +239,113 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
     
     @staticmethod
     def _is_corruption_error(error):
-        """Check if an exception indicates database corruption."""
+        """Check if an exception indicates database corruption.
+
+        Note: "disk i/o error" is deliberately NOT included here. It's usually a
+        transient host/filesystem hiccup (NAS blip, brief ENOSPC) on an otherwise
+        healthy database, not corruption — treating it as corruption meant a
+        transient I/O error alone could trigger the full destructive recovery
+        path against a perfectly fine database. It's handled as a bounded,
+        backed-off retry in get_connection() instead (see _is_transient_io_error).
+        """
         err_str = str(error).lower()
         return ("database disk image is malformed" in err_str or
-                "file is not a database" in err_str or
-                "disk i/o error" in err_str)
+                "file is not a database" in err_str)
+
+    @staticmethod
+    def _is_transient_io_error(error) -> bool:
+        """Check if an exception is a transient I/O error that should be
+        retried with backoff rather than treated as corruption."""
+        return "disk i/o error" in str(error).lower()
     
-    def _trigger_corruption_recovery(self):
+    def _trigger_corruption_recovery(self, error=None):
         """Thread-safe corruption recovery. Only one thread performs recovery;
         others wait for it to complete, then get fresh connections.
-        
-        Returns True if recovery was performed (or already done recently), False on failure.
+
+        `error` is the exception that made the caller *suspect* corruption —
+        it is only used for logging. The decision to actually run the
+        destructive recovery path is always based on PRAGMA integrity_check
+        (see _run_integrity_diagnostics), never on the exception string alone:
+        trusting a single exception string previously meant e.g. a transient
+        "disk i/o error" could trigger a full destructive rebuild of a
+        perfectly healthy database.
+
+        Returns True if recovery was performed (or already done recently, or
+        the integrity check found nothing wrong), False on failure.
         """
         # If we recovered very recently (within 30s), don't do it again — just invalidate connection
         if time.time() - HuntarrDatabase._corruption_recovered_at < 30:
             self.invalidate_connection()
             return True
-        
+
         acquired = HuntarrDatabase._corruption_lock.acquire(timeout=60)
         if not acquired:
             logger.warning("Timed out waiting for corruption recovery lock")
             self.invalidate_connection()
             return False
-        
+
         try:
             # Double-check: another thread may have already recovered while we waited
             if time.time() - HuntarrDatabase._corruption_recovered_at < 30:
                 self.invalidate_connection()
                 return True
-            
+
             HuntarrDatabase._corruption_recovering = True
-            logger.error("=== DATABASE CORRUPTION DETECTED — starting automatic recovery ===")
-            
+            logger.error(f"=== POSSIBLE DATABASE CORRUPTION ({error}) — verifying before recovery ===")
+
             # Invalidate this thread's connection
             self.invalidate_connection()
-            
-            # Attempt WAL recovery first (non-destructive)
-            if self._attempt_wal_recovery():
-                # Test if WAL recovery fixed it
-                try:
-                    test_conn = sqlite3.connect(self.db_path, timeout=10)
-                    test_conn.execute("PRAGMA integrity_check").fetchone()
-                    test_conn.close()
-                    logger.info("WAL recovery resolved the corruption")
-                    HuntarrDatabase._corruption_recovered_at = time.time()
-                    return True
-                except Exception:
-                    logger.warning("WAL recovery did not fix corruption, proceeding to full recovery")
-            
-            # Full corruption handling (backup + rebuild)
+
+            # Attempt WAL recovery first (non-destructive) — folds any committed-
+            # but-uncheckpointed WAL data into the main file before we even ask
+            # whether anything is actually wrong.
+            self._attempt_wal_recovery()
+
+            # Require proof before doing anything destructive: a single caught
+            # exception string is not enough (see _is_corruption_error notes).
+            diagnostics = self._run_integrity_diagnostics()
+            if diagnostics['ok']:
+                logger.error(
+                    f"integrity_check reports ok after WAL recovery — the triggering error "
+                    f"was not real corruption ({error}). Declining destructive recovery."
+                )
+                HuntarrDatabase._corruption_recovered_at = time.time()
+                return True
+
+            logger.error(
+                f"Corruption CONFIRMED by integrity_check: {diagnostics['integrity_check']} "
+                f"(quick_check={diagnostics['quick_check']})"
+            )
+
+            # Full corruption handling (backup + rebuild) — _handle_database_corruption
+            # re-verifies integrity itself before touching anything, so this is safe
+            # even if called from other paths that didn't already check.
             self._handle_database_corruption()
-            
+
             # Recreate tables on the fresh database
             self.ensure_database_exists()
-            
+
             HuntarrDatabase._corruption_recovered_at = time.time()
             logger.info("=== DATABASE CORRUPTION RECOVERY COMPLETE ===")
             return True
-            
+
         except Exception as e:
             logger.error(f"Database corruption recovery failed: {e}")
             return False
         finally:
             HuntarrDatabase._corruption_recovering = False
             HuntarrDatabase._corruption_lock.release()
-    
+
     def _check_and_recover_corruption(self, error):
         """Check if an error is corruption-related and trigger recovery if so.
-        
+
         Call this from any except block that catches database errors.
         Returns True if corruption was detected and recovery was triggered,
         meaning the caller should retry or return a safe default.
         """
         if self._is_corruption_error(error):
-            logger.error(f"Database corruption detected during operation: {error}")
-            self._trigger_corruption_recovery()
+            logger.error(f"Database corruption suspected during operation: {error}")
+            self._trigger_corruption_recovery(error=error)
             return True
         return False
     
@@ -374,12 +421,105 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
             logger.warning(f"WAL recovery attempt failed: {e}")
             return False
     
+    # Number of safe snapshots kept: huntarr_safe_snapshot.db (newest) plus
+    # this many numbered history files. A single-file snapshot meant a bad
+    # write (e.g. snapshotting an already-emptied live database) permanently
+    # destroyed the only known-good copy — see write_safe_snapshot.
+    _SAFE_SNAPSHOT_HISTORY_COUNT = 5
+
     def _get_safe_snapshot_path(self) -> Path:
-        """Path to the periodically-refreshed, guaranteed-consistent database snapshot
-        (see write_safe_snapshot). Lives alongside the live db so it's covered by
-        whatever the host already backs up, without needing any external backup
-        config changes."""
+        """Path to the newest periodically-refreshed, guaranteed-consistent
+        database snapshot (see write_safe_snapshot). Lives alongside the live
+        db so it's covered by whatever the host already backs up, without
+        needing any external backup config changes."""
         return self.db_path.parent / "huntarr_safe_snapshot.db"
+
+    def _get_safe_snapshot_history_path(self, n: int) -> Path:
+        """Path to the n-th oldest snapshot history slot (1 = most recently
+        rotated out of the newest slot)."""
+        return self.db_path.parent / f"huntarr_safe_snapshot.{n}.db"
+
+    def _iter_safe_snapshot_paths(self):
+        """Yield existing snapshot paths, newest first."""
+        newest = self._get_safe_snapshot_path()
+        if newest.exists():
+            yield newest
+        for n in range(1, self._SAFE_SNAPSHOT_HISTORY_COUNT + 1):
+            p = self._get_safe_snapshot_history_path(n)
+            if p.exists():
+                yield p
+
+    def _rotate_safe_snapshots(self):
+        """Shift the numbered snapshot history up by one slot, dropping the
+        oldest beyond the retention count, and move the current newest
+        snapshot into slot 1. Call immediately before writing a new snapshot
+        into huntarr_safe_snapshot.db."""
+        newest = self._get_safe_snapshot_path()
+        if not newest.exists():
+            return
+        oldest = self._get_safe_snapshot_history_path(self._SAFE_SNAPSHOT_HISTORY_COUNT)
+        try:
+            if oldest.exists():
+                oldest.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to prune oldest safe snapshot history slot: {e}")
+        for n in range(self._SAFE_SNAPSHOT_HISTORY_COUNT - 1, 0, -1):
+            src = self._get_safe_snapshot_history_path(n)
+            if src.exists():
+                try:
+                    src.replace(self._get_safe_snapshot_history_path(n + 1))
+                except Exception as e:
+                    logger.warning(f"Failed to rotate safe snapshot history slot {n}: {e}")
+        try:
+            newest.replace(self._get_safe_snapshot_history_path(1))
+        except Exception as e:
+            logger.warning(f"Failed to rotate current safe snapshot into history: {e}")
+
+    @staticmethod
+    def _get_table_row_counts(db_path) -> Dict[str, int]:
+        """Best-effort per-table row counts for a database file. Used to
+        compare before/after state around recovery and snapshot writes."""
+        counts: Dict[str, int] = {}
+        conn = None
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=10)
+            conn.execute('PRAGMA busy_timeout = 5000')
+            tables = [
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            ]
+            for table in tables:
+                try:
+                    counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return counts
+
+    @staticmethod
+    def _detect_row_count_collapse(before: Dict[str, int], after: Dict[str, int]) -> List[str]:
+        """Return descriptions of tables whose row count collapsed by more
+        than 90% (or went non-zero -> zero) from `before` to `after`. This is
+        exactly the failure mode that let a recovery run silently empty
+        magnetarr_sources/magnetarr_realdebrid_submissions/magnetarr_stats and
+        then have write_safe_snapshot faithfully overwrite the last good
+        snapshot with the empties six hours later."""
+        collapsed = []
+        for table, before_count in before.items():
+            if before_count <= 0:
+                continue
+            after_count = after.get(table, 0)
+            if after_count == 0 or after_count <= before_count * 0.10:
+                collapsed.append(f"{table} ({before_count} -> {after_count})")
+        return collapsed
 
     def write_safe_snapshot(self) -> bool:
         """Write a guaranteed-consistent snapshot of the live database to a separate
@@ -410,6 +550,29 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
             dest_conn = None
             source_conn.close()
             source_conn = None
+
+            # Refuse to overwrite a healthy snapshot with a collapsed one. This
+            # is exactly what let a previous recovery bug go unnoticed for two
+            # weeks: the live database got silently emptied of three tables,
+            # and the maintenance loop kept snapshotting that emptied database
+            # over the last good snapshot every 6 hours with no check at all.
+            if snapshot_path.exists():
+                before_counts = self._get_table_row_counts(snapshot_path)
+                after_counts = self._get_table_row_counts(tmp_path)
+                collapsed = self._detect_row_count_collapse(before_counts, after_counts)
+                if collapsed:
+                    logger.error(
+                        "Refusing to overwrite safe snapshot: row count collapsed in "
+                        f"table(s): {', '.join(collapsed)}. Keeping previous snapshot "
+                        f"at {snapshot_path} untouched."
+                    )
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
+                    return False
+
+            self._rotate_safe_snapshots()
             os.replace(str(tmp_path), str(snapshot_path))
             logger.debug(f"Wrote safe database snapshot to {snapshot_path}")
             return True
@@ -433,117 +596,285 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
             except Exception:
                 pass
 
-    def _handle_database_corruption(self):
-        """Handle confirmed database corruption with recovery-first approach.
+    def _run_integrity_diagnostics(self, db_path=None) -> dict:
+        """Run PRAGMA quick_check (cheap pre-filter) then PRAGMA integrity_check
+        against a database file and return both results. This is the proof
+        gate for the destructive recovery path — nothing in this module should
+        rebuild/quarantine live data based on a caught exception string alone;
+        a prior version trusted "disk i/o error" as proof of corruption and
+        that alone could trigger destroying a perfectly healthy database.
 
-        This is only called after WAL recovery and retries have failed.
-        Strategy: back up the corrupted file, then copy every table's rows over to a
-        freshly created database, generically (not a hardcoded list of "important"
-        tables) - past versions of this function only recovered users/settings/app
-        configs by name, which silently dropped any other table (e.g. swaparr_state,
-        swaparr_activity_history) on every corruption event. Only delete the corrupted
-        file after a backup exists.
+        Always logs the outcome at ERROR level: that evidence never existed
+        before, which is why a past bad recovery run went unnoticed for two
+        weeks — there was no log record of what integrity_check actually said.
         """
-        logger.error(f"Handling confirmed database corruption for: {self.db_path}")
+        path = db_path or self.db_path
+        diag = {'quick_check': None, 'integrity_check': None, 'ok': False, 'error': None}
+        conn = None
+        try:
+            conn = sqlite3.connect(str(path), timeout=10)
+            conn.execute('PRAGMA busy_timeout = 30000')
+            quick = conn.execute('PRAGMA quick_check').fetchall()
+            diag['quick_check'] = [row[0] for row in quick]
+            quick_ok = len(quick) == 1 and quick[0][0] == 'ok'
+            full = conn.execute('PRAGMA integrity_check').fetchall()
+            diag['integrity_check'] = [row[0] for row in full]
+            diag['ok'] = quick_ok and len(full) == 1 and full[0][0] == 'ok'
+        except Exception as e:
+            diag['error'] = str(e)
+            diag['ok'] = False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        logger.error(
+            f"Integrity diagnostics for {path}: ok={diag['ok']} "
+            f"quick_check={diag['quick_check']} integrity_check={diag['integrity_check']} "
+            f"error={diag['error']}"
+        )
+        return diag
+
+    def _fill_missing_tables_from_snapshots(self, recovered_tables: Dict[str, Any]) -> None:
+        """Fill in tables that row-by-row salvage couldn't fully recover using
+        the safe snapshot rotation (see write_safe_snapshot), newest first.
+        A table already salvaged with more rows than a given snapshot has is
+        left alone, since the corrupted file's own data is more recent than
+        any periodic snapshot; a snapshot is only used when it has strictly
+        more rows than what's already in `recovered_tables`. Mutates
+        `recovered_tables` in place."""
+        found_any = False
+        for snapshot_path in self._iter_safe_snapshot_paths():
+            found_any = True
+            try:
+                snap_conn = sqlite3.connect(str(snapshot_path), timeout=10)
+            except Exception as e:
+                logger.warning(f"Could not open safe snapshot {snapshot_path} for recovery: {e}")
+                continue
+            try:
+                snap_tables = [
+                    row[0] for row in snap_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                    ).fetchall()
+                ]
+                for table in snap_tables:
+                    existing_rows = recovered_tables.get(table, (None, []))[1]
+                    try:
+                        cursor = snap_conn.execute(f"SELECT * FROM {table}")
+                        columns = [desc[0] for desc in cursor.description]
+                        rows = cursor.fetchall()
+                    except Exception as e:
+                        logger.debug(f"Could not read table '{table}' from safe snapshot {snapshot_path}: {e}")
+                        continue
+                    if len(rows) > len(existing_rows):
+                        logger.info(
+                            f"Using safe snapshot {snapshot_path.name} for table '{table}' "
+                            f"({len(rows)} row(s) vs {len(existing_rows)} previously recovered)"
+                        )
+                        recovered_tables[table] = (columns, rows)
+            finally:
+                snap_conn.close()
+        if not found_any:
+            logger.debug("No safe snapshot available for corruption recovery fallback")
+
+    def _prune_quarantined_databases(self, keep_days: int = 14):
+        """Delete quarantined database files (see _handle_database_corruption)
+        older than keep_days. Quarantining instead of deleting the suspect
+        live database means a bad recovery decision is still recoverable
+        from; this just stops the quarantine directory from growing forever."""
+        cutoff = time.time() - keep_days * 86400
+        try:
+            for p in self.db_path.parent.glob("huntarr_quarantined_*.db*"):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink()
+                        logger.info(f"Pruned old quarantined database file: {p}")
+                except Exception as e:
+                    logger.debug(f"Could not prune quarantined file {p}: {e}")
+        except Exception as e:
+            logger.debug(f"Quarantine pruning skipped: {e}")
+
+    def _log_recovery_summary(self, before_counts: Dict[str, int], after_counts: Dict[str, int],
+                               backup_path, quarantine_path) -> None:
+        """Log a clear, ERROR-level, per-table before/after row count summary
+        for a recovery run. This evidence never existed before, which is why a
+        past recovery run that silently emptied three tables went unnoticed
+        for two weeks with no error anywhere."""
+        all_tables = sorted(set(before_counts) | set(after_counts))
+        lines = [f"  {t}: {before_counts.get(t, 0)} -> {after_counts.get(t, 0)}" for t in all_tables]
+        logger.error(
+            "=== DATABASE RECOVERY SUMMARY ===\n"
+            f"Backup: {backup_path}\n"
+            f"Quarantined original: {quarantine_path}\n"
+            "Per-table row counts (before -> after):\n" + "\n".join(lines)
+        )
+        # TODO: wire this into a notification channel (e.g. via
+        # src.primary.notification_manager.send_notification). Not done here
+        # because notification connection config lives in this same database —
+        # reading it back out mid-recovery, before we know the rebuild even
+        # succeeded, risks re-entering DB access from inside the recovery path
+        # itself. Left as a single well-marked hook point instead of restructuring.
+
+    def _handle_database_corruption(self):
+        """Handle suspected database corruption with recovery-first approach.
+
+        Strategy: verify corruption is real via PRAGMA integrity_check (never
+        trust just a caught exception string), back up the FULL file set
+        (db + wal + shm — a WAL routinely holds multi-megabyte committed but
+        not yet checkpointed data, and copying only the .db file made that
+        data unrecoverable), then copy every table's rows over to a freshly
+        created database, generically (not a hardcoded list of "important"
+        tables). Only quarantine (rename, never delete) the suspect file after
+        a backup exists.
+        """
+        logger.error(f"Handling suspected database corruption for: {self.db_path}")
 
         if not self.db_path.exists():
             logger.info("Database file does not exist, nothing to recover")
             return
 
-        # Always create a backup first - NEVER delete without backup
-        backup_path = self.db_path.parent / f"huntarr_corrupted_backup_{int(time.time())}.db"
+        wal_path = Path(str(self.db_path) + "-wal")
+        shm_path = Path(str(self.db_path) + "-shm")
+
+        # Fold any committed-but-uncheckpointed WAL data into the main file
+        # before doing anything else. If this fails we still fall back to
+        # copying the WAL alongside the main file below, so that data isn't
+        # lost even if it can't be folded in right now.
+        try:
+            ckpt_conn = sqlite3.connect(str(self.db_path), timeout=10)
+            try:
+                ckpt_conn.execute('PRAGMA busy_timeout = 30000')
+                result = ckpt_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                logger.info(
+                    f"Pre-recovery WAL checkpoint: blocked={result[0]}, "
+                    f"pages_written={result[1]}, pages_checkpointed={result[2]}"
+                )
+            finally:
+                ckpt_conn.close()
+        except Exception as e:
+            logger.warning(f"Pre-recovery WAL checkpoint failed (continuing anyway): {e}")
+
+        # Require proof before doing anything destructive. This method is
+        # reachable from several places (get_connection retries, startup
+        # checks, _trigger_corruption_recovery); re-verifying here means every
+        # one of those callers is safe even if they didn't already check.
+        diagnostics = self._run_integrity_diagnostics()
+        if diagnostics['ok']:
+            logger.error(
+                "integrity_check reports ok after WAL checkpoint — declining to run "
+                f"destructive recovery. quick_check={diagnostics['quick_check']}"
+            )
+            return
+
+        logger.error(
+            f"Corruption CONFIRMED before destructive recovery: "
+            f"quick_check={diagnostics['quick_check']} integrity_check={diagnostics['integrity_check']}"
+        )
+
+        before_counts = self._get_table_row_counts(self.db_path)
+
+        # Always create a backup first - NEVER quarantine/delete without one.
+        # Copy the WHOLE file set (db + wal + shm), keeping sidecar names
+        # consistent with the backup .db name so SQLite associates them —
+        # copying only huntarr.db silently dropped everything still sitting
+        # in the WAL.
+        timestamp = int(time.time())
+        backup_path = self.db_path.parent / f"huntarr_corrupted_backup_{timestamp}.db"
+        backup_wal = Path(str(backup_path) + "-wal")
+        backup_shm = Path(str(backup_path) + "-shm")
         try:
             shutil.copy2(self.db_path, backup_path)
-            logger.warning(f"Corrupted database backed up to: {backup_path}")
+            if wal_path.exists():
+                shutil.copy2(wal_path, backup_wal)
+            if shm_path.exists():
+                shutil.copy2(shm_path, backup_shm)
+            logger.warning(
+                f"Suspect database backed up to: {backup_path} "
+                f"(wal={wal_path.exists()}, shm={shm_path.exists()})"
+            )
         except Exception as backup_error:
             logger.error(f"Failed to create backup copy: {backup_error}")
-            # Try rename as fallback
-            try:
-                self.db_path.rename(backup_path)
-                logger.warning(f"Corrupted database renamed to: {backup_path}")
-                return  # File moved, no need to delete
-            except Exception:
-                pass
 
-        # Strategy 1: Salvage every table's rows from the corrupted DB, generically.
-        # {table_name: (column_names, rows)}
+        # Strategy 1: Salvage every table's rows from the backup copy,
+        # generically. WAL-aware: if a WAL sidecar was copied, open the backup
+        # in normal WAL mode and checkpoint it so rows only present in the WAL
+        # are visible, rather than forcing journal_mode=OFF (which would
+        # silently ignore them). Only fall back to a WAL-less read if the
+        # WAL-aware open genuinely fails.
         recovered_tables: Dict[str, Any] = {}
+        salvage_conn = None
         try:
-            conn = sqlite3.connect(backup_path, timeout=10)
-            conn.execute('PRAGMA journal_mode = OFF')  # Don't use WAL on corrupted file
+            try:
+                salvage_conn = sqlite3.connect(str(backup_path), timeout=10)
+                salvage_conn.execute('PRAGMA busy_timeout = 30000')
+                if backup_wal.exists():
+                    salvage_conn.execute('PRAGMA journal_mode = WAL')
+                    salvage_conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                else:
+                    salvage_conn.execute('PRAGMA journal_mode = OFF')
+                salvage_conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+            except Exception as wal_open_error:
+                logger.warning(
+                    f"WAL-aware open of backup copy failed, falling back to "
+                    f"journal_mode=OFF: {wal_open_error}"
+                )
+                try:
+                    if salvage_conn is not None:
+                        salvage_conn.close()
+                except Exception:
+                    pass
+                salvage_conn = sqlite3.connect(str(backup_path), timeout=10)
+                salvage_conn.execute('PRAGMA journal_mode = OFF')
+
             try:
                 table_names = [
-                    row[0] for row in conn.execute(
+                    row[0] for row in salvage_conn.execute(
                         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
                     ).fetchall()
                 ]
             except Exception as e:
-                logger.warning(f"Could not list tables in corrupted database: {e}")
+                logger.warning(f"Could not list tables in backup copy: {e}")
                 table_names = []
 
             for table in table_names:
                 try:
-                    cursor = conn.execute(f"SELECT * FROM {table}")
+                    cursor = salvage_conn.execute(f"SELECT * FROM {table}")
                     columns = [desc[0] for desc in cursor.description]
                     rows = cursor.fetchall()
                     recovered_tables[table] = (columns, rows)
-                    logger.info(f"Recovered {len(rows)} row(s) from table '{table}' in corrupted database")
+                    logger.info(f"Recovered {len(rows)} row(s) from table '{table}' in backup copy")
                 except Exception as e:
                     logger.warning(f"Could not recover table '{table}': {e}")
-
-            conn.close()
         except Exception as e:
-            logger.warning(f"Could not open corrupted database for recovery: {e}")
-
-        # Strategy 1b: If a safe snapshot exists (written periodically while the
-        # database was healthy — see write_safe_snapshot), use it to fill in any
-        # table the row-by-row salvage above couldn't recover at all, or recovered
-        # fewer rows for. The corrupted file's own data is preferred when it salvaged
-        # successfully, since it's more recent than the periodic snapshot.
-        snapshot_path = self._get_safe_snapshot_path()
-        if snapshot_path.exists():
-            try:
-                snap_conn = sqlite3.connect(str(snapshot_path), timeout=10)
+            logger.warning(f"Could not open backup copy for recovery: {e}")
+        finally:
+            if salvage_conn is not None:
                 try:
-                    snap_tables = [
-                        row[0] for row in snap_conn.execute(
-                            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                        ).fetchall()
-                    ]
-                    for table in snap_tables:
-                        existing_rows = recovered_tables.get(table, (None, []))[1]
-                        try:
-                            cursor = snap_conn.execute(f"SELECT * FROM {table}")
-                            columns = [desc[0] for desc in cursor.description]
-                            rows = cursor.fetchall()
-                        except Exception as e:
-                            logger.debug(f"Could not read table '{table}' from safe snapshot: {e}")
-                            continue
-                        if len(rows) > len(existing_rows):
-                            logger.info(
-                                f"Using safe snapshot for table '{table}' ({len(rows)} row(s) vs "
-                                f"{len(existing_rows)} salvaged from corrupted file)"
-                            )
-                            recovered_tables[table] = (columns, rows)
-                finally:
-                    snap_conn.close()
-            except Exception as e:
-                logger.warning(f"Could not open safe snapshot for recovery: {e}")
-        else:
-            logger.debug("No safe snapshot available for corruption recovery fallback")
+                    salvage_conn.close()
+                except Exception:
+                    pass
 
-        # Remove the corrupted database file (backup already exists)
+        # Strategy 1b: fill in anything still missing/partial from the safe
+        # snapshot rotation (see write_safe_snapshot).
+        self._fill_missing_tables_from_snapshots(recovered_tables)
+
+        # Quarantine (rename, NEVER unlink) the suspect database and its
+        # sidecars now that a backup exists. A previous version of this
+        # method deleted the live file outright, which meant a bad salvage
+        # (e.g. one that missed WAL-only data) destroyed the only copy.
+        quarantine_path = self.db_path.parent / f"huntarr_quarantined_{timestamp}.db"
         try:
-            self.db_path.unlink()
-            # Also remove WAL and SHM files
-            wal_path = Path(str(self.db_path) + "-wal")
-            shm_path = Path(str(self.db_path) + "-shm")
+            self.db_path.rename(quarantine_path)
             if wal_path.exists():
-                wal_path.unlink()
+                wal_path.rename(Path(str(quarantine_path) + "-wal"))
             if shm_path.exists():
-                shm_path.unlink()
+                shm_path.rename(Path(str(quarantine_path) + "-shm"))
+            logger.warning(f"Quarantined suspect database to: {quarantine_path}")
         except Exception as rm_error:
-            logger.error(f"Error removing corrupted database: {rm_error}")
+            logger.error(f"Error quarantining suspect database: {rm_error}")
+
+        self._prune_quarantined_databases()
 
         # Strategy 2: Recreate database (with the current schema) and restore every
         # recovered table's rows into it.
@@ -607,6 +938,9 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 logger.error(f"Failed to restore data to fresh database: {restore_error}")
         else:
             logger.warning("No data could be recovered from corrupted database. Starting fresh.")
+
+        after_counts = self._get_table_row_counts(self.db_path)
+        self._log_recovery_summary(before_counts, after_counts, backup_path, quarantine_path)
 
     def _check_database_integrity(self) -> bool:
         """Check if database integrity is intact"""
