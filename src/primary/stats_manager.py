@@ -443,6 +443,28 @@ def increment_stat(app_type: str, stat_type: str, count: int = 1, instance_name:
             logger.error(f"Error incrementing stat {app_type}.{stat_type}: {e}")
             return False
 
+def increment_media_stat_only(app_type: str, stat_type: str, count: int = 1, instance_name: Optional[str] = None) -> bool:
+    """Increment media statistics without consuming the search-submission hourly cap."""
+    if app_type not in ["sonarr", "radarr", "lidarr", "readarr", "whisparr", "eros", "movie_hunt", "tv_hunt"]:
+        logger.error(f"Invalid app_type: {app_type}")
+        return False
+    if stat_type not in ["hunted", "upgraded", "found", "found_upgrade"]:
+        logger.error(f"Invalid stat_type: {stat_type}")
+        return False
+    if instance_name is not None:
+        instance_name = _normalize_instance_name(instance_name)
+    with stats_lock:
+        try:
+            db = get_database()
+            db.increment_media_stat(app_type, stat_type, count)
+            if instance_name:
+                db.increment_media_stat_per_instance(app_type, instance_name, stat_type, count)
+            return True
+        except Exception as e:
+            logger.error(f"Error incrementing media stat {app_type}.{stat_type}: {e}")
+            return False
+
+
 def increment_stat_only(app_type: str, stat_type: str, count: int = 1, instance_name: Optional[str] = None) -> bool:
     """
     Increment a specific statistic and the hourly API cap (so the API bar matches searches/upgrades).

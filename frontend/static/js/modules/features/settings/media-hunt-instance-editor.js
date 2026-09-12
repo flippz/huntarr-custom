@@ -40,7 +40,7 @@
             upgrade_tag: (s.upgrade_tag || '').trim() || 'upgradinatorr',
             release_date_delay_days: s.release_date_delay_days !== undefined ? s.release_date_delay_days : 0,
             state_management_mode: s.state_management_mode || 'custom',
-            state_management_hours: s.state_management_hours !== undefined ? s.state_management_hours : 72,
+            state_management_hours: s.state_management_hours !== undefined ? s.state_management_hours : 24,
             sleep_duration: s.sleep_duration !== undefined ? s.sleep_duration : 900,
             hourly_cap: s.hourly_cap !== undefined ? s.hourly_cap : 20,
             monitored_only: s.monitored_only !== false,
@@ -118,7 +118,7 @@
             '<select id="mh-editor-state-mode"><option value="custom"' + (safe.state_management_mode === 'custom' ? ' selected' : '') + '>Enabled</option><option value="disabled"' + (safe.state_management_mode === 'disabled' ? ' selected' : '') + '>Disabled</option></select></div>' +
             '<p class="editor-help-text">Track processed items to avoid redundant searches</p></div>' +
             '<div class="editor-field-group"><div class="editor-setting-item"><label>Reset Interval (Hours)</label><input type="number" id="mh-editor-state-hours" value="' + safe.state_management_hours + '"></div>' +
-            '<p class="editor-help-text">How long to wait before re-searching a previously processed item (default: 72 hours / 3 days)</p></div>' +
+            '<p class="editor-help-text">How long to wait before re-searching a previously processed item (default: 24 hours)</p></div>' +
             '<div id="mh-editor-stateful-block" class="editor-field-group" style="display:' + statefulBlockDisplay + ';">' +
             '<button type="button" class="btn-card delete btn-reset-state" id="mh-editor-reset-state"><i class="fas fa-undo"></i> Reset Processed State Now</button>' +
             '<p class="editor-help-text" style="text-align: center; margin-top: -10px !important;">Clears the history of processed items for this instance</p>' +
@@ -215,7 +215,7 @@
             upgrade_tag: (get('mh-editor-upgrade-tag') || '').trim(),
             release_date_delay_days: getNum('mh-editor-release-date-delay', 0),
             state_management_mode: get('mh-editor-state-mode') || 'custom',
-            state_management_hours: getNum('mh-editor-state-hours', 72),
+            state_management_hours: getNum('mh-editor-state-hours', 24),
             sleep_duration: getNum('mh-editor-sleep-duration', 15) * 60,
             hourly_cap: getNum('mh-editor-hourly-cap', 20),
             exempt_tags: tags,
@@ -738,7 +738,7 @@
             upgrade_tag: (s.upgrade_tag || '').trim() || 'upgradinatorr',
             skip_future_episodes: s.skip_future_episodes !== false,
             state_management_mode: s.state_management_mode || 'custom',
-            state_management_hours: s.state_management_hours !== undefined ? s.state_management_hours : 72,
+            state_management_hours: s.state_management_hours !== undefined ? s.state_management_hours : 24,
             sleep_duration: s.sleep_duration !== undefined ? s.sleep_duration : 900,
             hourly_cap: s.hourly_cap !== undefined ? s.hourly_cap : 20,
             monitored_only: s.monitored_only !== false,
@@ -784,7 +784,7 @@
             // STATEFUL MANAGEMENT
             '<div class="editor-section"><div class="editor-section-title"><div class="section-title-text"><span class="section-title-icon accent-stateful"><i class="fas fa-sync"></i></span>STATEFUL MANAGEMENT</div></div>' +
             '<div class="editor-field-group"><div class="editor-setting-item"><label>State Management</label><select id="th-editor-state-mode"><option value="custom"' + (safe.state_management_mode === 'custom' ? ' selected' : '') + '>Enabled</option><option value="disabled"' + (safe.state_management_mode === 'disabled' ? ' selected' : '') + '>Disabled</option></select></div><p class="editor-help-text">Track processed items to avoid redundant searches</p></div>' +
-            '<div class="editor-field-group"><div class="editor-setting-item"><label>Reset Interval (Hours)</label><input type="number" id="th-editor-state-hours" value="' + safe.state_management_hours + '"></div><p class="editor-help-text">How long before re-searching a processed item (default: 72 hours)</p></div>' +
+            '<div class="editor-field-group"><div class="editor-setting-item"><label>Reset Interval (Hours)</label><input type="number" id="th-editor-state-hours" value="' + safe.state_management_hours + '"></div><p class="editor-help-text">How long before re-searching a processed item (default: 24 hours)</p></div>' +
             '<div id="th-editor-stateful-block" class="editor-field-group" style="display:' + statefulBlockDisplay + ';">' +
             '<button type="button" class="btn-card delete btn-reset-state" id="th-editor-reset-state"><i class="fas fa-undo"></i> Reset Processed State Now</button>' +
             '<p class="editor-help-text" style="text-align:center;margin-top:-10px !important;">Clears processed items history for this instance</p></div></div>' +
@@ -834,7 +834,7 @@
             upgrade_tag: (get('th-editor-upgrade-tag') || '').trim(),
             skip_future_episodes: getCheck('th-editor-skip-future'),
             state_management_mode: get('th-editor-state-mode') || 'custom',
-            state_management_hours: getNum('th-editor-state-hours', 72),
+            state_management_hours: getNum('th-editor-state-hours', 24),
             sleep_duration: getNum('th-editor-sleep-duration', 15) * 60,
             hourly_cap: getNum('th-editor-hourly-cap', 20),
             exempt_tags: tags,

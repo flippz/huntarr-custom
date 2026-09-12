@@ -1358,6 +1358,21 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 )
             ''')
             
+            # Durable journal for guarded Sonarr exact-season replacement recovery.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS sonarr_season_recovery_journal (
+                    id TEXT PRIMARY KEY,
+                    instance_name TEXT NOT NULL,
+                    series_id INTEGER NOT NULL,
+                    season_number INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    files_json TEXT NOT NULL,
+                    error TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
             # Create sleep_data table for cycle tracking (single-app e.g. swaparr)
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS sleep_data (
@@ -1748,6 +1763,7 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
             conn.execute('CREATE INDEX IF NOT EXISTS idx_media_stats_app_type ON media_stats(app_type, stat_type)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_hourly_caps_app_type ON hourly_caps(app_type)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_hourly_caps_per_instance_app ON hourly_caps_per_instance(app_type, instance_name)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_sonarr_recovery_instance_state ON sonarr_season_recovery_journal(instance_name, state)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_sleep_data_app_type ON sleep_data(app_type)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_sleep_data_per_instance_app ON sleep_data_per_instance(app_type, instance_name)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_schedules_app_type ON schedules(app_type)')

@@ -502,7 +502,7 @@ def app_specific_loop(app_type: str) -> None:
                 db = get_database()
                 
                 # Get instance-specific state management hours
-                instance_hours = instance_details.get("state_management_hours", 72)
+                instance_hours = instance_details.get("state_management_hours", 24)
                 
                 # Initialize if not already done (safe, only runs once per instance)
                 db.initialize_instance_state_management(app_type, instance_key, instance_hours)
@@ -543,6 +543,32 @@ def app_specific_loop(app_type: str) -> None:
                     if clear_instance_log_context:
                         clear_instance_log_context()
                     return (False, instance_name, False, False) # Skip this instance if connection fails
+
+                # Recovery is unconditional: disabling the force option after a crash
+                # must never strand staged files or stale Sonarr episode-file state.
+                if app_type == "sonarr":
+                    try:
+                        from src.primary.apps.sonarr.season_recovery import recover_pending
+                        recovery_timeout = max(
+                            1, int(instance_details.get("command_wait_delay", 1) or 1)
+                        ) * max(1, int(instance_details.get("command_wait_attempts", 600) or 1))
+                        if not recover_pending(
+                            api_url, api_key, api_timeout, instance_key,
+                            recovery_timeout_seconds=recovery_timeout,
+                        ):
+                            app_logger.error("Unresolved exact-season recovery for %s; skipping safely", instance_name)
+                            if end_cycle:
+                                end_cycle(app_type, next_cycle_naive, instance_name=instance_key, log_name=instance_name)
+                            if clear_instance_log_context:
+                                clear_instance_log_context()
+                            return (False, instance_name, False, False)
+                    except Exception as e:
+                        app_logger.error("Exact-season recovery check failed for %s: %s", instance_name, e, exc_info=True)
+                        if end_cycle:
+                            end_cycle(app_type, next_cycle_naive, instance_name=instance_key, log_name=instance_name)
+                        if clear_instance_log_context:
+                            clear_instance_log_context()
+                        return (False, instance_name, False, False)
 
                 # --- API Cap Check --- #
                 try:
@@ -618,6 +644,13 @@ def app_specific_loop(app_type: str) -> None:
                     try:
                         instance_api_timeout = instance_details.get("api_timeout", 120)
                         current_queue_size = get_queue_size(api_url, api_key, instance_api_timeout)
+                        if current_queue_size < 0:
+                            app_logger.warning(f"Download queue status is unavailable while hard ceiling {max_queue_size} is enabled for {instance_name}. Skipping safely.")
+                            if end_cycle:
+                                end_cycle(app_type, next_cycle_naive, instance_name=instance_key, log_name=instance_name)
+                            if clear_instance_log_context:
+                                clear_instance_log_context()
+                            return (False, instance_name, False, False)
                         if current_queue_size >= max_queue_size:
                             app_logger.info(f"Download queue size ({current_queue_size}) meets or exceeds maximum ({max_queue_size}) for {instance_name}. Skipping cycle for this instance.")
                             if end_cycle:
@@ -625,10 +658,14 @@ def app_specific_loop(app_type: str) -> None:
                             if clear_instance_log_context:
                                 clear_instance_log_context()
                             return (False, instance_name, False, False) # Skip processing for this instance
-                        else:
-                            app_logger.info(f"Queue size ({current_queue_size}) is below maximum ({max_queue_size}). Proceeding.")
+                        app_logger.info(f"Queue size ({current_queue_size}) is below maximum ({max_queue_size}). Proceeding.")
                     except Exception as e:
-                        app_logger.warning(f"Could not get download queue size for {instance_name}. Proceeding anyway. Error: {e}", exc_info=False) # Log less verbosely
+                        app_logger.warning(f"Could not get download queue size for {instance_name} while hard ceiling is enabled. Skipping safely. Error: {e}", exc_info=False)
+                        if end_cycle:
+                            end_cycle(app_type, next_cycle_naive, instance_name=instance_key, log_name=instance_name)
+                        if clear_instance_log_context:
+                            clear_instance_log_context()
+                        return (False, instance_name, False, False)
 
             # --- Max Seed Queue Check (torrents only; skip for Movie Hunt) ---
             # When disabled (max_seed_queue_size < 0): no network calls, no imports, no side effects.
@@ -727,6 +764,29 @@ def app_specific_loop(app_type: str) -> None:
                     return True
                 return False
             stop_check_func = _stop_check
+
+            # Every Sonarr/Radarr search command passes through one per-instance,
+            # queue-aware dispatcher.  This is deliberately separate from stateful
+            # processed-ID memory and from the hourly search-submission cap.
+            if app_type in ("sonarr", "radarr"):
+                try:
+                    from src.primary.apps._common.queue_dispatch import configure_dispatch
+                    active_search_count = getattr(api_module, "get_active_search_command_count")
+                    combined_settings["max_download_queue_size"] = max_queue_size
+                    configure_dispatch(
+                        app_type, instance_key, combined_settings,
+                        queue_size=lambda: get_queue_size(api_url, api_key, api_timeout),
+                        active_searches=lambda: active_search_count(api_url, api_key, api_timeout),
+                        stop_check=stop_check_func,
+                        logger=app_logger,
+                    )
+                except Exception as e:
+                    app_logger.error("Unable to configure safe queue dispatch for %s: %s", instance_name, e)
+                    if end_cycle:
+                        end_cycle(app_type, next_cycle_naive, instance_name=instance_key, log_name=instance_name)
+                    if clear_instance_log_context:
+                        clear_instance_log_context()
+                    return (False, instance_name, False, False)
 
             # --- Process Missing --- #
             if hunt_missing_enabled and process_missing:
@@ -842,7 +902,8 @@ def app_specific_loop(app_type: str) -> None:
                             custom_tags=custom_tags,
                             upgrade_selection_method=upgrade_selection_method,
                             upgrade_tag=upgrade_tag,
-                            exempt_tags=exempt_tags
+                            exempt_tags=exempt_tags,
+                            force_season_replacement=instance_details.get("force_season_replacement", False)
                         )
                     else:
                         # For other apps that still use the old signature
@@ -950,7 +1011,7 @@ def app_specific_loop(app_type: str) -> None:
                         for instance_details in all_instances:
                             if instance_details.get("instance_name") == instance_name:
                                 instance_key = instance_details.get("instance_id") or instance_details.get("instance_name", "Default")
-                                instance_hours = instance_details.get("state_management_hours", 72)
+                                instance_hours = instance_details.get("state_management_hours", 24)
                                 instance_mode = instance_details.get("state_management_mode", "custom")
                                 instance_enabled = (instance_mode != "disabled")
                                 break

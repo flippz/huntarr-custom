@@ -1190,7 +1190,11 @@ document.head.appendChild(styleEl);
                     hunt_missing_mode: 'seasons_packs',
                     upgrade_mode: 'seasons_packs',
                     state_management_mode: 'custom',
-                    state_management_hours: 72,
+                    state_management_hours: 24,
+                    target_queue_depth: 3,
+                    minimum_dispatch_interval_seconds: 15,
+                    queue_redispatch_wait_seconds: 60,
+                    force_season_replacement: false,
                     swaparr_enabled: false
                 };
             }
@@ -1542,7 +1546,7 @@ document.head.appendChild(styleEl);
                 air_date_delay_days: instance.air_date_delay_days || 0,
                 release_date_delay_days: instance.release_date_delay_days || 0,
                 state_management_mode: instance.state_management_mode || 'custom',
-                state_management_hours: instance.state_management_hours || 72,
+                state_management_hours: instance.state_management_hours || 24,
                 swaparr_enabled: instance.swaparr_enabled === true,
                 // Additional Options (per-instance)
                 monitored_only: instance.monitored_only !== false,
@@ -1561,6 +1565,10 @@ document.head.appendChild(styleEl);
                 command_wait_delay: instance.command_wait_delay || 1,
                 command_wait_attempts: instance.command_wait_attempts || 600,
                 max_download_queue_size: instance.max_download_queue_size !== undefined ? instance.max_download_queue_size : -1,
+                target_queue_depth: instance.target_queue_depth !== undefined ? instance.target_queue_depth : 3,
+                minimum_dispatch_interval_seconds: instance.minimum_dispatch_interval_seconds !== undefined ? instance.minimum_dispatch_interval_seconds : 15,
+                queue_redispatch_wait_seconds: instance.queue_redispatch_wait_seconds !== undefined ? instance.queue_redispatch_wait_seconds : 60,
+                force_season_replacement: instance.force_season_replacement === true,
                 max_seed_queue_size: instance.max_seed_queue_size !== undefined ? instance.max_seed_queue_size : -1,
                 seed_check_torrent_client: instance.seed_check_torrent_client && typeof instance.seed_check_torrent_client === 'object' ? instance.seed_check_torrent_client : null,
                 // Cycle settings (per-instance; were global in 9.0.x)
@@ -1910,7 +1918,7 @@ document.head.appendChild(styleEl);
                             <label>Reset Interval (Hours)</label>
                             <input type="number" id="editor-state-hours" value="${safeInstance.state_management_hours}">
                         </div>
-                        <p class="editor-help-text">How long to wait before re-searching a previously processed item (default: 72 hours / 3 days)</p>
+                        <p class="editor-help-text">Processed-item deduplication memory only: how long before an item may be searched again (default: 24 hours)</p>
                     </div>
                     
                     ${isEdit ? `
@@ -1950,10 +1958,10 @@ document.head.appendChild(styleEl);
                     
                     <div class="editor-field-group">
                         <div class="editor-setting-item">
-                            <label>API Cap - Hourly</label>
+                            <label>${['sonarr', 'radarr'].includes(appType) ? 'Search Dispatch Cap - Hourly' : 'API Cap - Hourly'}</label>
                             <input type="number" id="editor-hourly-cap" value="${safeInstance.hourly_cap !== undefined ? safeInstance.hourly_cap : 20}" min="1" max="400">
                         </div>
-                        <p class="editor-help-text">Maximum API requests per hour for this instance (10-20 recommended, max 400)</p>
+                        <p class="editor-help-text">${['sonarr', 'radarr'].includes(appType) ? 'Maximum accepted search commands per hour (10-20 recommended, max 400). Polling and media totals do not consume it.' : 'Maximum API requests per hour for this instance (10-20 recommended, max 400)'}</p>
                         <div id="editor-hourly-cap-warning" class="editor-hourly-cap-warning" style="display: none; margin-top: 8px; padding: 12px 14px; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.5); border-radius: 6px; color: #fca5a5; font-size: 0.85rem; line-height: 1.4;">
                             <i class="fas fa-stop-circle" style="margin-right: 6px;"></i> <strong>Do not overwhelm your indexers.</strong> High request rates can trigger rate limits or bans. Keep at 10–20 unless your provider allows more. When in doubt, contact your indexer providers.
                         </div>
@@ -2093,13 +2101,52 @@ document.head.appendChild(styleEl);
                         <p class="editor-help-text">Maximum attempts to wait for command completion (default: 600). Set to 0 for fire-and-forget: trigger search and don't wait — reduces API usage when Sonarr's command queue is slow.</p>
                     </div>
                     
+                    ${['sonarr', 'radarr'].includes(appType) ? `
                     <div class="editor-field-group">
                         <div class="editor-setting-item">
-                            <label>Max Download Queue Size</label>
+                            <label>Target Queue Depth</label>
+                            <input type="number" id="editor-target-queue-depth" value="${safeInstance.target_queue_depth}" min="1" max="1000">
+                        </div>
+                        <p class="editor-help-text">Keep queue + active searches + recent submissions below this target before dispatching another search.</p>
+                    </div>
+
+                    <div class="editor-field-group">
+                        <div class="editor-setting-item">
+                            <label>Minimum Dispatch Interval (seconds)</label>
+                            <input type="number" id="editor-min-dispatch-interval" value="${safeInstance.minimum_dispatch_interval_seconds}" min="1" max="3600">
+                        </div>
+                        <p class="editor-help-text">Minimum spacing between successful search submissions (default: 15 seconds).</p>
+                    </div>
+
+                    <div class="editor-field-group">
+                        <div class="editor-setting-item">
+                            <label>Prompt Redispatch Wait (seconds)</label>
+                            <input type="number" id="editor-redispatch-wait" value="${safeInstance.queue_redispatch_wait_seconds}" min="0" max="3600">
+                        </div>
+                        <p class="editor-help-text">Responsively recheck for a free slot for up to this long; polling is bounded and never busy-loops.</p>
+                    </div>
+
+                    <div class="editor-field-group">
+                        <div class="editor-setting-item">
+                            <label>Max Download Queue Size (Hard Ceiling)</label>
                             <input type="number" id="editor-max-queue-size" value="${safeInstance.max_download_queue_size !== undefined ? safeInstance.max_download_queue_size : -1}" min="-1" max="1000">
                         </div>
-                        <p class="editor-help-text">Skip processing if queue size meets or exceeds this value (-1 = disabled, default)</p>
+                        <p class="editor-help-text">Never submit at or above this queue size (-1 = disabled). If enabled and queue status is unavailable, dispatch is denied.</p>
                     </div>
+                    ` : ''}
+
+                    ${appType === 'sonarr' ? `
+                    <div class="editor-field-group">
+                        <div class="editor-setting-item flex-row">
+                            <label>Force Exact-Season Replacement/Import</label>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="editor-force-season-replacement" ${safeInstance.force_season_replacement ? 'checked' : ''}>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <p class="editor-help-text" style="color:#f59e0b;">OFF by default. Season-pack upgrades only; Command Wait Attempts must be above 0. Safely journals and stages the exact season, waits for a verified import, and restores + rescans on no-grab, failure, timeout, or restart. Replaced originals remain preserved outside the series folder.</p>
+                    </div>
+                    ` : ''}
                     
                     ${swaparrEnabled ? `
                     <div class="editor-field-group">
@@ -2181,7 +2228,7 @@ document.head.appendChild(styleEl);
                 api_key: document.getElementById('editor-key').value,
                 external_url: (document.getElementById('editor-external-url').value || '').trim(),
                 state_management_mode: document.getElementById('editor-state-mode').value,
-                state_management_hours: parseInt(document.getElementById('editor-state-hours').value) || 72,
+                state_management_hours: parseInt(document.getElementById('editor-state-hours').value, 10) || 24,
                 // Additional Options
                 monitored_only: document.getElementById('editor-monitored-only').checked,
                 tag_processed_items: tagEnableMissing || tagEnableUpgrade || tagEnableShowsMissing,
@@ -2198,7 +2245,11 @@ document.head.appendChild(styleEl);
                 api_timeout: parseInt(document.getElementById('editor-api-timeout').value) || 120,
                 command_wait_delay: parseInt(document.getElementById('editor-cmd-wait-delay').value) || 1,
                 command_wait_attempts: (function () { const el = document.getElementById('editor-cmd-wait-attempts'); if (!el) return 600; const v = parseInt(el.value, 10); return (!isNaN(v) && v >= 0) ? v : 600; })(),
-                max_download_queue_size: parseInt(document.getElementById('editor-max-queue-size').value) || -1,
+                max_download_queue_size: document.getElementById('editor-max-queue-size') ? (Number.isNaN(parseInt(document.getElementById('editor-max-queue-size').value, 10)) ? -1 : parseInt(document.getElementById('editor-max-queue-size').value, 10)) : -1,
+                target_queue_depth: document.getElementById('editor-target-queue-depth') ? (parseInt(document.getElementById('editor-target-queue-depth').value, 10) || 3) : 3,
+                minimum_dispatch_interval_seconds: document.getElementById('editor-min-dispatch-interval') ? (parseInt(document.getElementById('editor-min-dispatch-interval').value, 10) || 15) : 15,
+                queue_redispatch_wait_seconds: document.getElementById('editor-redispatch-wait') ? Math.max(0, parseInt(document.getElementById('editor-redispatch-wait').value, 10) || 0) : 60,
+                force_season_replacement: !!(document.getElementById('editor-force-season-replacement') && document.getElementById('editor-force-season-replacement').checked),
                 max_seed_queue_size: (function () { const v = parseInt(document.getElementById('editor-max-seed-queue-size').value, 10); return (!isNaN(v) && v >= -1) ? v : -1; })(),
                 seed_check_torrent_client: (function () {
                     const typeEl = document.getElementById('editor-seed-client-type');
@@ -13600,7 +13651,7 @@ document.head.appendChild(styleEl);
             upgrade_tag: (s.upgrade_tag || '').trim() || 'upgradinatorr',
             release_date_delay_days: s.release_date_delay_days !== undefined ? s.release_date_delay_days : 0,
             state_management_mode: s.state_management_mode || 'custom',
-            state_management_hours: s.state_management_hours !== undefined ? s.state_management_hours : 72,
+            state_management_hours: s.state_management_hours !== undefined ? s.state_management_hours : 24,
             sleep_duration: s.sleep_duration !== undefined ? s.sleep_duration : 900,
             hourly_cap: s.hourly_cap !== undefined ? s.hourly_cap : 20,
             monitored_only: s.monitored_only !== false,
@@ -13678,7 +13729,7 @@ document.head.appendChild(styleEl);
             '<select id="mh-editor-state-mode"><option value="custom"' + (safe.state_management_mode === 'custom' ? ' selected' : '') + '>Enabled</option><option value="disabled"' + (safe.state_management_mode === 'disabled' ? ' selected' : '') + '>Disabled</option></select></div>' +
             '<p class="editor-help-text">Track processed items to avoid redundant searches</p></div>' +
             '<div class="editor-field-group"><div class="editor-setting-item"><label>Reset Interval (Hours)</label><input type="number" id="mh-editor-state-hours" value="' + safe.state_management_hours + '"></div>' +
-            '<p class="editor-help-text">How long to wait before re-searching a previously processed item (default: 72 hours / 3 days)</p></div>' +
+            '<p class="editor-help-text">How long to wait before re-searching a previously processed item (default: 24 hours)</p></div>' +
             '<div id="mh-editor-stateful-block" class="editor-field-group" style="display:' + statefulBlockDisplay + ';">' +
             '<button type="button" class="btn-card delete btn-reset-state" id="mh-editor-reset-state"><i class="fas fa-undo"></i> Reset Processed State Now</button>' +
             '<p class="editor-help-text" style="text-align: center; margin-top: -10px !important;">Clears the history of processed items for this instance</p>' +
@@ -13775,7 +13826,7 @@ document.head.appendChild(styleEl);
             upgrade_tag: (get('mh-editor-upgrade-tag') || '').trim(),
             release_date_delay_days: getNum('mh-editor-release-date-delay', 0),
             state_management_mode: get('mh-editor-state-mode') || 'custom',
-            state_management_hours: getNum('mh-editor-state-hours', 72),
+            state_management_hours: getNum('mh-editor-state-hours', 24),
             sleep_duration: getNum('mh-editor-sleep-duration', 15) * 60,
             hourly_cap: getNum('mh-editor-hourly-cap', 20),
             exempt_tags: tags,
@@ -14298,7 +14349,7 @@ document.head.appendChild(styleEl);
             upgrade_tag: (s.upgrade_tag || '').trim() || 'upgradinatorr',
             skip_future_episodes: s.skip_future_episodes !== false,
             state_management_mode: s.state_management_mode || 'custom',
-            state_management_hours: s.state_management_hours !== undefined ? s.state_management_hours : 72,
+            state_management_hours: s.state_management_hours !== undefined ? s.state_management_hours : 24,
             sleep_duration: s.sleep_duration !== undefined ? s.sleep_duration : 900,
             hourly_cap: s.hourly_cap !== undefined ? s.hourly_cap : 20,
             monitored_only: s.monitored_only !== false,
@@ -14344,7 +14395,7 @@ document.head.appendChild(styleEl);
             // STATEFUL MANAGEMENT
             '<div class="editor-section"><div class="editor-section-title"><div class="section-title-text"><span class="section-title-icon accent-stateful"><i class="fas fa-sync"></i></span>STATEFUL MANAGEMENT</div></div>' +
             '<div class="editor-field-group"><div class="editor-setting-item"><label>State Management</label><select id="th-editor-state-mode"><option value="custom"' + (safe.state_management_mode === 'custom' ? ' selected' : '') + '>Enabled</option><option value="disabled"' + (safe.state_management_mode === 'disabled' ? ' selected' : '') + '>Disabled</option></select></div><p class="editor-help-text">Track processed items to avoid redundant searches</p></div>' +
-            '<div class="editor-field-group"><div class="editor-setting-item"><label>Reset Interval (Hours)</label><input type="number" id="th-editor-state-hours" value="' + safe.state_management_hours + '"></div><p class="editor-help-text">How long before re-searching a processed item (default: 72 hours)</p></div>' +
+            '<div class="editor-field-group"><div class="editor-setting-item"><label>Reset Interval (Hours)</label><input type="number" id="th-editor-state-hours" value="' + safe.state_management_hours + '"></div><p class="editor-help-text">How long before re-searching a processed item (default: 24 hours)</p></div>' +
             '<div id="th-editor-stateful-block" class="editor-field-group" style="display:' + statefulBlockDisplay + ';">' +
             '<button type="button" class="btn-card delete btn-reset-state" id="th-editor-reset-state"><i class="fas fa-undo"></i> Reset Processed State Now</button>' +
             '<p class="editor-help-text" style="text-align:center;margin-top:-10px !important;">Clears processed items history for this instance</p></div></div>' +
@@ -14394,7 +14445,7 @@ document.head.appendChild(styleEl);
             upgrade_tag: (get('th-editor-upgrade-tag') || '').trim(),
             skip_future_episodes: getCheck('th-editor-skip-future'),
             state_management_mode: get('th-editor-state-mode') || 'custom',
-            state_management_hours: getNum('th-editor-state-hours', 72),
+            state_management_hours: getNum('th-editor-state-hours', 24),
             sleep_duration: getNum('th-editor-sleep-duration', 15) * 60,
             hourly_cap: getNum('th-editor-hourly-cap', 20),
             exempt_tags: tags,

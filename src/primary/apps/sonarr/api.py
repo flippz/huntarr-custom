@@ -32,6 +32,7 @@ def arr_request(api_url: str, api_key: str, api_timeout: int, endpoint: str, met
         endpoint: The API endpoint to call
         method: HTTP method (GET, POST, PUT, DELETE)
         data: Optional data payload for POST/PUT requests
+        count_api: Retained for compatibility; only accepted search commands count
     
     Returns:
         The parsed JSON response or None if the request failed
@@ -78,16 +79,9 @@ def arr_request(api_url: str, api_key: str, api_timeout: int, endpoint: str, met
             # Check for successful response
             response.raise_for_status()
             
-            # Increment API counter only if count_api is True and request was successful (per-instance when in instance context)
-            if count_api:
-                try:
-                    from src.primary.stats_manager import increment_hourly_cap
-                    from src.primary.utils.clean_logger import get_instance_name_for_cap
-                    instance_name = get_instance_name_for_cap()
-                    increment_hourly_cap("sonarr", 1, instance_name=instance_name)
-                except Exception as e:
-                    sonarr_logger.warning(f"Failed to increment API counter for sonarr: {e}")
-            
+            # Hourly caps count accepted search commands only. Read/status/tag/file
+            # requests never consume dispatch capacity; count_api is retained for
+            # call-site compatibility.
             # Check if there's any content before trying to parse JSON
             if response.content:
                 try:
@@ -860,16 +854,19 @@ def search_episode(api_url: str, api_key: str, api_timeout: int, episode_ids: Li
     if not episode_ids:
         sonarr_logger.warning("No episode IDs provided for search.")
         return None
-    
-    # Check API limit before making request
+
+    # Check the search-submission cap before waiting for queue capacity.
     try:
         from src.primary.stats_manager import check_hourly_cap_exceeded
-        if check_hourly_cap_exceeded("sonarr"):
-            sonarr_logger.warning(f"🛑 Sonarr API hourly limit reached - skipping episode search for {len(episode_ids)} episodes")
+        if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
+            sonarr_logger.warning(f"🛑 Sonarr search-dispatch hourly limit reached - skipping episode search for {len(episode_ids)} episodes")
             return None
     except Exception as e:
         sonarr_logger.error(f"Error checking hourly API cap: {e}")
-        # Continue with request if cap check fails - safer than skipping
+
+    from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot
+    if not acquire_dispatch_slot():
+        return None
     
     try:
         endpoint = f"{api_url}/api/v3/command"
@@ -884,8 +881,13 @@ def search_episode(api_url: str, api_key: str, api_timeout: int, episode_ids: Li
         response = requests.post(endpoint, headers={"X-Api-Key": api_key}, json=payload, timeout=api_timeout, verify=verify_ssl)
         response.raise_for_status()
         command_id = response.json().get('id')
+        if command_id:
+            from src.primary.apps._common.queue_dispatch import record_submission
+            from src.primary.stats_manager import increment_hourly_cap
+            record_submission()
+            increment_hourly_cap("sonarr", 1, instance_name=instance_name)
         sonarr_logger.info(f"Triggered Sonarr search for episode IDs: {episode_ids}. Command ID: {command_id}")
-        # API bar is incremented by increment_stat / increment_stat_only when hunt/upgrade is recorded (one count per trigger)
+        # Exactly one hourly-cap slot is consumed by each accepted search command.
         return command_id
     except requests.exceptions.RequestException as e:
         sonarr_logger.error(f"Error triggering Sonarr search for episode IDs {episode_ids}: {e}")
@@ -967,6 +969,21 @@ def get_download_queue_size(api_url: str, api_key: str, api_timeout: int) -> int
     return -1
 
 
+def get_active_search_command_count(api_url: str, api_key: str, api_timeout: int) -> int:
+    """Return queued/started Sonarr search commands, or -1 when status is unknown."""
+    response = arr_request(api_url, api_key, api_timeout,
+                           "command?page=1&pageSize=1000", count_api=False)
+    commands = response.get("records") if isinstance(response, dict) else response
+    if not isinstance(commands, list):
+        return -1
+    search_names = {"episodesearch", "seasonsearch", "seriessearch"}
+    return sum(
+        1 for command in commands
+        if str(command.get("name", "")).lower() in search_names
+        and str(command.get("status", command.get("state", ""))).lower() in {"queued", "started", "running"}
+    )
+
+
 def get_disk_space(api_url: str, api_key: str, api_timeout: int) -> Optional[List[Dict]]:
     """
     Get disk space info for all configured root folders from Sonarr.
@@ -1003,18 +1020,23 @@ def get_series_by_id(api_url: str, api_key: str, api_timeout: int, series_id: in
         return None
 
 def search_season(api_url: str, api_key: str, api_timeout: int, series_id: int, season_number: int,
-                  instance_name: Optional[str] = None) -> Optional[Union[int, str]]:
-    """Trigger a search for a specific season in Sonarr. instance_name used for per-instance API cap."""
-    
-    # Check API limit before making request
+                  instance_name: Optional[str] = None,
+                  dispatch_slot_acquired: bool = False) -> Optional[Union[int, str]]:
+    """Trigger a search for a specific season. One accepted command consumes one cap slot."""
+
+    # Check the search-submission cap before waiting for queue capacity.
     try:
         from src.primary.stats_manager import check_hourly_cap_exceeded
-        if check_hourly_cap_exceeded("sonarr"):
-            sonarr_logger.warning(f"🛑 Sonarr API hourly limit reached - skipping season search for series {series_id}, season {season_number}")
+        if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
+            sonarr_logger.warning(f"🛑 Sonarr search-dispatch hourly limit reached - skipping season search for series {series_id}, season {season_number}")
             return None
     except Exception as e:
         sonarr_logger.error(f"Error checking hourly API cap: {e}")
-        # Continue with request if cap check fails - safer than skipping
+
+    if not dispatch_slot_acquired:
+        from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot
+        if not acquire_dispatch_slot():
+            return None
     
     try:
         endpoint = f"{api_url}/api/v3/command"
@@ -1030,8 +1052,13 @@ def search_season(api_url: str, api_key: str, api_timeout: int, series_id: int, 
         response = requests.post(endpoint, headers={"X-Api-Key": api_key}, json=payload, timeout=api_timeout, verify=verify_ssl)
         response.raise_for_status()
         command_id = response.json().get('id')
+        if command_id:
+            from src.primary.apps._common.queue_dispatch import record_submission
+            from src.primary.stats_manager import increment_hourly_cap
+            record_submission()
+            # One SeasonSearch command is one hourly dispatch slot, not one per episode.
+            increment_hourly_cap("sonarr", 1, instance_name=instance_name)
         sonarr_logger.info(f"Triggered Sonarr season search for series ID: {series_id}, season: {season_number}. Command ID: {command_id}")
-        # API bar is incremented by increment_stat / increment_stat_only when hunt/upgrade is recorded (one count per trigger)
         return command_id
     except requests.exceptions.RequestException as e:
         sonarr_logger.error(f"Error triggering Sonarr season search for series ID {series_id}, season {season_number}: {e}")
@@ -1353,8 +1380,16 @@ def get_series_without_tag(
     return out
 
 
-def series_search(api_url: str, api_key: str, api_timeout: int, series_id: int) -> Optional[int]:
+def series_search(api_url: str, api_key: str, api_timeout: int, series_id: int,
+                  instance_name: Optional[str] = None) -> Optional[int]:
     """Trigger SeriesSearch for a series (all episodes)."""
+    from src.primary.stats_manager import check_hourly_cap_exceeded
+    if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
+        sonarr_logger.warning("Sonarr search-dispatch hourly limit reached; SeriesSearch deferred")
+        return None
+    from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot
+    if not acquire_dispatch_slot():
+        return None
     try:
         endpoint = f"{api_url.rstrip('/')}/api/v3/command"
         payload = {"name": "SeriesSearch", "seriesId": series_id}
@@ -1365,6 +1400,11 @@ def series_search(api_url: str, api_key: str, api_timeout: int, series_id: int) 
         response = requests.post(endpoint, headers={"X-Api-Key": api_key}, json=payload, timeout=api_timeout, verify=verify_ssl)
         response.raise_for_status()
         command_id = response.json().get('id')
+        if command_id:
+            from src.primary.apps._common.queue_dispatch import record_submission
+            from src.primary.stats_manager import increment_hourly_cap
+            record_submission()
+            increment_hourly_cap("sonarr", 1, instance_name=instance_name)
         sonarr_logger.info(f"Triggered Sonarr SeriesSearch for series ID: {series_id}. Command ID: {command_id}")
         return command_id
     except requests.exceptions.RequestException as e:

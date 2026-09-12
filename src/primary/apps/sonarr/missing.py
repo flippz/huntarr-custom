@@ -13,7 +13,7 @@ from src.primary.utils.logger import get_logger
 from src.primary.settings_manager import load_settings, get_advanced_setting
 from src.primary.utils.history_utils import log_processed_media
 from src.primary.history_manager import update_history_status
-from src.primary.stats_manager import increment_stat, increment_stat_only, check_hourly_cap_exceeded
+from src.primary.stats_manager import increment_media_stat_only, check_hourly_cap_exceeded
 from src.primary.stateful_manager import is_processed, add_processed_id
 from src.primary.apps._common.tagging import try_tag_item, extract_tag_settings
 from src.primary.apps.sonarr import api as sonarr_api
@@ -348,7 +348,7 @@ def process_missing_seasons_packs_mode(
         
         # Check API limit before processing each season
         try:
-            if check_hourly_cap_exceeded("sonarr"):
+            if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
                 sonarr_logger.warning(f"🛑 Sonarr API hourly limit reached - stopping season pack processing after {processed_count} seasons")
                 break
         except Exception as e:
@@ -389,7 +389,7 @@ def process_missing_seasons_packs_mode(
             # CRITICAL FIX: Use increment_stat_only to avoid double-counting API calls
             # The API call is already tracked in search_season(), so we only increment stats here
             for i in range(episode_count):
-                increment_stat_only("sonarr", "hunted", 1, instance_name)
+                increment_media_stat_only("sonarr", "hunted", 1, instance_name)
             sonarr_logger.debug(f"Incremented sonarr hunted statistics for {episode_count} episodes in season pack (API call already tracked separately)")
             
             # Wait for command to complete if configured
@@ -516,7 +516,7 @@ def process_missing_shows_mode(
         
         # Check API limit before processing each show
         try:
-            if check_hourly_cap_exceeded("sonarr"):
+            if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
                 sonarr_logger.warning(f"🛑 Sonarr API hourly limit reached - stopping shows processing")
                 break
         except Exception as e:
@@ -632,7 +632,7 @@ def process_missing_shows_mode(
             sonarr_logger.debug(f"Logged history entry for complete series: {media_name}")
             
             # Increment the hunted statistics
-            increment_stat("sonarr", "hunted", len(episode_ids), instance_name)
+            increment_media_stat_only("sonarr", "hunted", len(episode_ids), instance_name)
             sonarr_logger.debug(f"Incremented sonarr hunted statistics by {len(episode_ids)}")
         else:
             sonarr_logger.error(f"Failed to trigger search for {show_title}.")
@@ -784,7 +784,7 @@ def process_missing_episodes_mode(
         
         # Check API limit before processing each episode
         try:
-            if check_hourly_cap_exceeded("sonarr"):
+            if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
                 sonarr_logger.warning(f"🛑 Sonarr API hourly limit reached - stopping episodes processing after {processed_count} episodes")
                 break
         except Exception as e:
@@ -837,7 +837,7 @@ def process_missing_episodes_mode(
                     update_history_status(_entry_id, 'failed')
 
             # Increment statistics
-            increment_stat("sonarr", "hunted", 1, instance_name)
+            increment_media_stat_only("sonarr", "hunted", 1, instance_name)
             sonarr_logger.debug(f"Incremented sonarr hunted statistics for episode {episode_id}")
 
             # Note: No tagging is performed in episodes mode as it would be inefficient

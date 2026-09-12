@@ -86,7 +86,7 @@ def get_configured_instances(quiet: bool = False) -> List[Dict[str, Any]]:
                 "upgrade_tag": settings.get("upgrade_tag", ""),
                 "skip_future_episodes": settings.get("skip_future_episodes", True),
                 "state_management_mode": settings.get("state_management_mode", "custom"),
-                "state_management_hours": settings.get("state_management_hours", 72),
+                "state_management_hours": settings.get("state_management_hours", 24),
                 "sleep_duration": settings.get("sleep_duration", 900),
                 "hourly_cap": settings.get("hourly_cap", 20),
                 "exempt_tags": settings.get("exempt_tags") or [],

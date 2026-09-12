@@ -86,7 +86,7 @@ def check_state_reset(app_type: str) -> bool:
         
     # Use a longer default interval (3 days = 72 hours) to prevent too frequent resets
     try:
-        reset_interval = int(settings_manager.get_advanced_setting("stateful_management_hours", 72))
+        reset_interval = int(settings_manager.get_advanced_setting("stateful_management_hours", 24))
     except (TypeError, ValueError):
         reset_interval = 72
 
@@ -148,7 +148,7 @@ def calculate_reset_time(app_type: str) -> str:
         return "Next reset: Unknown (app type not provided)"
         
     try:
-        reset_interval = int(settings_manager.get_advanced_setting("stateful_management_hours", 72))
+        reset_interval = int(settings_manager.get_advanced_setting("stateful_management_hours", 24))
     except (TypeError, ValueError):
         reset_interval = 72
 

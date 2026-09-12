@@ -79,7 +79,7 @@ def reset_stateful():
                 if settings and 'instances' in settings:
                     for instance in settings['instances']:
                         if instance.get('name') == instance_name:
-                            instance_hours = instance.get('state_management_hours', 72)
+                            instance_hours = instance.get('state_management_hours', 24)
                             break
             except Exception as e:
                 from src.primary.utils.log_deduplication import should_log_message, format_suppressed_message
@@ -194,7 +194,7 @@ def get_summary():
                 for instance in settings['instances']:
                     if instance.get('name') == instance_name:
                         # Get per-instance state management hours
-                        instance_hours = instance.get('state_management_hours', 72)
+                        instance_hours = instance.get('state_management_hours', 24)
                         instance_mode = instance.get('state_management_mode', 'custom')
                         
                         # If state management is disabled for this instance, return disabled status

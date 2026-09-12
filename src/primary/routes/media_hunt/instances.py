@@ -292,7 +292,7 @@ def register_movie_instances_routes(bp):
             if not inst:
                 return jsonify({'error': 'Instance not found'}), 404
             settings = _get_movie_hunt_instance_settings(instance_id)
-            hours = int(settings.get('state_management_hours', 72))
+            hours = int(settings.get('state_management_hours', 24))
             db.reset_instance_state_management('movie_hunt', str(instance_id), hours)
             return jsonify({'success': True, 'message': 'State reset successfully'}), 200
         except Exception as e:
@@ -494,7 +494,7 @@ def register_tv_instances_routes(bp):
             if not inst:
                 return jsonify({'error': 'Instance not found'}), 404
             settings = _get_tv_hunt_instance_settings(instance_id)
-            hours = int(settings.get('state_management_hours', 72))
+            hours = int(settings.get('state_management_hours', 24))
             db.reset_instance_state_management('tv_hunt', str(instance_id), hours)
             return jsonify({'success': True, 'message': 'State reset successfully'}), 200
         except Exception as e:

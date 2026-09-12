@@ -219,6 +219,26 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
                 settings_data[field] = 0
                 settings_logger.warning(f"{field} for {app_name} was {original_value}, automatically set to minimum allowed value of 0")
 
+    # Queue controls are normally per-instance, but validate top-level legacy
+    # configuration too so upgrades cannot bypass the same bounds.
+    _queue_ranges = {
+        'target_queue_depth': (1, 1000, 3),
+        'minimum_dispatch_interval_seconds': (1, 3600, 15),
+        'queue_redispatch_wait_seconds': (0, 3600, 60),
+        'state_management_hours': (1, 8760, 24),
+        'max_download_queue_size': (-1, 1000, -1),
+    }
+    for qfield, (qmin, qmax, qdefault) in _queue_ranges.items():
+        if qfield not in settings_data:
+            continue
+        try:
+            qvalue = int(settings_data[qfield])
+        except (TypeError, ValueError):
+            qvalue = qdefault
+        settings_data[qfield] = min(qmax, max(qmin, qvalue))
+    if app_name == 'sonarr' and 'force_season_replacement' in settings_data:
+        settings_data['force_season_replacement'] = settings_data.get('force_season_replacement') is True
+
     # Also validate numeric fields in instances array
     if 'instances' in settings_data and isinstance(settings_data['instances'], list):
         for i, instance in enumerate(settings_data['instances']):
@@ -228,6 +248,19 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
                     if isinstance(original_value, (int, float)) and original_value < _sleep_min:
                         instance['sleep_duration'] = _sleep_min
                         settings_logger.warning(f"Sleep duration for {app_name} instance {i+1} was {original_value}s, set to minimum {_sleep_min}s (1 minute)")
+                # Queue dispatcher values are per instance. Clamp invalid input so a
+                # malformed UI/API payload cannot create a busy loop or bypass limits.
+                for qfield, (qmin, qmax, qdefault) in _queue_ranges.items():
+                    if qfield not in instance:
+                        continue
+                    try:
+                        qvalue = int(instance[qfield])
+                    except (TypeError, ValueError):
+                        qvalue = qdefault
+                    instance[qfield] = min(qmax, max(qmin, qvalue))
+                if app_name == 'sonarr':
+                    instance['force_season_replacement'] = instance.get('force_season_replacement') is True
+
                 # Enforce hourly_cap max 400 per instance
                 if 'hourly_cap' in instance:
                     original_cap = instance['hourly_cap']

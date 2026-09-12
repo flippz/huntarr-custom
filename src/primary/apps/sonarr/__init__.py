@@ -83,12 +83,16 @@ def get_configured_instances(quiet=False):
                     "tag_enable_upgraded": instance.get("tag_enable_upgraded", False),
                     "tag_enable_shows_missing": instance.get("tag_enable_shows_missing", False),
                     "custom_tags": instance.get("custom_tags", {}),
-                    "state_management_hours": instance.get("state_management_hours", 72),  # CRITICAL for Issue #717 fix
+                    "state_management_hours": instance.get("state_management_hours", 24),  # processed-item dedup retention
                     "state_management_mode": instance.get("state_management_mode", "custom"),  # CRITICAL for Issue #717 fix
                     "api_timeout": instance.get("api_timeout", 120),
                     "command_wait_delay": instance.get("command_wait_delay", 1),
                     "command_wait_attempts": instance.get("command_wait_attempts", 600),
                     "max_download_queue_size": instance.get("max_download_queue_size", -1),
+                    "target_queue_depth": instance.get("target_queue_depth", 3),
+                    "minimum_dispatch_interval_seconds": instance.get("minimum_dispatch_interval_seconds", 15),
+                    "queue_redispatch_wait_seconds": instance.get("queue_redispatch_wait_seconds", 60),
+                    "force_season_replacement": instance.get("force_season_replacement", False),
                     "max_seed_queue_size": instance.get("max_seed_queue_size", -1),
                     "seed_check_torrent_client": instance.get("seed_check_torrent_client"),
                 }

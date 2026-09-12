@@ -10,7 +10,7 @@ from src.primary.utils.logger import get_logger
 from src.primary.apps._common.tagging import try_tag_item
 from src.primary.apps.sonarr import api as sonarr_api
 from src.primary.apps.sonarr.missing import _normalize_exempt_tags
-from src.primary.stats_manager import increment_stat, check_hourly_cap_exceeded
+from src.primary.stats_manager import increment_media_stat_only, check_hourly_cap_exceeded
 from src.primary.stateful_manager import is_processed, add_processed_id
 from src.primary.utils.history_utils import log_processed_media
 from src.primary.settings_manager import get_advanced_setting, load_settings
@@ -38,6 +38,7 @@ def process_cutoff_upgrades(
     upgrade_tag: str = "",
     exempt_tags: list = None,
     instance_display_name: Optional[str] = None,
+    force_season_replacement: bool = False,
 ) -> bool:
     """
     Process quality cutoff upgrades for Sonarr.
@@ -54,6 +55,15 @@ def process_cutoff_upgrades(
     tag_label = (upgrade_tag or "").strip()
         
     sonarr_logger.info(f"Upgrade: checking for {hunt_upgrade_items} items for '{instance_name}'")
+
+    if force_season_replacement:
+        from src.primary.apps.sonarr.season_recovery import recover_pending
+        if not recover_pending(
+            api_url, api_key, api_timeout, instance_name,
+            recovery_timeout_seconds=max(1, command_wait_delay) * max(1, command_wait_attempts),
+        ):
+            sonarr_logger.error("Force season replacement blocked: pending recovery could not complete")
+            return False
     
     # Use custom tags if provided, otherwise use defaults
     if custom_tags is None:
@@ -119,10 +129,9 @@ def process_cutoff_upgrades(
             series_id = s.get("id")
             title = s.get("title", f"Series {series_id}")
             sonarr_logger.info(f"Processing tag-based upgrade for series: \"{title}\" (ID: {series_id})")
-            if sonarr_api.series_search(api_url, api_key, api_timeout, series_id):
+            if sonarr_api.series_search(api_url, api_key, api_timeout, series_id, instance_name=instance_name):
                 add_processed_id("sonarr", instance_name, f"series_{series_id}")
-                from src.primary.stats_manager import increment_stat_only
-                increment_stat_only("sonarr", "upgraded", 1, instance_name)
+                increment_media_stat_only("sonarr", "upgraded", 1, instance_name)
                 log_processed_media("sonarr", title, str(series_id), instance_name, "upgrade", display_name_for_log=instance_display_name or instance_name)
                 
                 # Add the upgrade tag to mark as processed (Upgradinatorr-style)
@@ -150,10 +159,11 @@ def process_cutoff_upgrades(
     # Use seasons_packs mode or episodes mode (exempt_tags already normalized above)
     if upgrade_mode == "seasons_packs":
         return process_upgrade_seasons_mode(
-            api_url, api_key, instance_name, api_timeout, monitored_only, 
+            api_url, api_key, instance_name, api_timeout, monitored_only,
             hunt_upgrade_items, command_wait_delay, command_wait_attempts, stop_check,
-            tag_processed_items, tag_enable_upgrade, tag_enable_upgraded, custom_tags, exempt_tags=exempt_tags,
-            instance_display_name=display_name
+            tag_processed_items, tag_enable_upgrade, tag_enable_upgraded, custom_tags,
+            exempt_tags=exempt_tags, instance_display_name=display_name,
+            force_season_replacement=force_season_replacement,
         )
     elif upgrade_mode == "episodes":
         # Handle individual episode upgrades (reinstated with warnings)
@@ -211,6 +221,7 @@ def process_upgrade_seasons_mode(
     custom_tags: dict = None,
     exempt_tags: list = None,
     instance_display_name: Optional[str] = None,
+    force_season_replacement: bool = False,
 ) -> bool:
     """Process upgrades in season mode - groups episodes by season."""
     processed_any = False
@@ -347,8 +358,8 @@ def process_upgrade_seasons_mode(
         
         # Check API limit before processing each season
         try:
-            if check_hourly_cap_exceeded("sonarr"):
-                sonarr_logger.warning(f"🛑 Sonarr API hourly limit reached - stopping upgrade season processing")
+            if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
+                sonarr_logger.warning(f"🛑 Sonarr search-dispatch hourly limit reached - stopping upgrade season processing")
                 break
         except Exception as e:
             sonarr_logger.error(f"Error checking hourly API cap: {e}")
@@ -365,17 +376,59 @@ def process_upgrade_seasons_mode(
             sonarr_logger.info("Stop requested during season processing.")
             break
             
-        # Trigger search for the entire season instead of individual episodes
+        # Trigger search for the entire season. The opt-in force path acquires a
+        # queue slot before touching files, then waits for a verified import or rolls back.
         sonarr_logger.debug(f"Attempting to search for entire Season {season_number} of {series_title} for upgrades")
-        search_command_id = sonarr_api.search_season(api_url, api_key, api_timeout, series_id, season_number, instance_name=instance_name)
-        
+        recovery_id = None
+        dispatch_slot_acquired = False
+        search_started_at = None
+        if force_season_replacement:
+            if command_wait_attempts <= 0:
+                sonarr_logger.error("Force exact-season replacement requires command waiting; skipping unsafe fire-and-forget search")
+                continue
+            from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot
+            dispatch_slot_acquired = acquire_dispatch_slot()
+            if not dispatch_slot_acquired:
+                continue
+            from src.primary.apps.sonarr.season_recovery import (
+                mark_search_started, prepare_exact_season, utc_now_iso,
+            )
+            recovery_id = prepare_exact_season(
+                api_url, api_key, api_timeout, instance_name, series_id, season_number
+            )
+            if recovery_id is None:
+                sonarr_logger.error("Skipping forced search: exact-season staging was not safe")
+                continue
+            search_started_at = utc_now_iso()
+            if not mark_search_started(instance_name, recovery_id, search_started_at):
+                sonarr_logger.error("Skipping forced search: could not arm durable recovery journal")
+                from src.primary.apps.sonarr.season_recovery import recover_pending
+                recover_pending(api_url, api_key, api_timeout, instance_name)
+                continue
+        search_command_id = sonarr_api.search_season(
+            api_url, api_key, api_timeout, series_id, season_number,
+            instance_name=instance_name, dispatch_slot_acquired=dispatch_slot_acquired,
+        )
+        command_completed = False
         if search_command_id:
-            # Wait for search command to complete
-            if wait_for_command(
+            command_completed = wait_for_command(
                 api_url, api_key, api_timeout, search_command_id,
                 command_wait_delay, command_wait_attempts, "Episode Upgrade Search", stop_check,
                 instance_name=instance_name
-            ):
+            )
+        if force_season_replacement:
+            from src.primary.apps.sonarr.season_recovery import finish_operation
+            outcome = finish_operation(
+                api_url, api_key, api_timeout, instance_name, recovery_id,
+                search_started_at or utc_now_iso(), command_completed,
+                command_wait_delay, command_wait_attempts, stop_check,
+            )
+            if outcome not in {"imported", "no-files"}:
+                sonarr_logger.info("Forced exact-season search ended with recovery outcome: %s", outcome)
+                continue
+
+        if search_command_id:
+            if command_completed:
                 # Mark as processed if search command completed successfully
                 processed_any = True
                 sonarr_logger.info(f"Successfully triggered season pack search for {series_title} Season {season_number} with {len(episode_ids)} cutoff unmet episodes")
@@ -392,19 +445,15 @@ def process_upgrade_seasons_mode(
                 add_processed_id("sonarr", instance_name, season_id)
                 sonarr_logger.debug(f"Marked season ID {season_id} as processed for upgrades ({series_title} - Season {season_number})")
                 
-                # We'll increment stats individually for each episode instead of in batch
-                # increment_stat("sonarr", "upgraded", len(episode_ids))
-                # sonarr_logger.debug(f"Incremented sonarr upgraded statistics by {len(episode_ids)}")
-                
+                # Media totals are recorded per episode below; the search command
+                # itself consumed exactly one dispatch-cap slot.
                 # Mark episodes as processed using stateful management
                 for episode_id in episode_ids:
                     add_processed_id("sonarr", instance_name, str(episode_id))
                     sonarr_logger.debug(f"Marked episode ID {episode_id} as processed for upgrades")
                     
-                    # CRITICAL FIX: Use increment_stat_only to avoid double-counting API calls
-                    # The API call is already tracked in search_season(), so we only increment stats here
-                    from src.primary.stats_manager import increment_stat_only
-                    increment_stat_only("sonarr", "upgraded", 1, instance_name)
+                    # Media totals are independent from the one-slot search dispatch cap.
+                    increment_media_stat_only("sonarr", "upgraded", 1, instance_name)
                     sonarr_logger.debug(f"Incremented sonarr upgraded statistic for episode {episode_id} (API call already tracked separately)")
                     
                     # Find the episode information for history logging
@@ -584,17 +633,15 @@ def process_upgrade_shows_mode(
                              api_url, api_key, api_timeout, series_id,
                              sonarr_logger, f"series {series_id}")
                 
-                # We'll increment stats individually for each episode instead of in batch
-                # increment_stat("sonarr", "upgraded", len(episode_ids))
-                # sonarr_logger.debug(f"Incremented sonarr upgraded statistics by {len(episode_ids)}")
-                
+                # Media totals are recorded per episode below; the search command
+                # itself consumed exactly one dispatch-cap slot.
                 # Mark episodes as processed using stateful management
                 for episode_id in episode_ids:
                     add_processed_id("sonarr", instance_name, str(episode_id))
                     sonarr_logger.debug(f"Marked episode ID {episode_id} as processed for upgrades")
                     
-                    # Increment stats for this episode (consistent with Radarr's approach)
-                    increment_stat("sonarr", "upgraded", 1, instance_name)
+                    # Increment media totals without consuming another dispatch slot.
+                    increment_media_stat_only("sonarr", "upgraded", 1, instance_name)
                     sonarr_logger.debug(f"Incremented sonarr upgraded statistic for episode {episode_id}")
                     
                     # Find the episode information for history logging
@@ -744,7 +791,7 @@ def process_upgrade_episodes_mode(
         
         # Check API limit before processing each episode
         try:
-            if check_hourly_cap_exceeded("sonarr"):
+            if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
                 sonarr_logger.warning(f"🛑 Sonarr API hourly limit reached - stopping episode upgrade processing after {processed_count} episodes")
                 break
         except Exception as e:
@@ -788,8 +835,8 @@ def process_upgrade_episodes_mode(
                     log_processed_media("sonarr", media_name, str(episode_id), instance_name, "upgrade", display_name_for_log=instance_display_name or instance_name, status='completed')
                     sonarr_logger.debug(f"Logged upgrade to history for episode: {media_name}")
                     
-                    # Increment statistics
-                    increment_stat("sonarr", "upgraded", 1, instance_name)
+                    # Increment media totals without consuming another dispatch slot.
+                    increment_media_stat_only("sonarr", "upgraded", 1, instance_name)
                     sonarr_logger.debug(f"Incremented sonarr upgraded statistics for episode {episode_id}")
                     
                     # Note: No tagging is performed in episodes mode as it would be inefficient
@@ -810,8 +857,8 @@ def process_upgrade_episodes_mode(
                 log_processed_media("sonarr", media_name, str(episode_id), instance_name, "upgrade", display_name_for_log=instance_display_name or instance_name)
                 sonarr_logger.debug(f"Logged upgrade to history for episode: {media_name}")
                 
-                # Increment statistics
-                increment_stat("sonarr", "upgraded", 1, instance_name)
+                # Increment media totals without consuming another dispatch slot.
+                increment_media_stat_only("sonarr", "upgraded", 1, instance_name)
                 sonarr_logger.debug(f"Incremented sonarr upgraded statistics for episode {episode_id}")
         else:
             sonarr_logger.error(f"Failed to trigger upgrade search for episode: {series_title} - {season_episode}")

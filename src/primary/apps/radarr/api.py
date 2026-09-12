@@ -33,7 +33,7 @@ def arr_request(api_url: str, api_key: str, api_timeout: int, endpoint: str, met
         method: HTTP method (GET, POST, PUT, DELETE)
         data: Optional data payload for POST/PUT requests
         params: Optional query parameters for GET requests
-        count_api: Whether the request counts toward API tally
+        count_api: Retained for compatibility; only accepted search commands count
     
     Returns:
         The parsed JSON response or None if the request failed
@@ -43,12 +43,7 @@ def arr_request(api_url: str, api_key: str, api_timeout: int, endpoint: str, met
             radarr_logger.error("No URL or API key provided")
             return None
         
-        # Check API limit before making request (skip for read-only / count_api=False, e.g. Activity queue)
-        from src.primary.stats_manager import check_hourly_cap_exceeded, increment_hourly_cap
-        if count_api and check_hourly_cap_exceeded("radarr"):
-            radarr_logger.warning("\U0001F6D1 Radarr API hourly limit reached - skipping request")
-            return None
-        
+        # Read/status/tag requests are separate from the search-dispatch cap.
         # Construct the full URL properly
         full_url = f"{api_url.rstrip('/')}/api/v3/{endpoint.lstrip('/')}"
         
@@ -83,10 +78,6 @@ def arr_request(api_url: str, api_key: str, api_timeout: int, endpoint: str, met
         # Check for errors
         response.raise_for_status()
         
-        # Increment API usage counter only after successful request
-        if count_api:
-            increment_hourly_cap("radarr")
-        
         # Parse JSON response
         if response.text:
             return response.json()
@@ -115,7 +106,8 @@ def get_download_queue_size(api_url: str, api_key: str, api_timeout: int) -> int
         # Radarr uses /api/v3/queue
         endpoint = f"{api_url.rstrip('/')}/api/v3/queue?page=1&pageSize=1000" # Fetch a large page size
         headers = {"X-Api-Key": api_key}
-        response = session.get(endpoint, headers=headers, timeout=api_timeout)
+        response = session.get(endpoint, headers=headers, timeout=api_timeout,
+                               verify=get_ssl_verify_setting())
         response.raise_for_status()
         queue_data = response.json()
         queue_size = queue_data.get('totalRecords', 0)
@@ -127,6 +119,20 @@ def get_download_queue_size(api_url: str, api_key: str, api_timeout: int) -> int
     except Exception as e:
         radarr_logger.error(f"An unexpected error occurred while getting Radarr queue size: {e}")
         return -1
+
+
+def get_active_search_command_count(api_url: str, api_key: str, api_timeout: int) -> int:
+    """Return queued/started Radarr movie searches, or -1 when status is unknown."""
+    response = arr_request(api_url, api_key, api_timeout, "command",
+                           params={"page": 1, "pageSize": 1000}, count_api=False)
+    commands = response.get("records") if isinstance(response, dict) else response
+    if not isinstance(commands, list):
+        return -1
+    return sum(
+        1 for command in commands
+        if str(command.get("name", "")).lower() in {"moviessearch", "moviesearch"}
+        and str(command.get("status", command.get("state", ""))).lower() in {"queued", "started", "running"}
+    )
 
 
 def get_disk_space(api_url: str, api_key: str, api_timeout: int) -> Optional[List[Dict]]:
@@ -447,6 +453,17 @@ def movie_search(api_url: str, api_key: str, api_timeout: int, movie_ids: List[i
     if not movie_ids:
         radarr_logger.warning("No movie IDs provided for search.")
         return None
+
+    from src.primary.stats_manager import check_hourly_cap_exceeded
+    from src.primary.utils.clean_logger import get_instance_name_for_cap
+    instance_name = get_instance_name_for_cap()
+    if check_hourly_cap_exceeded("radarr", instance_name=instance_name):
+        radarr_logger.warning("Radarr search-dispatch hourly limit reached; MoviesSearch deferred")
+        return None
+
+    from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot
+    if not acquire_dispatch_slot():
+        return None
         
     endpoint = "command"
     data = {
@@ -454,10 +471,14 @@ def movie_search(api_url: str, api_key: str, api_timeout: int, movie_ids: List[i
         "movieIds": movie_ids
     }
     
-    # count_api=False: caller (missing/upgrade) uses increment_stat_only so API bar = searches + upgrades (one count per action)
+    # Only accepted search commands consume the separate hourly dispatch cap.
     response = arr_request(api_url, api_key, api_timeout, endpoint, method="POST", data=data, count_api=False)
     if response and 'id' in response:
         command_id = response['id']
+        from src.primary.apps._common.queue_dispatch import record_submission
+        from src.primary.stats_manager import increment_hourly_cap
+        record_submission()
+        increment_hourly_cap("radarr", 1, instance_name=instance_name)
         radarr_logger.debug(f"Triggered search for movie IDs: {movie_ids}. Command ID: {command_id}")
         return command_id
     else:
@@ -487,7 +508,8 @@ def wait_for_command(api_url: str, api_key: str, api_timeout: int, command_id: i
     """
     attempts = 0
     while attempts < max_attempts:
-        response = arr_request(api_url, api_key, api_timeout, f"command/{command_id}")
+        # Command status polling does not consume the search-submission hourly cap.
+        response = arr_request(api_url, api_key, api_timeout, f"command/{command_id}", count_api=False)
         if response and 'state' in response:
             state = response['state']
             if state == "completed":

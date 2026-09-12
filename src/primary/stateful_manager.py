@@ -14,7 +14,7 @@ from typing import Dict, Any, List, Optional, Set
 stateful_logger = logging.getLogger("stateful_manager")
 
 # Constants
-DEFAULT_HOURS = 72  # Default 3 days (72 hours)
+DEFAULT_HOURS = 24  # Processed-item deduplication retention default
 
 # App types
 APP_TYPES = ["sonarr", "radarr", "lidarr", "readarr", "whisparr", "eros", "movie_hunt", "tv_hunt"]
