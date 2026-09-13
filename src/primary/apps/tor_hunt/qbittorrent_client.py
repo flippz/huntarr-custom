@@ -146,6 +146,56 @@ class QBittorrentClient:
                 return []
         return []
 
+    def get_job_capacity(self, fallback_limit: int = 0) -> Dict[str, Any]:
+        """Read active job count and capacity with explicit health semantics.
+
+        Used by Swaparr/Huntarr for Decypharr's qBittorrent-compatible API. Unlike
+        ``get_torrents()``, this raises on telemetry failure so callers never interpret
+        a failed request as an empty client.
+        """
+        torrents_response = self._get('/torrents/info')
+        if torrents_response is None or torrents_response.status_code != 200:
+            status = torrents_response.status_code if torrents_response is not None else "unreachable"
+            raise RuntimeError(f"qBittorrent-compatible jobs endpoint returned {status}")
+        try:
+            torrents = torrents_response.json()
+        except Exception as exc:
+            raise RuntimeError(f"qBittorrent-compatible jobs endpoint returned invalid JSON: {exc}") from None
+        if not isinstance(torrents, list):
+            raise RuntimeError("qBittorrent-compatible jobs endpoint returned an unexpected format")
+        inactive = {
+            'uploading', 'stalledup', 'pausedup', 'queuedup', 'checkingup',
+            'completed', 'stoppedup', 'error', 'missingfiles',
+        }
+        active = sum(
+            1 for torrent in torrents
+            if isinstance(torrent, dict)
+            and str(torrent.get('state') or '').lower() not in inactive
+        )
+        preferences_response = self._get('/app/preferences')
+        preferences = {}
+        if preferences_response is not None and preferences_response.status_code == 200:
+            try:
+                preferences = preferences_response.json()
+            except Exception:
+                preferences = {}
+        try:
+            limit = int(preferences.get('max_active_downloads') or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        source = 'client-reported max_active_downloads'
+        if limit <= 0:
+            try:
+                limit = int(fallback_limit or 0)
+            except (TypeError, ValueError):
+                limit = 0
+            source = 'configured Decypharr max active jobs'
+        if limit <= 0:
+            raise RuntimeError(
+                "Decypharr job limit unavailable (set Max Active Jobs if the client does not report it)"
+            )
+        return {'active': active, 'limit': limit, 'free': max(0, limit - active), 'source': source}
+
     def get_torrent_properties(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
         """Get properties of a specific torrent."""
         r = self._get('/torrents/properties', params={'hash': torrent_hash})

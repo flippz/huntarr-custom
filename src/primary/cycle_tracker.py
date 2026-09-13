@@ -68,7 +68,10 @@ def _pipeline_summary(app_type: str, instance_id: str, instance_settings: dict) 
     summary = {
         "slots_used": runtime.get("slots_used"),
         "slots_target": runtime.get("slots_target", target),
+        "slots_free": runtime.get("slots_free"),
         "pause_reason": runtime.get("pause_reason"),
+        "decypharr": runtime.get("decypharr"),
+        "shared_capacity_weight": int(instance_settings.get("shared_capacity_weight", 1) or 1),
     }
     try:
         from src.primary.stats_manager import get_hourly_cap_status

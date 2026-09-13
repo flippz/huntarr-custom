@@ -66,6 +66,11 @@ def get_default_instance_config(app_type: str) -> Dict[str, Any]:
             "upgrade_tag": "upgradinatorr",
             "skip_future_episodes": True,
             "force_season_replacement": False,
+            "webhook_enabled": False,
+            "webhook_secret": "",
+            "shared_capacity_weight": 1,
+            "decypharr_capacity_enabled": False,
+            "decypharr_max_active_jobs": 0,
             "tag_enable_shows_missing": True,
             "custom_tags": {
                 "missing": "huntarr-missing",
@@ -79,6 +84,11 @@ def get_default_instance_config(app_type: str) -> Dict[str, Any]:
             "hunt_upgrade_movies": 0,
             "upgrade_selection_method": "cutoff",
             "upgrade_tag": "upgradinatorr",
+            "webhook_enabled": False,
+            "webhook_secret": "",
+            "shared_capacity_weight": 1,
+            "decypharr_capacity_enabled": False,
+            "decypharr_max_active_jobs": 0,
         })
     elif app_type == "lidarr":
         base_instance.update({

@@ -10455,6 +10455,10 @@ window.CycleCountdown = (function() {
         if (pipeline.search_budget_limit !== undefined && pipeline.search_budget_limit !== null) {
             parts.push('Searches ' + (pipeline.search_budget_used || 0) + '/' + pipeline.search_budget_limit);
         }
+        if (pipeline.decypharr && pipeline.decypharr.enabled) {
+            if (pipeline.decypharr.healthy) parts.push('Decypharr free ' + pipeline.decypharr.free);
+            else parts.push(pipeline.decypharr.reason || 'Decypharr fail-open');
+        }
         if (pipeline.pause_reason) parts.push('Paused: ' + pipeline.pause_reason);
         status.textContent = parts.length ? ' · ' + parts.join(' · ') : '';
         timerElement.title = pipeline.pause_reason || parts.join(' · ');

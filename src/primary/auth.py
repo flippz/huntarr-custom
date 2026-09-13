@@ -513,6 +513,11 @@ def authenticate_request():
         '/api/logs/', '/api/cycle/', '/api/hourly-caps', '/api/swaparr/status'
     ])
 
+    # Starr webhooks perform their own constant-time per-instance secret authentication.
+    # They must be reachable by Sonarr/Radarr without a Huntarr browser session.
+    if request.path.startswith('/api/webhooks/starr/'):
+        return None
+
     # FIRST: Always allow setup and user page access
     if request.path.endswith('/setup') or request.path.endswith('/user'):
         return None

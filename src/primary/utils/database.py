@@ -1420,6 +1420,26 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 ON pipeline_item_events (app_type, instance_name, item_key, occurred_at_epoch)
             ''')
 
+            # Optional Sonarr/Radarr webhook receipts. The globally unique digest makes
+            # retries idempotent across restarts; pruning bounds long-term storage.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS starr_webhook_receipts (
+                    event_id TEXT PRIMARY KEY,
+                    app_type TEXT NOT NULL,
+                    instance_name TEXT NOT NULL,
+                    received_at_epoch INTEGER NOT NULL,
+                    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_starr_webhook_receipts_received
+                ON starr_webhook_receipts (received_at_epoch)
+            ''')
+            conn.execute(
+                "DELETE FROM starr_webhook_receipts WHERE received_at_epoch < ?",
+                (int(time.time()) - 7 * 24 * 60 * 60,),
+            )
+
             # Create sleep_data table for cycle tracking (single-app e.g. swaparr)
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS sleep_data (

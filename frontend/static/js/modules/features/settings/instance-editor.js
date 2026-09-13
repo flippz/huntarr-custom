@@ -139,6 +139,11 @@
                     minimum_dispatch_interval_seconds: 15,
                     queue_redispatch_wait_seconds: 60,
                     force_season_replacement: false,
+                    webhook_enabled: false,
+                    webhook_secret: '',
+                    shared_capacity_weight: 1,
+                    decypharr_capacity_enabled: false,
+                    decypharr_max_active_jobs: 0,
                     swaparr_enabled: false
                 };
             }
@@ -474,6 +479,9 @@
             console.log(`[SettingsForms] Generating editor HTML for ${appType}, instance index: ${index}`);
             const isEdit = index !== null;
             const swaparrEnabled = this.isSwaparrGloballyEnabled();
+            const escapeAttr = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            })[char]);
 
             // Ensure instance properties have defaults if undefined
             const safeInstance = {
@@ -513,6 +521,11 @@
                 minimum_dispatch_interval_seconds: instance.minimum_dispatch_interval_seconds !== undefined ? instance.minimum_dispatch_interval_seconds : 15,
                 queue_redispatch_wait_seconds: instance.queue_redispatch_wait_seconds !== undefined ? instance.queue_redispatch_wait_seconds : 60,
                 force_season_replacement: instance.force_season_replacement === true,
+                webhook_enabled: instance.webhook_enabled === true,
+                webhook_secret: instance.webhook_secret || '',
+                shared_capacity_weight: instance.shared_capacity_weight !== undefined ? instance.shared_capacity_weight : 1,
+                decypharr_capacity_enabled: instance.decypharr_capacity_enabled === true,
+                decypharr_max_active_jobs: instance.decypharr_max_active_jobs !== undefined ? instance.decypharr_max_active_jobs : 0,
                 max_seed_queue_size: instance.max_seed_queue_size !== undefined ? instance.max_seed_queue_size : -1,
                 seed_check_torrent_client: instance.seed_check_torrent_client && typeof instance.seed_check_torrent_client === 'object' ? instance.seed_check_torrent_client : null,
                 // Cycle settings (per-instance; were global in 9.0.x)
@@ -1077,6 +1090,44 @@
                         </div>
                         <p class="editor-help-text">Never submit at or above this queue size (-1 = disabled). If enabled and queue status is unavailable, dispatch is denied.</p>
                     </div>
+
+                    <div class="editor-field-group">
+                        <div class="editor-setting-item">
+                            <label>Shared Capacity Weight</label>
+                            <input type="number" id="editor-shared-capacity-weight" value="${safeInstance.shared_capacity_weight}" min="1" max="100">
+                        </div>
+                        <p class="editor-help-text">Weighted fair share when Sonarr and Radarr instances contend. Default 1 preserves equal sharing; other Arr app types are unaffected.</p>
+                    </div>
+
+                    <div class="editor-field-group tag-sub-box">
+                        <div class="editor-setting-item flex-row">
+                            <label>Use Decypharr Worker Capacity</label>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="editor-decypharr-capacity-enabled" ${safeInstance.decypharr_capacity_enabled ? 'checked' : ''}>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="editor-setting-item" style="margin-top: 8px;">
+                            <label>Decypharr Max Active Jobs</label>
+                            <input type="number" id="editor-decypharr-max-active-jobs" value="${safeInstance.decypharr_max_active_jobs}" min="0" max="1000">
+                        </div>
+                        <p class="editor-help-text">Uses the qBittorrent-compatible client configured below. Huntarr reads active jobs and the client-reported max_active_downloads value. Set a fallback here only if Decypharr does not report a limit (0 = require client-reported limit). Missing telemetry fails open to safe Starr capacity with bounded backoff.</p>
+                    </div>
+
+                    <div class="editor-field-group tag-sub-box">
+                        <div class="editor-setting-item flex-row">
+                            <label>Starr Webhook Wake</label>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="editor-webhook-enabled" ${safeInstance.webhook_enabled ? 'checked' : ''}>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="editor-setting-item" style="margin-top: 8px;">
+                            <label>Webhook Secret</label>
+                            <input type="password" id="editor-webhook-secret" value="${escapeAttr(safeInstance.webhook_secret)}" placeholder="Generated when enabled and saved" autocomplete="off">
+                        </div>
+                        <p class="editor-help-text">Optional and off by default. In ${appType === 'sonarr' ? 'Sonarr' : 'Radarr'}: Settings → Connect → Webhook, use POST URL <code>/api/webhooks/starr/${appType}/${safeInstance.instance_id || '&lt;save-instance-first&gt;'}</code>, enable Grab, Download/Import, and failure events, then add header <code>X-Huntarr-Webhook-Secret</code> with this secret (or HTTP Basic password). Save once after enabling to generate the secret. Polling remains the fallback.</p>
+                    </div>
                     ` : ''}
 
                     ${appType === 'sonarr' ? `
@@ -1194,6 +1245,11 @@
                 minimum_dispatch_interval_seconds: document.getElementById('editor-min-dispatch-interval') ? (parseInt(document.getElementById('editor-min-dispatch-interval').value, 10) || 15) : 15,
                 queue_redispatch_wait_seconds: document.getElementById('editor-redispatch-wait') ? Math.max(0, parseInt(document.getElementById('editor-redispatch-wait').value, 10) || 0) : 60,
                 force_season_replacement: !!(document.getElementById('editor-force-season-replacement') && document.getElementById('editor-force-season-replacement').checked),
+                webhook_enabled: !!(document.getElementById('editor-webhook-enabled') && document.getElementById('editor-webhook-enabled').checked),
+                webhook_secret: document.getElementById('editor-webhook-secret') ? document.getElementById('editor-webhook-secret').value.trim() : '',
+                shared_capacity_weight: document.getElementById('editor-shared-capacity-weight') ? (parseInt(document.getElementById('editor-shared-capacity-weight').value, 10) || 1) : 1,
+                decypharr_capacity_enabled: !!(document.getElementById('editor-decypharr-capacity-enabled') && document.getElementById('editor-decypharr-capacity-enabled').checked),
+                decypharr_max_active_jobs: document.getElementById('editor-decypharr-max-active-jobs') ? Math.max(0, parseInt(document.getElementById('editor-decypharr-max-active-jobs').value, 10) || 0) : 0,
                 max_seed_queue_size: (function () { const v = parseInt(document.getElementById('editor-max-seed-queue-size').value, 10); return (!isNaN(v) && v >= -1) ? v : -1; })(),
                 seed_check_torrent_client: (function () {
                     const typeEl = document.getElementById('editor-seed-client-type');
@@ -1304,14 +1360,18 @@
                 savePromise.then(function (data) {
                     // Server may have generated instance_id for new instances; update the displayed field
                     if (data && data.settings && data.settings.instances && data.settings.instances[finalIndex]) {
+                        window.huntarrUI.originalSettings[appType] = data.settings;
                         const savedInstance = data.settings.instances[finalIndex];
                         const instanceId = (savedInstance.instance_id || '').trim();
+                        const webhookSecret = savedInstance.webhook_secret || '';
                         if (instanceId) {
                             const idInput = document.getElementById('editor-instance-id');
                             if (idInput) idInput.value = instanceId;
-                            if (self._currentEditing && self._currentEditing.originalInstance) {
-                                self._currentEditing.originalInstance.instance_id = instanceId;
-                            }
+                        }
+                        const secretInput = document.getElementById('editor-webhook-secret');
+                        if (secretInput && webhookSecret) secretInput.value = webhookSecret;
+                        if (self._currentEditing && self._currentEditing.originalInstance) {
+                            self._currentEditing.originalInstance = JSON.parse(JSON.stringify(savedInstance));
                         }
                     }
                 }).catch(function () { /* saveAppSettings already shows error */ });

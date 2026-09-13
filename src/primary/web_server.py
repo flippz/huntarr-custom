@@ -321,10 +321,12 @@ from src.primary.routes.requestarr_users_routes import requestarr_users_bp
 from src.primary.routes.requestarr_services_routes import requestarr_services_bp
 from src.primary.routes.requestarr_requests_routes import requestarr_requests_bp
 from src.primary.routes.requestarr_bundles_routes import requestarr_bundles_bp
+from src.primary.routes.starr_webhook_routes import starr_webhook_bp
 app.register_blueprint(requestarr_users_bp)
 app.register_blueprint(requestarr_services_bp)
 app.register_blueprint(requestarr_requests_bp)
 app.register_blueprint(requestarr_bundles_bp)
+app.register_blueprint(starr_webhook_bp)
 
 # User notification settings
 from src.primary.routes.user_notification_routes import user_notification_bp

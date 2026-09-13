@@ -227,6 +227,8 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
         'queue_redispatch_wait_seconds': (0, 3600, 60),
         'state_management_hours': (1, 8760, 24),
         'max_download_queue_size': (-1, 1000, -1),
+        'shared_capacity_weight': (1, 100, 1),
+        'decypharr_max_active_jobs': (0, 1000, 0),
     }
     for qfield, (qmin, qmax, qdefault) in _queue_ranges.items():
         if qfield not in settings_data:
@@ -238,6 +240,12 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
         settings_data[qfield] = min(qmax, max(qmin, qvalue))
     if app_name == 'sonarr' and 'force_season_replacement' in settings_data:
         settings_data['force_season_replacement'] = settings_data.get('force_season_replacement') is True
+    if app_name in ('sonarr', 'radarr'):
+        settings_data['webhook_enabled'] = settings_data.get('webhook_enabled') is True
+        settings_data['decypharr_capacity_enabled'] = settings_data.get('decypharr_capacity_enabled') is True
+        if settings_data['webhook_enabled'] and len(str(settings_data.get('webhook_secret') or '')) < 24:
+            import secrets
+            settings_data['webhook_secret'] = secrets.token_urlsafe(32)
 
     # Also validate numeric fields in instances array
     if 'instances' in settings_data and isinstance(settings_data['instances'], list):
@@ -260,6 +268,14 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
                     instance[qfield] = min(qmax, max(qmin, qvalue))
                 if app_name == 'sonarr':
                     instance['force_season_replacement'] = instance.get('force_season_replacement') is True
+                if app_name in ('sonarr', 'radarr'):
+                    instance['webhook_enabled'] = instance.get('webhook_enabled') is True
+                    instance['decypharr_capacity_enabled'] = instance.get('decypharr_capacity_enabled') is True
+                    if instance['webhook_enabled']:
+                        secret = str(instance.get('webhook_secret') or '')
+                        if len(secret) < 24:
+                            import secrets
+                            instance['webhook_secret'] = secrets.token_urlsafe(32)
 
                 # Enforce hourly_cap max 400 per instance
                 if 'hourly_cap' in instance:

@@ -87,6 +87,10 @@ def _responsive_sleep(
     elapsed = 0
     instances = instances_for_reset or []
     _db_error_logged = False  # Throttle DB error logging to avoid log flooding
+    from src.primary.apps._common.wake_registry import consume_wakes, wait as wait_for_webhook
+    if consume_wakes(app_type):
+        app_logger.info("Starr webhook wake detected for %s; starting reconciliation cycle", app_type)
+        return
     while elapsed < sleep_seconds:
         if stop_event.is_set():
             app_logger.info("Stop event detected during sleep. Breaking out of sleep cycle.")
@@ -123,8 +127,12 @@ def _responsive_sleep(
             stop_event.wait(min(wait_interval * 10, 30))
             elapsed += min(wait_interval * 10, 30)
             continue
-        stop_event.wait(wait_interval)
-        elapsed += wait_interval
+        interval = min(wait_interval, max(0, sleep_seconds - elapsed))
+        if wait_for_webhook(app_type, interval):
+            consume_wakes(app_type)
+            app_logger.info("Starr webhook wake detected for %s; starting reconciliation cycle", app_type)
+            return
+        elapsed += interval
 
 
 def _parse_next_cycle_time(next_str: Optional[str], user_tz) -> Optional[datetime.datetime]:

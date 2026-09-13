@@ -230,6 +230,8 @@ Once running, open your browser to `http://<your-server-ip>:9705`.
 
 For full documentation, visit the [Huntarr Docs](https://emiliomm.github.io/huntarr-custom/).
 
+Phase 3 setup: [optional Starr webhooks, Decypharr capacity, and weighted fairness](docs/phase3-webhooks-capacity.md).
+
 ---
 
 ## The original

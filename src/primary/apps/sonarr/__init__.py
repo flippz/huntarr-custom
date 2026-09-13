@@ -93,6 +93,10 @@ def get_configured_instances(quiet=False):
                     "minimum_dispatch_interval_seconds": instance.get("minimum_dispatch_interval_seconds", 15),
                     "queue_redispatch_wait_seconds": instance.get("queue_redispatch_wait_seconds", 60),
                     "force_season_replacement": instance.get("force_season_replacement", False),
+                    "webhook_enabled": instance.get("webhook_enabled", False),
+                    "shared_capacity_weight": instance.get("shared_capacity_weight", 1),
+                    "decypharr_capacity_enabled": instance.get("decypharr_capacity_enabled", False),
+                    "decypharr_max_active_jobs": instance.get("decypharr_max_active_jobs", 0),
                     "max_seed_queue_size": instance.get("max_seed_queue_size", -1),
                     "seed_check_torrent_client": instance.get("seed_check_torrent_client"),
                 }

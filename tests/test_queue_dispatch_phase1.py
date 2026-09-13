@@ -89,6 +89,10 @@ class DefaultsAndPlumbingTests(unittest.TestCase):
         self.assertEqual(sonarr["minimum_dispatch_interval_seconds"], 15)
         self.assertEqual(sonarr["queue_redispatch_wait_seconds"], 60)
         self.assertFalse(sonarr["force_season_replacement"])
+        self.assertFalse(sonarr["webhook_enabled"])
+        self.assertEqual(sonarr["webhook_secret"], "")
+        self.assertFalse(sonarr["decypharr_capacity_enabled"])
+        self.assertEqual(sonarr["shared_capacity_weight"], 1)
 
     def test_settings_validation_clamps_queue_controls_and_force_boolean(self):
         class FakeDB:
@@ -111,6 +115,10 @@ class DefaultsAndPlumbingTests(unittest.TestCase):
             "queue_redispatch_wait_seconds": 99999,
             "max_download_queue_size": -50,
             "state_management_hours": 0,
+            "shared_capacity_weight": 999,
+            "decypharr_max_active_jobs": -5,
+            "webhook_enabled": True,
+            "webhook_secret": "short",
             "force_season_replacement": "true",
         }]}
         with mock.patch.object(settings_manager, "get_database", return_value=db):
@@ -121,6 +129,10 @@ class DefaultsAndPlumbingTests(unittest.TestCase):
         self.assertEqual(saved["queue_redispatch_wait_seconds"], 3600)
         self.assertEqual(saved["max_download_queue_size"], -1)
         self.assertEqual(saved["state_management_hours"], 1)
+        self.assertEqual(saved["shared_capacity_weight"], 100)
+        self.assertEqual(saved["decypharr_max_active_jobs"], 0)
+        self.assertTrue(saved["webhook_enabled"])
+        self.assertGreaterEqual(len(saved["webhook_secret"]), 24)
         self.assertFalse(saved["force_season_replacement"])
 
     def test_force_option_is_forwarded_only_to_season_upgrade_mode(self):

@@ -189,6 +189,14 @@ class PipelineState:
                 if name in values:
                     entry["value"][name] = copy.deepcopy(values[name])
 
+    def invalidate_queue(self, app_type: str, instance_name: str) -> None:
+        """Make the next reconciliation observation prompt without discarding safe cache data."""
+        key = (str(app_type), str(instance_name))
+        with self._lock:
+            entry = self._queue.get(key)
+            if entry:
+                entry["next_poll"] = 0.0
+
     def set_runtime(self, app_type: str, instance_name: str, **values) -> None:
         with self._lock:
             state = self._runtime.setdefault((str(app_type), str(instance_name)), {})
@@ -326,6 +334,51 @@ class PipelineState:
                     (str(app_type), str(instance_name), str(item_key), state, metadata, now),
                 )
             return cursor.rowcount == 1
+
+    def apply_webhook_event(self, app_type: str, instance_name: str, event_id: str,
+                            item_keys, state: Optional[str], metadata: Optional[str] = None,
+                            cooldown_seconds: Optional[int] = None) -> dict:
+        """Durably deduplicate a webhook and advance only existing unresolved rows.
+
+        Terminal rows are intentionally immutable here. A repeated or late event therefore
+        cannot reopen completed/failed/no-grab work or shorten its cooldown.
+        """
+        if state is not None and state not in LIFECYCLE_STATES:
+            raise ValueError(f"invalid pipeline lifecycle state: {state}")
+        keys = list(dict.fromkeys(str(key) for key in item_keys if key))
+        now = int(self._clock())
+        cooldown = now + max(0, int(cooldown_seconds or 0)) if cooldown_seconds is not None else None
+        unresolved = tuple(sorted(UNRESOLVED_STATES))
+        placeholders = ",".join("?" for _ in unresolved)
+        with self.db.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            receipt = conn.execute(
+                "INSERT OR IGNORE INTO starr_webhook_receipts"
+                "(event_id,app_type,instance_name,received_at_epoch) VALUES(?,?,?,?)",
+                (str(event_id), str(app_type), str(instance_name), now),
+            )
+            if receipt.rowcount != 1:
+                return {"duplicate": True, "transitioned": 0}
+            transitioned = 0
+            if state is not None:
+                for item_key in keys:
+                    cursor = conn.execute(
+                        "UPDATE pipeline_items SET state=?, metadata=COALESCE(?,metadata), "
+                        "cooldown_until_epoch=COALESCE(?,cooldown_until_epoch), updated_at_epoch=?, "
+                        "updated_at=CURRENT_TIMESTAMP WHERE app_type=? AND instance_name=? AND item_key=? "
+                        f"AND state IN ({placeholders})",
+                        (state, metadata, cooldown, now, str(app_type), str(instance_name),
+                         item_key, *unresolved),
+                    )
+                    if cursor.rowcount == 1:
+                        transitioned += 1
+                        conn.execute(
+                            "INSERT INTO pipeline_item_events"
+                            "(app_type,instance_name,item_key,state,metadata,occurred_at_epoch) "
+                            "VALUES(?,?,?,?,?,?)",
+                            (str(app_type), str(instance_name), item_key, state, metadata, now),
+                        )
+            return {"duplicate": False, "transitioned": transitioned}
 
     def transition_command(self, app_type: str, command_id: str, state: str,
                            cooldown_seconds: Optional[int] = None) -> bool:

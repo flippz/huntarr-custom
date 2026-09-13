@@ -34,6 +34,10 @@ class DispatchContext:
     poll_interval: float = 5.0
     last_capacity: Optional[tuple] = None
     current_item_keys: list = field(default_factory=list)
+    shared_weight: int = 1
+    decypharr_capacity_enabled: bool = False
+    decypharr_config: Optional[dict] = None
+    scheduler_held: bool = False
 
 
 _local = threading.local()
@@ -58,9 +62,15 @@ def configure_dispatch(app_type: str, instance_name: str, settings: dict,
     maximum = _integer("max_download_queue_size", -1, -1)
     interval = float(_integer("minimum_dispatch_interval_seconds", 15, 1))
     redispatch = float(_integer("queue_redispatch_wait_seconds", 60, 0))
+    shared_weight = _integer("shared_capacity_weight", 1, 1)
+    decypharr_enabled = settings.get("decypharr_capacity_enabled") is True
+    decypharr_config = dict(settings.get("seed_check_torrent_client") or {})
+    decypharr_config["max_active_jobs"] = _integer("decypharr_max_active_jobs", 0, 0)
     key = (app_type, str(instance_name))
     with _lock:
         previous = _contexts.get(key)
+        if previous and previous.scheduler_held:
+            _release_shared(previous)
         recent = list(previous.recent_submissions) if previous else []
         last = previous.last_submission if previous else 0.0
         cache_name = str(queue_cache_name or instance_name)
@@ -93,18 +103,35 @@ def configure_dispatch(app_type: str, instance_name: str, settings: dict,
         context = DispatchContext(app_type, str(instance_name), target, maximum,
                                   interval, redispatch, stop_check, queue_size,
                                   active_searches, logger, cache_name, recent, last,
-                                  queue_status=_queue_status)
+                                  queue_status=_queue_status, shared_weight=shared_weight,
+                                  decypharr_capacity_enabled=decypharr_enabled,
+                                  decypharr_config=decypharr_config)
         _contexts[key] = context
+        from src.primary.apps._common.shared_scheduler import get_shared_scheduler
+        get_shared_scheduler().configure(app_type, str(instance_name), shared_weight)
     _local.context = context
     logger.info(
-        "Queue dispatch enabled for %s: target=%d, hard ceiling=%s, minimum interval=%ds",
-        instance_name, target, "disabled" if maximum < 0 else maximum, int(interval)
+        "Queue dispatch enabled for %s: target=%d, hard ceiling=%s, minimum interval=%ds, "
+        "shared weight=%d, Decypharr capacity=%s",
+        instance_name, target, "disabled" if maximum < 0 else maximum, int(interval),
+        shared_weight, "enabled" if decypharr_enabled else "disabled"
     )
     return context
 
 
 def clear_dispatch() -> None:
+    context = getattr(_local, "context", None)
+    if context is not None:
+        _release_shared(context)
     _local.context = None
+
+
+def invalidate_dispatch_observation(app_type: str, instance_name: str) -> None:
+    """Force the matching stable instance's next Starr observation after a webhook."""
+    with _lock:
+        context = _contexts.get((str(app_type), str(instance_name)))
+        cache_name = context.queue_cache_name if context else str(instance_name)
+    get_pipeline_state().invalidate_queue(app_type, cache_name)
 
 
 def _occupancy(context: DispatchContext, now: float):
@@ -124,8 +151,37 @@ def _occupancy(context: DispatchContext, now: float):
     return queue + active + unseen_recent, queue, active, unseen_recent
 
 
+def _release_shared(context: DispatchContext) -> None:
+    if not context.scheduler_held:
+        return
+    from src.primary.apps._common.shared_scheduler import get_shared_scheduler
+    get_shared_scheduler().release(context.app_type, context.instance_name)
+    context.scheduler_held = False
+
+
+def _decypharr_capacity(context: DispatchContext) -> dict:
+    if not context.decypharr_capacity_enabled:
+        return {"enabled": False, "healthy": False, "free": None, "fail_open": True,
+                "reason": "Decypharr capacity disabled"}
+    from src.primary.apps.swaparr.decypharr_capacity import get_capacity
+    return get_capacity(context.decypharr_config or {})
+
+
+def _search_budget(context: DispatchContext) -> dict:
+    try:
+        from src.primary.stats_manager import get_hourly_cap_status
+        status = get_hourly_cap_status(context.app_type, instance_name=context.instance_name)
+        if not isinstance(status, dict) or status.get("error") or status.get("remaining") is None:
+            raise RuntimeError("search budget status unavailable")
+        return {"remaining": max(0, int(status["remaining"])),
+                "limit": status.get("limit"), "used": status.get("current_usage", 0)}
+    except Exception:
+        # Existing call-site cap checks still apply; telemetry failure must not introduce deadlock.
+        return {"remaining": None, "limit": None, "used": None}
+
+
 def acquire_dispatch_slot() -> bool:
-    """Wait responsively for one dispatch slot; return False when safely deferred."""
+    """Wait responsively for min(Starr, Decypharr, budget) and a weighted turn."""
     context: Optional[DispatchContext] = getattr(_local, "context", None)
     if context is None:
         return True
@@ -137,12 +193,22 @@ def acquire_dispatch_slot() -> bool:
             return False
         now = time.monotonic()
         occupancy, queue, active, recent = _occupancy(context, now)
+        decypharr = _decypharr_capacity(context)
+        budget = _search_budget(context)
+        starr_free = None if occupancy is None else max(0, context.target_depth - occupancy)
+        decypharr_free = decypharr.get("free") if decypharr.get("healthy") else None
+        budget_free = budget.get("remaining")
+        effective_free = min(
+            value for value in (starr_free, decypharr_free, budget_free)
+            if value is not None
+        ) if any(value is not None for value in (starr_free, decypharr_free, budget_free)) else None
         if occupancy is None:
             # A configured hard ceiling must never be bypassed when queue state is unknown.
             if context.max_queue_size >= 0:
                 get_pipeline_state().set_runtime(
                     context.app_type, context.instance_name, slots_used=None,
-                    slots_target=context.target_depth, queue=queue, active_searches=active,
+                    slots_target=context.target_depth, slots_free=0, queue=queue,
+                    active_searches=active, decypharr=decypharr,
                     pause_reason="queue/command status unavailable while hard ceiling is enabled",
                 )
                 context.logger.warning(
@@ -154,12 +220,21 @@ def acquire_dispatch_slot() -> bool:
             # The shared cache owns unhealthy 30..300s backoff. Avoid forcing a fresh
             # request here; this loop merely waits before consulting that cache again.
             context.poll_interval = min(300.0, max(30.0, context.poll_interval * 2.0))
+        elif budget_free is not None and budget_free <= 0:
+            reason = f"search budget exhausted ({budget.get('used')}/{budget.get('limit')})"
+            get_pipeline_state().set_runtime(
+                context.app_type, context.instance_name, slots_used=occupancy,
+                slots_target=context.target_depth, slots_free=0, queue=queue,
+                active_searches=active, decypharr=decypharr, pause_reason=reason,
+            )
+            context.logger.info("Queue dispatch deferred for %s: %s", context.instance_name, reason)
+            return False
         elif context.max_queue_size >= 0 and queue >= context.max_queue_size:
             reason = f"download queue {queue} reached hard ceiling {context.max_queue_size}"
             get_pipeline_state().set_runtime(
                 context.app_type, context.instance_name, slots_used=occupancy,
-                slots_target=context.target_depth, queue=queue, active_searches=active,
-                pause_reason=reason,
+                slots_target=context.target_depth, slots_free=0, queue=queue,
+                active_searches=active, decypharr=decypharr, pause_reason=reason,
             )
             context.logger.info(
                 "Queue dispatch deferred for %s: queue=%d reached hard ceiling=%d",
@@ -167,24 +242,53 @@ def acquire_dispatch_slot() -> bool:
             )
             return False
         elif occupancy >= context.target_depth:
-            last_reason = (f"effective occupancy {occupancy}/{context.target_depth} "
+            last_reason = (f"Starr capacity full: effective occupancy {occupancy}/{context.target_depth} "
                            f"(queue={queue}, active searches={active}, recent reservations={recent})")
+        elif decypharr.get("healthy") and decypharr_free <= 0:
+            last_reason = f"Decypharr capacity full: {decypharr.get('reason')}"
         else:
             interval_left = context.minimum_interval - (now - context.last_submission)
             if interval_left <= 0:
-                get_pipeline_state().set_runtime(
-                    context.app_type, context.instance_name, slots_used=occupancy,
-                    slots_target=context.target_depth, queue=queue, active_searches=active,
-                    pause_reason=None,
-                )
-                context.logger.info(
-                    "Queue dispatch slot available for %s: occupancy=%d/%d "
-                    "(queue=%d, active searches=%d, recent reservations=%d)",
-                    context.instance_name, occupancy, context.target_depth,
-                    queue, active, recent,
-                )
-                return True
-            last_reason = f"minimum dispatch interval ({interval_left:.1f}s remaining)"
+                from src.primary.apps._common.shared_scheduler import get_shared_scheduler
+                scheduler = get_shared_scheduler()
+                remaining = max(0.0, deadline - now)
+                waiting_reason = scheduler.waiting_reason(context.app_type, context.instance_name)
+                if waiting_reason:
+                    get_pipeline_state().set_runtime(
+                        context.app_type, context.instance_name, slots_used=occupancy,
+                        slots_target=context.target_depth, slots_free=effective_free,
+                        queue=queue, active_searches=active, decypharr=decypharr,
+                        pause_reason=waiting_reason,
+                    )
+                if not scheduler.acquire(
+                    context.app_type, context.instance_name, remaining, context.stop_check,
+                ):
+                    last_reason = waiting_reason or "waiting for weighted shared capacity turn"
+                else:
+                    context.scheduler_held = True
+                    # Re-observe Starr capacity after the serialized grant. Recent reservations
+                    # from the previous holder are now visible before this caller can POST.
+                    occupancy2, queue2, active2, recent2 = _occupancy(context, time.monotonic())
+                    if occupancy2 is None or occupancy2 >= context.target_depth:
+                        _release_shared(context)
+                        last_reason = "shared capacity changed before dispatch; reconciling"
+                    else:
+                        get_pipeline_state().set_runtime(
+                            context.app_type, context.instance_name, slots_used=occupancy2,
+                            slots_target=context.target_depth, slots_free=max(0, effective_free or 0),
+                            queue=queue2, active_searches=active2, decypharr=decypharr,
+                            pause_reason=None,
+                        )
+                        context.logger.info(
+                            "Queue dispatch slot available for %s: Starr free=%d, Decypharr free=%s, "
+                            "search budget=%s (weighted shared grant)",
+                            context.instance_name, context.target_depth - occupancy2,
+                            decypharr_free if decypharr_free is not None else "fail-open",
+                            budget_free if budget_free is not None else "unknown",
+                        )
+                        return True
+            else:
+                last_reason = f"minimum dispatch interval ({interval_left:.1f}s remaining)"
 
         if occupancy is not None:
             capacity = (queue, active, recent, occupancy >= context.target_depth,
@@ -196,23 +300,29 @@ def acquire_dispatch_slot() -> bool:
             context.last_capacity = capacity
 
         remaining = deadline - now
+        get_pipeline_state().set_runtime(
+            context.app_type, context.instance_name,
+            slots_used=occupancy, slots_target=context.target_depth, slots_free=effective_free,
+            queue=queue, active_searches=active, decypharr=decypharr,
+            pause_reason=last_reason,
+        )
         if remaining <= 0:
             context.logger.info("Queue dispatch paused for %s after %s; next cycle will retry",
                                 context.instance_name, last_reason)
             return False
         # Bounded polling: never faster than once per second and normally at the configured interval.
         sleep_for = min(remaining, context.poll_interval)
-        get_pipeline_state().set_runtime(
-            context.app_type, context.instance_name,
-            slots_used=occupancy, slots_target=context.target_depth,
-            queue=queue, active_searches=active, pause_reason=last_reason,
-        )
         context.logger.debug("Queue dispatch waiting %.1fs for %s: %s",
                              sleep_for, context.instance_name, last_reason)
         end = time.monotonic() + sleep_for
         while time.monotonic() < end:
             if context.stop_check():
+                _release_shared(context)
                 return False
+            from src.primary.apps._common.wake_registry import is_wake_pending
+            if is_wake_pending(context.app_type):
+                context.poll_interval = 1.0
+                break
             time.sleep(min(0.5, end - time.monotonic()))
 
 
@@ -225,6 +335,13 @@ def record_submission() -> None:
     with _lock:
         context.last_submission = now
         context.recent_submissions.append(now)
+    if context.decypharr_capacity_enabled:
+        try:
+            from src.primary.apps.swaparr.decypharr_capacity import reserve_slot
+            reserve_slot(context.decypharr_config or {})
+        except Exception:
+            pass
+    _release_shared(context)
 
 
 def claim_search(item_keys: Union[str, Iterable[str]]) -> bool:
@@ -247,7 +364,10 @@ def claim_search(item_keys: Union[str, Iterable[str]]) -> bool:
 
 def finish_search_claim(state: str, command_id=None, cooldown_seconds: Optional[int] = None) -> None:
     context: Optional[DispatchContext] = getattr(_local, "context", None)
-    if context is None or not context.current_item_keys:
+    if context is None:
+        return
+    if not context.current_item_keys:
+        _release_shared(context)
         return
     get_pipeline_state().transition_items(
         context.app_type, context.instance_name, context.current_item_keys, state,
@@ -255,6 +375,7 @@ def finish_search_claim(state: str, command_id=None, cooldown_seconds: Optional[
     )
     if state in {"completed", "no_grab", "failed", "timed_out"}:
         context.current_item_keys = []
+    _release_shared(context)
 
 
 def mark_command(command_id, state: str, cooldown_seconds: Optional[int] = None) -> bool:
