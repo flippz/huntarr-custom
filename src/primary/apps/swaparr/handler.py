@@ -118,7 +118,7 @@ def save_queue_snapshot(app_name, instance_name, snapshot):
         swaparr_logger.error(f"Error saving queue snapshot for {app_name}/{instance_name}: {str(e)}")
 
 def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
-    """Poll Sonarr's own /history directly for completed imports and Sonarr-side failures,
+    """Poll Sonarr/Radarr /history for completed imports and Arr-side failures,
     logging them to the Activity history. This is the authoritative source for "did this
     download actually finish" - a once-per-cycle queue snapshot comparison missed the vast
     majority of real completions, since Decypharr/debrid downloads can enter and leave the
@@ -127,14 +127,17 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
     Tracks a per-instance checkpoint (last event date seen) so each cycle only processes
     new events. Best-effort: any failure here is logged and swallowed, never raised.
     """
-    if app_name != "sonarr":
+    if app_name not in ("sonarr", "radarr"):
         return
     try:
         db = get_database()
         checkpoint = db.get_swaparr_state_data(app_name, f"history_checkpoint_{instance_name}") or {}
         last_seen_date = checkpoint.get("last_date")
 
-        from src.primary.apps.sonarr.api import arr_request
+        if app_name == "sonarr":
+            from src.primary.apps.sonarr.api import arr_request
+        else:
+            from src.primary.apps.radarr.api import arr_request
         response = arr_request(
             instance_data["api_url"], instance_data["api_key"], instance_data.get("api_timeout", 120),
             "history?pageSize=250&sortDirection=descending&sortKey=date", count_api=False
@@ -194,14 +197,7 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
                 from src.primary.apps._common.pipeline_state import get_pipeline_state
                 pipeline = get_pipeline_state()
                 lifecycle_instance = str(instance_data.get("instance_id") or instance_name)
-                episode = record.get("episode") or {}
-                series_id = record.get("seriesId") or (record.get("series") or {}).get("id")
-                if episode.get("id") is not None:
-                    pipeline_key = "episodes:" + str(episode["id"])
-                elif series_id is not None and episode.get("seasonNumber") is not None:
-                    pipeline_key = "season:%s:%s" % (series_id, episode["seasonNumber"])
-                else:
-                    pipeline_key = "queue:" + str(download_id)
+                pipeline_key = pipeline_key_for_history_record(app_name, record)
                 claimed = pipeline.claim_candidate(
                     app_name, lifecycle_instance, pipeline_key, cooldown_seconds=0,
                 )
@@ -228,7 +224,9 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
                     # (e.g. a download client error or "Manually marked as failed"); surface it
                     # before falling back to the generic label.
                     sonarr_message = (record.get("data") or {}).get("message")
-                    base_reason = f"Failed in Sonarr: {sonarr_message}" if sonarr_message else "Failed in Sonarr"
+                    app_label = app_name.capitalize()
+                    base_reason = (f"Failed in {app_label}: {sonarr_message}"
+                                   if sonarr_message else f"Failed in {app_label}")
 
                     decypharr_error = decypharr_errors.get(name)
                     decypharr_note = f"; Decypharr: {decypharr_error}" if decypharr_error else ""
@@ -583,6 +581,22 @@ def parse_queue_items(records, item_type, app_name):
     return queue_items
 
 
+def pipeline_key_for_history_record(app_name, record):
+    """Return the Huntarr media key represented by one Arr history event."""
+    download_id = record.get("downloadId")
+    if app_name == "radarr":
+        movie_id = record.get("movieId") or (record.get("movie") or {}).get("id")
+        if movie_id is not None:
+            return "movies:" + str(movie_id)
+    episode = record.get("episode") or {}
+    series_id = record.get("seriesId") or (record.get("series") or {}).get("id")
+    if episode.get("id") is not None:
+        return "episodes:" + str(episode["id"])
+    if series_id is not None and episode.get("seasonNumber") is not None:
+        return "season:%s:%s" % (series_id, episode["seasonNumber"])
+    return "queue:" + str(download_id)
+
+
 def pipeline_key_for_queue_item(app_name, item):
     """Return the same per-media key used by Huntarr search submission."""
     if app_name == "radarr" and item.get("media_id") is not None:
@@ -770,7 +784,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             swaparr_logger.warning(f"Swaparr was disabled during download processing for {app_name} instance: {instance_name}. Stopping processing.")
             return 0
         
-        # Scan Sonarr's own history for completions/failures regardless of current queue
+        # Scan Arr history for completions/failures regardless of current queue
         # state - this is independent of the queue-watching logic below.
         scan_sonarr_history_for_activity(app_name, instance_name, instance_data)
 

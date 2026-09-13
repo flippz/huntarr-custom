@@ -277,6 +277,21 @@ class BatchDispatchAndSwaparrTests(unittest.TestCase):
         self.assertEqual(snapshot["records"], records)
         self.assertEqual(queue_calls, [1])
 
+    def test_arr_history_keys_cover_radarr_movies_and_sonarr_episodes(self):
+        self.assertEqual(
+            swaparr_handler.pipeline_key_for_history_record(
+                "radarr", {"downloadId": "d1", "movieId": 42},
+            ),
+            "movies:42",
+        )
+        self.assertEqual(
+            swaparr_handler.pipeline_key_for_history_record(
+                "sonarr", {"downloadId": "d2", "seriesId": 7,
+                           "episode": {"id": 99, "seasonNumber": 3}},
+            ),
+            "episodes:99",
+        )
+
     def test_swaparr_uses_episode_key_and_does_not_reopen_terminal_row(self):
         pipeline = mock.Mock()
         pipeline.claim_candidate.return_value = False
