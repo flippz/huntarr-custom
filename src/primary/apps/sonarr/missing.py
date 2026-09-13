@@ -14,7 +14,9 @@ from src.primary.settings_manager import load_settings, get_advanced_setting
 from src.primary.utils.history_utils import log_processed_media
 from src.primary.history_manager import update_history_status
 from src.primary.stats_manager import increment_media_stat_only, check_hourly_cap_exceeded
-from src.primary.stateful_manager import is_processed, add_processed_id
+from src.primary.stateful_manager import (
+    add_processed_id, get_processed_ids, get_state_management_summary, is_processed,
+)
 from src.primary.apps._common.tagging import try_tag_item, extract_tag_settings
 from src.primary.apps.sonarr import api as sonarr_api
 
@@ -78,6 +80,51 @@ def _get_exempt_series_ids(api_url: str, api_key: str, api_timeout: int, exempt_
                 exempt_series_ids.add(s.get("id"))
                 break
     return exempt_series_ids
+
+
+def _format_epoch(epoch: Optional[int]) -> Optional[str]:
+    if epoch is None:
+        return None
+    try:
+        from src.primary.utils.timezone_utils import get_user_timezone
+        timezone = get_user_timezone()
+        return datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc).astimezone(
+            timezone
+        ).strftime('%Y-%m-%d %H:%M:%S %Z')
+    except Exception:
+        return datetime.datetime.fromtimestamp(
+            epoch, tz=datetime.timezone.utc
+        ).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+
+def _publish_candidate_noop(instance_name: str, scanned: int, blocked: dict) -> None:
+    """Expose why candidate discovery produced no dispatch, including retry times."""
+    reasons = []
+    labels = (
+        ("processed", "state-managed processed"),
+        ("unresolved", "unresolved pipeline"),
+        ("cooldown", "pipeline cooldown"),
+        ("future", "future"),
+        ("delayed", "air-date delayed"),
+        ("exempt", "exempt-tagged"),
+        ("invalid", "invalid ID"),
+    )
+    for key, label in labels:
+        if blocked.get(key):
+            reasons.append(f"{blocked[key]} {label}")
+    reason = f"no eligible missing episodes after scanning {scanned} candidates"
+    if reasons:
+        reason += ": " + ", ".join(reasons)
+    if blocked.get("processed"):
+        summary = get_state_management_summary("sonarr", instance_name)
+        if summary.get("next_reset_time"):
+            reason += f"; state reset {summary['next_reset_time']}"
+    next_pipeline = _format_epoch(blocked.get("next_pipeline_epoch"))
+    if next_pipeline:
+        reason += f"; next pipeline retry {next_pipeline}"
+    from src.primary.apps._common.queue_dispatch import publish_noop
+    publish_noop(reason)
+    sonarr_logger.info("Missing: %s", reason)
 
 
 def process_missing_episodes(
@@ -685,96 +732,79 @@ def process_missing_episodes_mode(
     
     sonarr_logger.warning("Using Episodes mode - This will make more API calls and does not support tagging")
     
-    # Get missing episodes using random page selection for efficiency
-    missing_episodes = sonarr_api.get_missing_episodes_random_page(
-        api_url, api_key, api_timeout, monitored_only, hunt_missing_items * 2,
-        search_order=search_order
+    # Build all eligibility constraints before the API helper applies its final
+    # random/ordered limit. The helper continues through additional pages until it
+    # fills the requested eligible set or exhausts the wanted list.
+    from src.primary.apps._common.pipeline_state import get_pipeline_state
+    pipeline = get_pipeline_state()
+    processed_ids = get_processed_ids("sonarr", instance_name)
+    exempt_series_ids = (
+        _get_exempt_series_ids(api_url, api_key, api_timeout, exempt_tags)
+        if exempt_tags else set()
     )
-    
+    blocked = {
+        "processed": 0, "unresolved": 0, "cooldown": 0, "future": 0,
+        "delayed": 0, "exempt": 0, "invalid": 0,
+        "next_pipeline_epoch": None,
+    }
+    scanned = [0]
+    now_unix = time.time()
+
+    def _eligible_page(episodes):
+        scanned[0] += len(episodes)
+        preliminarily_eligible = []
+        for episode in episodes:
+            episode_id = episode.get('id')
+            if episode_id is None:
+                blocked["invalid"] += 1
+                continue
+            if episode.get("seriesId") in exempt_series_ids:
+                blocked["exempt"] += 1
+                continue
+            air_date_str = episode.get('airDateUtc')
+            if skip_future_episodes and air_date_str:
+                try:
+                    if time.mktime(time.strptime(air_date_str, '%Y-%m-%dT%H:%M:%SZ')) >= now_unix:
+                        blocked["future"] += 1
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            if air_date_delay_days > 0 and should_delay_episode_search(
+                air_date_str, air_date_delay_days,
+            ):
+                blocked["delayed"] += 1
+                continue
+            if str(episode_id) in processed_ids:
+                blocked["processed"] += 1
+                continue
+            preliminarily_eligible.append(episode)
+
+        keys = [f"episodes:{episode['id']}" for episode in preliminarily_eligible]
+        availability = pipeline.candidate_availability("sonarr", instance_name, keys)
+        eligible_keys = set(availability["eligible"])
+        blocked["unresolved"] += len(availability["unresolved"])
+        blocked["cooldown"] += len(availability["cooldown"])
+        next_epoch = availability.get("next_available_epoch")
+        if next_epoch is not None:
+            current = blocked.get("next_pipeline_epoch")
+            blocked["next_pipeline_epoch"] = next_epoch if current is None else min(current, next_epoch)
+        return [
+            episode for episode in preliminarily_eligible
+            if f"episodes:{episode['id']}" in eligible_keys
+        ]
+
+    missing_episodes = sonarr_api.get_missing_episodes_random_page(
+        api_url, api_key, api_timeout, monitored_only, hunt_missing_items,
+        search_order=search_order, candidate_filter=_eligible_page,
+    )
     if not missing_episodes:
-        sonarr_logger.info("No missing episodes found for individual processing.")
+        if scanned[0]:
+            _publish_candidate_noop(instance_name, scanned[0], blocked)
+        else:
+            sonarr_logger.info("No missing episodes found for individual processing.")
         return False
 
-    # Filter out episodes from series with exempt tags
-    if exempt_tags:
-        exempt_series_ids = _get_exempt_series_ids(api_url, api_key, api_timeout, exempt_tags)
-        if exempt_series_ids:
-            original_count = len(missing_episodes)
-            missing_episodes = [e for e in missing_episodes if e.get("seriesId") not in exempt_series_ids]
-            if original_count != len(missing_episodes):
-                sonarr_logger.info(f"Exempt tags filter: {len(missing_episodes)} episodes remaining after excluding series with exempt tags.")
-    if not missing_episodes:
-        sonarr_logger.info("No missing episodes left after exempt tags filter.")
-        return False
-    
-    # Filter out future episodes if configured
-    if skip_future_episodes:
-        now_unix = time.time()
-        original_count = len(missing_episodes)
-        filtered_episodes = []
-        skipped_count = 0
-        
-        for episode in missing_episodes:
-            air_date_str = episode.get('airDateUtc')
-            if air_date_str:
-                try:
-                    # Parse the air date and check if it's in the past
-                    air_date_unix = time.mktime(time.strptime(air_date_str, '%Y-%m-%dT%H:%M:%SZ'))
-                    if air_date_unix < now_unix:
-                        filtered_episodes.append(episode)
-                    else:
-                        skipped_count += 1
-                        sonarr_logger.debug(f"Skipping future episode ID {episode.get('id')} with air date: {air_date_str}")
-                except (ValueError, TypeError) as e:
-                    sonarr_logger.warning(f"Could not parse air date '{air_date_str}' for episode ID {episode.get('id')}. Error: {e}. Including it.")
-                    filtered_episodes.append(episode)  # Keep if date is invalid
-            else:
-                filtered_episodes.append(episode)  # Keep if no air date
-        
-        missing_episodes = filtered_episodes
-        if skipped_count > 0:
-            sonarr_logger.info(f"Skipped {skipped_count} future episodes based on air date.")
-    
-    # Apply air date delay if configured
-    if air_date_delay_days > 0:
-        original_count = len(missing_episodes)
-        delayed_episodes = []
-        delayed_count = 0
-        
-        for episode in missing_episodes:
-            air_date_str = episode.get('airDateUtc')
-            if should_delay_episode_search(air_date_str, air_date_delay_days):
-                delayed_count += 1
-                sonarr_logger.debug(f"Delaying search for episode ID {episode.get('id')} - aired {air_date_str}, waiting {air_date_delay_days} days")
-            else:
-                delayed_episodes.append(episode)
-        
-        missing_episodes = delayed_episodes
-        if delayed_count > 0:
-            sonarr_logger.info(f"Delayed {delayed_count} episodes due to {air_date_delay_days}-day air date delay setting.")
-    
-    if not missing_episodes:
-        sonarr_logger.info("No missing episodes left to process after filtering future episodes.")
-        return False
-    
-    # Filter out already processed episodes
-    unprocessed_episodes = []
-    for episode in missing_episodes:
-        episode_id = str(episode.get('id'))
-        if not is_processed("sonarr", instance_name, episode_id):
-            unprocessed_episodes.append(episode)
-        else:
-            sonarr_logger.debug(f"Skipping already processed episode ID: {episode_id}")
-    
-    sonarr_logger.info(f"Missing: {len(unprocessed_episodes)} unprocessed of {len(missing_episodes)} total episodes")
-    
-    if not unprocessed_episodes:
-        sonarr_logger.info("All missing episodes have been processed.")
-        return False
-    
-    # Apply randomization and limit
-    random.shuffle(unprocessed_episodes)
-    episodes_to_process = unprocessed_episodes[:hunt_missing_items]
+    episodes_to_process = missing_episodes[:hunt_missing_items]
     
     sonarr_logger.info(f"Processing {len(episodes_to_process)} individual missing episodes...")
     

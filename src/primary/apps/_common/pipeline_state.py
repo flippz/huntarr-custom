@@ -207,6 +207,78 @@ class PipelineState:
         with self._lock:
             return dict(self._runtime.get((str(app_type), str(instance_name)), {}))
 
+    def queue_observation(self, app_type: str, instance_name: str,
+                          max_age: float = 300.0) -> dict:
+        """Return a current healthy cached observation without performing I/O."""
+        key = (str(app_type), str(instance_name))
+        now = self._clock()
+        with self._lock:
+            entry = self._queue.get(key)
+            if not entry or entry.get("value") is None:
+                return {"records": None, "queue": None, "active": None,
+                        "healthy": False, "observed_at": None,
+                        "error": "queue status unavailable"}
+            observed_at = entry.get("observed_at")
+            age = None if observed_at is None else max(0.0, now - observed_at)
+            healthy = bool(entry.get("healthy")) and age is not None and age <= max_age
+            result = copy.deepcopy(entry["value"])
+            result.update(
+                healthy=healthy,
+                observed_at=observed_at,
+                age=age,
+                error=(entry.get("error") if entry.get("healthy") is False
+                       else (None if healthy else "queue observation is stale")),
+            )
+            return result
+
+    def candidate_availability(self, app_type: str, instance_name: str, item_keys,
+                               unresolved_timeout: int = 21600) -> dict:
+        """Inspect candidate rows in bulk without claiming or mutating them."""
+        keys = list(dict.fromkeys(str(item_key) for item_key in item_keys))
+        now = int(self._clock())
+        rows = {}
+        with self.db.get_connection() as conn:
+            for start in range(0, len(keys), 500):
+                chunk = keys[start:start + 500]
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" for _ in chunk)
+                for item_key, state, updated_at, cooldown_until in conn.execute(
+                    "SELECT item_key,state,updated_at_epoch,cooldown_until_epoch "
+                    "FROM pipeline_items WHERE app_type=? AND instance_name=? "
+                    f"AND item_key IN ({placeholders})",
+                    (str(app_type), str(instance_name), *chunk),
+                ).fetchall():
+                    rows[str(item_key)] = (state, updated_at, cooldown_until)
+
+        eligible = []
+        unresolved = []
+        cooldown = []
+        next_available = []
+        for item_key in keys:
+            row = rows.get(item_key)
+            if not row:
+                eligible.append(item_key)
+                continue
+            state, updated_at, cooldown_until = row
+            updated_at = int(updated_at or now)
+            cooldown_until = int(cooldown_until or 0)
+            unresolved_until = updated_at + int(unresolved_timeout)
+            if state in UNRESOLVED_STATES and now < unresolved_until:
+                unresolved.append(item_key)
+                next_available.append(max(unresolved_until, cooldown_until))
+            elif cooldown_until > now:
+                cooldown.append(item_key)
+                next_available.append(cooldown_until)
+            else:
+                eligible.append(item_key)
+        return {
+            "eligible": eligible,
+            "unresolved": unresolved,
+            "cooldown": cooldown,
+            "next_available_epoch": min(next_available) if next_available else None,
+        }
+
     def claim_candidate(self, app_type: str, instance_name: str, item_key: str,
                         cooldown_seconds: int = 300, unresolved_timeout: int = 21600,
                         metadata: Optional[str] = None) -> bool:

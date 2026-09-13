@@ -185,6 +185,54 @@ def cancel_dispatch_slot() -> None:
         _cancel_context(context)
 
 
+def publish_noop(reason: str) -> None:
+    """Publish a no-dispatch reason and the best current, truthful slot status."""
+    context: Optional[DispatchContext] = getattr(_local, "context", None)
+    if context is None:
+        return
+    pipeline = get_pipeline_state()
+    snapshot = pipeline.queue_observation(
+        context.app_type, context.queue_cache_name or context.instance_name,
+    )
+    queue = snapshot.get("queue") if snapshot.get("healthy") else None
+    active = snapshot.get("active") if snapshot.get("healthy") else None
+    if queue is not None and active is None:
+        try:
+            active = context.active_searches()
+            if active is None or int(active) < 0:
+                active = None
+            else:
+                active = int(active)
+                pipeline.merge_queue(
+                    context.app_type, context.queue_cache_name or context.instance_name,
+                    active=active,
+                )
+        except Exception:
+            active = None
+    if queue is None:
+        # No compatible fresh shared observation exists. Use the normal observer,
+        # which retains unhealthy state rather than converting failures into zero.
+        queue, active = context.queue_status() if context.queue_status else (-1, -1)
+        queue = None if queue is None or queue < 0 else queue
+        active = None if active is None or active < 0 else active
+    occupancy = None
+    if queue is not None and active is not None:
+        now = time.monotonic()
+        context.recent_submissions[:] = [
+            submitted for submitted in context.recent_submissions
+            if now - submitted < _RECENT_GRACE_SECONDS
+        ]
+        unseen_recent = max(0, len(context.recent_submissions) - active)
+        occupancy = int(queue) + int(active) + unseen_recent
+    pipeline.set_runtime(
+        context.app_type, context.instance_name,
+        slots_used=occupancy, slots_target=context.target_depth,
+        slots_free=(None if occupancy is None else max(0, context.target_depth - occupancy)),
+        queue=queue, active_searches=active, pause_reason=reason,
+    )
+    context.logger.info("Search not dispatched for %s: %s", context.instance_name, reason)
+
+
 def _decypharr_capacity(context: DispatchContext, force: bool = False) -> dict:
     if not context.decypharr_capacity_enabled:
         return {"enabled": False, "healthy": False, "free": None, "fail_open": True,
