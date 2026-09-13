@@ -59,6 +59,25 @@ class StateMixin:
         except Exception as e:
             logger.error(f"Error adding processed ID {media_id} for {app_type}/{instance_name}: {e}")
             return False
+
+    def remove_processed_ids(self, app_type: str, instance_name: str, media_ids) -> int:
+        """Release specific IDs without disturbing the instance's ordinary reset window."""
+        ids = list(dict.fromkeys(str(media_id) for media_id in media_ids if media_id is not None))
+        if not ids:
+            return 0
+        with self.get_connection() as conn:
+            placeholders = ",".join("?" for _ in ids)
+            cursor = conn.execute(
+                "DELETE FROM stateful_processed_ids WHERE app_type=? AND instance_name=? "
+                f"AND media_id IN ({placeholders})",
+                (str(app_type), str(instance_name), *ids),
+            )
+            conn.commit()
+            logger.info(
+                "Released %s processed IDs for %s/%s after failed download",
+                cursor.rowcount, app_type, instance_name,
+            )
+            return cursor.rowcount
     
     def is_processed(self, app_type: str, instance_name: str, media_id: str) -> bool:
         """Check if a media ID has been processed for a specific app instance"""

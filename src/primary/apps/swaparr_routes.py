@@ -114,6 +114,9 @@ def get_status():
             "max_download_time": settings.get("max_download_time", "2h"),
             "ignore_above_size": settings.get("ignore_above_size", "25GB"),
             "remove_from_client": settings.get("remove_from_client", True),
+            "failed_download_retry_cooldown_minutes": settings.get(
+                "failed_download_retry_cooldown_minutes", 10
+            ),
             "dry_run": settings.get("dry_run", False)
         },
         "app_statistics": app_statistics,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
@@ -279,6 +280,45 @@ class PipelineState:
             "next_available_epoch": min(next_available) if next_available else None,
         }
 
+    @staticmethod
+    def _metadata_dict(value: Optional[str]) -> dict:
+        if not value:
+            return {}
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+
+    @staticmethod
+    def _metadata_json(base: Optional[str], **values) -> str:
+        data = PipelineState._metadata_dict(base)
+        data.update({key: value for key, value in values.items() if value is not None})
+        return json.dumps(data, separators=(",", ":"), sort_keys=True)
+
+    def retry_context(self, app_type: str, instance_name: str, item_keys) -> dict:
+        """Describe a cooled-down failed claim before Huntarr takes fallback ownership."""
+        keys = list(dict.fromkeys(str(key) for key in item_keys))
+        if not keys:
+            return {}
+        with self.db.get_connection() as conn:
+            placeholders = ",".join("?" for _ in keys)
+            rows = conn.execute(
+                "SELECT item_key,state,metadata,cooldown_until_epoch FROM pipeline_items "
+                "WHERE app_type=? AND instance_name=? "
+                f"AND item_key IN ({placeholders})",
+                (str(app_type), str(instance_name), *keys),
+            ).fetchall()
+        owners = set()
+        for _key, state, metadata, cooldown_until in rows:
+            data = self._metadata_dict(metadata)
+            if (state in {"failed", "no_grab", "timed_out"}
+                    and int(cooldown_until or 0) <= int(self._clock())):
+                owner = data.get("retry_owner")
+                if owner:
+                    owners.add(str(owner))
+        return {"fallback": bool(owners), "previous_retry_owners": sorted(owners)}
+
     def claim_candidate(self, app_type: str, instance_name: str, item_key: str,
                         cooldown_seconds: int = 300, unresolved_timeout: int = 21600,
                         metadata: Optional[str] = None) -> bool:
@@ -313,11 +353,24 @@ class PipelineState:
                         return False
             for item_key in keys:
                 if rows[item_key]:
+                    previous_metadata = conn.execute(
+                        "SELECT metadata FROM pipeline_items WHERE app_type=? AND instance_name=? AND item_key=?",
+                        (str(app_type), str(instance_name), item_key),
+                    ).fetchone()[0]
+                    claimed_metadata = metadata
+                    previous = self._metadata_dict(previous_metadata)
+                    if (previous.get("retry_owner")
+                            and rows[item_key][0] in {"failed", "no_grab", "timed_out"}):
+                        claimed_metadata = self._metadata_json(
+                            previous_metadata, retry_owner="huntarr-fallback",
+                            fallback_from=previous.get("retry_owner"),
+                            reason="fallback eligible after retry cooldown",
+                        )
                     conn.execute(
                         "UPDATE pipeline_items SET state='candidate', command_id=NULL, metadata=?, "
                         "cooldown_until_epoch=?, updated_at_epoch=?, updated_at=CURRENT_TIMESTAMP "
                         "WHERE app_type=? AND instance_name=? AND item_key=?",
-                        (metadata, now + max(0, int(cooldown_seconds)), now,
+                        (claimed_metadata, now + max(0, int(cooldown_seconds)), now,
                          str(app_type), str(instance_name), item_key),
                     )
                 else:
@@ -330,9 +383,186 @@ class PipelineState:
                 conn.execute(
                     "INSERT INTO pipeline_item_events(app_type,instance_name,item_key,state,metadata,occurred_at_epoch) "
                     "VALUES(?,?,?,'candidate',?,?)",
-                    (str(app_type), str(instance_name), item_key, metadata, now),
+                    (str(app_type), str(instance_name), item_key,
+                     claimed_metadata if rows[item_key] else metadata, now),
                 )
         return True
+
+    def observe_active_items(self, app_type: str, instance_name: str, item_keys,
+                             download_id: Optional[str] = None,
+                             title: Optional[str] = None,
+                             metadata: Optional[str] = None) -> Optional[list]:
+        """Apply queue evidence to matching media rows, including a genuinely new retry.
+
+        Failed rows can become active only when the queue download ID differs from the
+        failed download. Imported/completed and other terminal rows remain immutable.
+        """
+        keys = list(dict.fromkeys(str(key) for key in item_keys if key))
+        if not keys:
+            return []
+        now = int(self._clock())
+        changed = []
+        saw_existing = False
+        active_states = tuple(sorted(UNRESOLVED_STATES - {"imported"}))
+        with self.db.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for item_key in keys:
+                row = conn.execute(
+                    "SELECT state,metadata FROM pipeline_items WHERE app_type=? AND instance_name=? AND item_key=?",
+                    (str(app_type), str(instance_name), item_key),
+                ).fetchone()
+                if not row:
+                    continue
+                saw_existing = True
+                state, old_metadata = row
+                old = self._metadata_dict(old_metadata)
+                can_reopen_retry = (
+                    state == "failed" and download_id and
+                    str(download_id) != str(old.get("failed_download_id") or old.get("download_id") or "")
+                )
+                if state not in active_states and not can_reopen_retry:
+                    continue
+                merged = self._metadata_json(
+                    metadata or old_metadata, download_id=str(download_id or "")[:128],
+                    title=str(title or "")[:512],
+                    retry_owner=(old.get("retry_owner") if can_reopen_retry else None),
+                    reason=("replacement active in Starr queue" if can_reopen_retry else None),
+                )
+                cursor = conn.execute(
+                    "UPDATE pipeline_items SET state='downloading', metadata=?, updated_at_epoch=?, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE app_type=? AND instance_name=? AND item_key=?",
+                    (merged, now, str(app_type), str(instance_name), item_key),
+                )
+                if cursor.rowcount:
+                    changed.append(item_key)
+                    conn.execute(
+                        "INSERT INTO pipeline_item_events(app_type,instance_name,item_key,state,metadata,occurred_at_epoch) "
+                        "VALUES(?,?,?,'downloading',?,?)",
+                        (str(app_type), str(instance_name), item_key, merged, now),
+                    )
+        return changed if saw_existing else None
+
+    def fail_correlated_items(self, app_type: str, instance_name: str, item_keys,
+                              download_id: Optional[str], title: Optional[str],
+                              retry_owner: str, cooldown_seconds: int = 600,
+                              reason: Optional[str] = None) -> list:
+        """Fail original unresolved media rows using IDs, then download ID/title fallbacks."""
+        direct = list(dict.fromkeys(str(key) for key in item_keys if key))
+        now = int(self._clock())
+        cooldown = now + max(0, int(cooldown_seconds))
+        unresolved = tuple(sorted(UNRESOLVED_STATES - {"imported"}))
+        placeholders = ",".join("?" for _ in unresolved)
+        with self.db.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT item_key,metadata FROM pipeline_items WHERE app_type=? AND instance_name=? "
+                f"AND state IN ({placeholders})",
+                (str(app_type), str(instance_name), *unresolved),
+            ).fetchall()
+            by_key = {str(key): metadata for key, metadata in rows}
+            selected = [key for key in direct if key in by_key]
+            if download_id:
+                download_matches = [
+                    str(key) for key, metadata in rows
+                    if str(self._metadata_dict(metadata).get("download_id") or "").lower()
+                    == str(download_id).lower()
+                ]
+                selected = list(dict.fromkeys(selected + download_matches))
+            if not selected and title:
+                normalized = str(title).strip().casefold()
+                matches = [
+                    str(key) for key, metadata in rows
+                    if str(self._metadata_dict(metadata).get("title") or "").strip().casefold()
+                    == normalized
+                ]
+                # Title is a last resort only when it identifies one lifecycle row.
+                selected = matches if len(matches) == 1 else []
+            if not selected:
+                fallback = "queue:" + str(download_id or title or "unknown")[:256]
+                existing = conn.execute(
+                    "SELECT state FROM pipeline_items WHERE app_type=? AND instance_name=? AND item_key=?",
+                    (str(app_type), str(instance_name), fallback),
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        "INSERT INTO pipeline_items(app_type,instance_name,item_key,state,metadata,"
+                        "cooldown_until_epoch,updated_at_epoch) VALUES(?,?,?,'candidate',NULL,0,?)",
+                        (str(app_type), str(instance_name), fallback, now),
+                    )
+                    by_key[fallback] = None
+                    selected = [fallback]
+                elif existing[0] in UNRESOLVED_STATES:
+                    selected = [fallback]
+            for item_key in selected:
+                old_metadata = by_key.get(item_key)
+                merged = self._metadata_json(
+                    old_metadata, source="queue_failure", retry_owner=str(retry_owner),
+                    reason=str(reason or "failed download"),
+                    failed_download_id=str(download_id or "")[:128],
+                    title=str(title or "")[:512],
+                )
+                cursor = conn.execute(
+                    "UPDATE pipeline_items SET state='failed', metadata=?, cooldown_until_epoch=?, "
+                    "updated_at_epoch=?, updated_at=CURRENT_TIMESTAMP WHERE app_type=? AND instance_name=? "
+                    f"AND item_key=? AND state IN ({placeholders})",
+                    (merged, cooldown, now, str(app_type), str(instance_name), item_key, *unresolved),
+                )
+                if cursor.rowcount:
+                    conn.execute(
+                        "INSERT INTO pipeline_item_events(app_type,instance_name,item_key,state,metadata,occurred_at_epoch) "
+                        "VALUES(?,?,?,'failed',?,?)",
+                        (str(app_type), str(instance_name), item_key, merged, now),
+                    )
+            return selected
+
+    def mark_retry_requested(self, app_type: str, instance_name: str, item_keys,
+                             command_id: str, retry_owner: str = "swaparr") -> list:
+        """Move only the just-failed rows to an unresolved accepted-retry state."""
+        keys = list(dict.fromkeys(str(key) for key in item_keys if key))
+        now = int(self._clock())
+        changed = []
+        with self.db.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for item_key in keys:
+                row = conn.execute(
+                    "SELECT state,metadata FROM pipeline_items WHERE app_type=? AND instance_name=? AND item_key=?",
+                    (str(app_type), str(instance_name), item_key),
+                ).fetchone()
+                if not row or row[0] != "failed":
+                    continue
+                merged = self._metadata_json(
+                    row[1], retry_owner=str(retry_owner), retry_requested=True,
+                    reason="replacement search accepted",
+                )
+                conn.execute(
+                    "UPDATE pipeline_items SET state='search_submitted',command_id=?,metadata=?,"
+                    "updated_at_epoch=?,updated_at=CURRENT_TIMESTAMP WHERE app_type=? AND instance_name=? "
+                    "AND item_key=? AND state='failed'",
+                    (str(command_id), merged, now, str(app_type), str(instance_name), item_key),
+                )
+                changed.append(item_key)
+                conn.execute(
+                    "INSERT INTO pipeline_item_events(app_type,instance_name,item_key,state,command_id,metadata,occurred_at_epoch) "
+                    "VALUES(?,?,?,'search_submitted',?,?,?)",
+                    (str(app_type), str(instance_name), item_key, str(command_id), merged, now),
+                )
+        return changed
+
+    def pending_retry_commands(self, app_type: str, instance_name: str) -> list:
+        """Return accepted Swaparr replacement commands still awaiting queue evidence."""
+        with self.db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT command_id,metadata FROM pipeline_items WHERE app_type=? AND instance_name=? "
+                "AND state='search_submitted' AND command_id IS NOT NULL",
+                (str(app_type), str(instance_name)),
+            ).fetchall()
+        command_ids = []
+        for command_id, metadata in rows:
+            data = self._metadata_dict(metadata)
+            if (command_id and data.get("retry_owner") == "swaparr"
+                    and data.get("retry_requested") is True):
+                command_ids.append(str(command_id))
+        return list(dict.fromkeys(command_ids))
 
     def transition(self, app_type: str, instance_name: str, item_key: str, state: str,
                    command_id: Optional[str] = None, cooldown_seconds: Optional[int] = None,

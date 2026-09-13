@@ -291,6 +291,7 @@ SWAPARR_DEFAULTS = {
     "max_download_time": "2h",
     "ignore_above_size": "25GB",
     "remove_from_client": True,
+    "failed_download_retry_cooldown_minutes": 10,
     "dry_run": False,
     "ignore_usenet_queued": True,
     "remove_completed_stalled": True,

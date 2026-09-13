@@ -488,11 +488,23 @@ def claim_search(item_keys: Union[str, Iterable[str]]) -> bool:
         return True
     keys = [item_keys] if isinstance(item_keys, str) else list(item_keys)
     keys = list(dict.fromkeys(str(item_key) for item_key in keys))
-    claimed = get_pipeline_state().claim_candidates(
+    pipeline = get_pipeline_state()
+    retry = pipeline.retry_context(context.app_type, context.instance_name, keys)
+    claimed = pipeline.claim_candidates(
         context.app_type, context.instance_name, keys,
         cooldown_seconds=max(300, int(context.redispatch_wait)),
     )
     context.current_item_keys = keys if claimed else []
+    if claimed and isinstance(retry, dict) and retry.get("fallback"):
+        previous = ",".join(retry.get("previous_retry_owners") or []) or "unknown"
+        context.logger.info(
+            "Retry fallback claimed for %s: retry owner=huntarr-fallback, previous owner=%s, items=%s",
+            context.instance_name, previous, ", ".join(keys),
+        )
+        pipeline.set_runtime(
+            context.app_type, context.instance_name, retry_owner="huntarr-fallback",
+            reason="failed-download cooldown elapsed; no active replacement",
+        )
     if not claimed:
         context.logger.info("Search deferred for %s: one or more items already unresolved or cooling down: %s",
                             context.instance_name, ", ".join(keys))

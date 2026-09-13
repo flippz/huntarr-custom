@@ -117,7 +117,8 @@ def save_queue_snapshot(app_name, instance_name, snapshot):
     except Exception as e:
         swaparr_logger.error(f"Error saving queue snapshot for {app_name}/{instance_name}: {str(e)}")
 
-def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
+def scan_sonarr_history_for_activity(app_name, instance_name, instance_data,
+                                     retry_cooldown_seconds=600):
     """Poll Sonarr/Radarr /history for completed imports and Arr-side failures,
     logging them to the Activity history. This is the authoritative source for "did this
     download actually finish" - a once-per-cycle queue snapshot comparison missed the vast
@@ -190,21 +191,23 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
 
             for record in new_events:
                 name = record.get("sourceTitle") or "Unknown"
-                if db.has_recent_swaparr_activity(app_name, instance_name, name, hours=2):
-                    continue
+                suppress_activity = db.has_recent_swaparr_activity(
+                    app_name, instance_name, name, hours=2,
+                )
 
                 download_id = record.get("downloadId")
                 from src.primary.apps._common.pipeline_state import get_pipeline_state
                 pipeline = get_pipeline_state()
                 lifecycle_instance = str(instance_data.get("instance_id") or instance_name)
-                pipeline_key = pipeline_key_for_history_record(app_name, record)
-                claimed = pipeline.claim_candidate(
-                    app_name, lifecycle_instance, pipeline_key, cooldown_seconds=0,
-                )
+                pipeline_keys = pipeline_keys_for_history_record(app_name, record)
+                pipeline_key = pipeline_keys[0]
                 torrent = torrent_statuses.get((download_id or "").lower())
                 torrent_note = f" (torrent client status: {torrent.get('state')})" if torrent else ""
 
                 if record.get("eventType") == "downloadFolderImported":
+                    claimed = pipeline.claim_candidate(
+                        app_name, lifecycle_instance, pipeline_key, cooldown_seconds=0,
+                    )
                     if claimed:
                         pipeline.transition(app_name, lifecycle_instance, pipeline_key, "imported")
                     else:
@@ -212,14 +215,9 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
                     pipeline.observe_transition(
                         app_name, lifecycle_instance, pipeline_key, "completed", cooldown_seconds=300,
                     )
-                    log_activity_event(app_name, instance_name, download_id, name, "completed")
+                    if not suppress_activity:
+                        log_activity_event(app_name, instance_name, download_id, name, "completed")
                 else:
-                    if claimed:
-                        pipeline.transition(app_name, lifecycle_instance, pipeline_key, "failed", cooldown_seconds=300)
-                    else:
-                        pipeline.observe_transition(
-                            app_name, lifecycle_instance, pipeline_key, "failed", cooldown_seconds=300,
-                        )
                     # Sonarr's own message for this event is the most direct signal available
                     # (e.g. a download client error or "Manually marked as failed"); surface it
                     # before falling back to the generic label.
@@ -234,11 +232,36 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
                     nzbdav_error = nzbdav_errors.get(name)
                     nzbdav_note = f"; NZBDav: {nzbdav_error}" if nzbdav_error else ""
 
+                    history_item = {
+                        "id": record.get("id"),
+                        "name": name,
+                        "source_title": name,
+                        "download_id": download_id,
+                        "episode_id": (record.get("episode") or {}).get("id"),
+                        "episode_ids": [
+                            value for value in [(record.get("episode") or {}).get("id")]
+                            if value is not None
+                        ],
+                        "series_id": record.get("seriesId") or (record.get("series") or {}).get("id"),
+                        "season_number": (record.get("episode") or {}).get("seasonNumber"),
+                        "movie_id": record.get("movieId") or (record.get("movie") or {}).get("id"),
+                    }
+                    correlate_failed_download(
+                        pipeline, app_name, lifecycle_instance, history_item, "starr",
+                        cooldown_seconds=retry_cooldown_seconds,
+                        reason=f"{base_reason}{torrent_note}{decypharr_note}{nzbdav_note}",
+                    )
+                    swaparr_logger.info(
+                        "Natural %s failure observed for %s: retry owner=starr; no delete or search issued by Swaparr",
+                        app_name, name,
+                    )
+
                     # "failed" (not "removed") - Swaparr didn't act here, Sonarr/the download
                     # client reported the failure on its own. "removed" is reserved for Swaparr's
                     # own active strike-based deletions below (malicious/quality/age/max-strikes).
-                    log_activity_event(app_name, instance_name, download_id, name, "failed",
-                                        f"{base_reason}{torrent_note}{decypharr_note}{nzbdav_note}")
+                    if not suppress_activity:
+                        log_activity_event(app_name, instance_name, download_id, name, "failed",
+                                            f"{base_reason}{torrent_note}{decypharr_note}{nzbdav_note}")
 
         if not last_seen_date or newest_date > last_seen_date:
             db.set_swaparr_state_data(app_name, f"history_checkpoint_{instance_name}", {"last_date": newest_date})
@@ -573,57 +596,187 @@ def parse_queue_items(records, item_type, app_name):
             "protocol": record.get("protocol", "unknown").lower(),
             "error_message": record.get("errorMessage", ""),
             "download_id": record.get("downloadId"),
+            "source_title": record.get("title"),
             "media_id": (record.get(item_type) or {}).get("id"),
             "episode_id": (record.get("episode") or {}).get("id"),
+            "episode_ids": [
+                episode_id for episode_id in [(record.get("episode") or {}).get("id")]
+                if episode_id is not None
+            ],
+            "series_id": (record.get("series") or {}).get("id") or record.get("seriesId"),
+            "movie_id": (record.get("movie") or {}).get("id") or record.get("movieId"),
             "season_number": (record.get("episode") or {}).get("seasonNumber")
         })
     
     return queue_items
 
 
-def pipeline_key_for_history_record(app_name, record):
-    """Return the Huntarr media key represented by one Arr history event."""
+def pipeline_keys_for_history_record(app_name, record):
+    """Return ID-first Huntarr keys represented by one Arr history event."""
     download_id = record.get("downloadId")
     if app_name == "radarr":
         movie_id = record.get("movieId") or (record.get("movie") or {}).get("id")
         if movie_id is not None:
-            return "movies:" + str(movie_id)
+            return ["movies:" + str(movie_id)]
     episode = record.get("episode") or {}
     series_id = record.get("seriesId") or (record.get("series") or {}).get("id")
+    keys = []
     if episode.get("id") is not None:
-        return "episodes:" + str(episode["id"])
+        keys.append("episodes:" + str(episode["id"]))
     if series_id is not None and episode.get("seasonNumber") is not None:
-        return "season:%s:%s" % (series_id, episode["seasonNumber"])
-    return "queue:" + str(download_id)
+        keys.append("season:%s:%s" % (series_id, episode["seasonNumber"]))
+    if series_id is not None:
+        keys.append("series:" + str(series_id))
+    return keys or ["queue:" + str(download_id)]
+
+
+def pipeline_key_for_history_record(app_name, record):
+    """Backward-compatible primary key helper."""
+    return pipeline_keys_for_history_record(app_name, record)[0]
+
+
+def pipeline_keys_for_queue_item(app_name, item):
+    """Return ID-first media keys plus broader keys used by season/show searches."""
+    if app_name == "radarr":
+        movie_id = item.get("movie_id") or item.get("media_id")
+        if movie_id is not None:
+            return ["movies:" + str(movie_id)]
+    if app_name == "sonarr":
+        keys = ["episodes:" + str(value) for value in item.get("episode_ids", []) if value is not None]
+        if item.get("episode_id") is not None:
+            keys.insert(0, "episodes:" + str(item["episode_id"]))
+        series_id = item.get("series_id") or item.get("media_id")
+        if series_id is not None and item.get("season_number") is not None:
+            keys.append("season:%s:%s" % (series_id, item["season_number"]))
+        if series_id is not None:
+            keys.append("series:" + str(series_id))
+        if keys:
+            return list(dict.fromkeys(keys))
+    return ["queue:" + str(item.get("download_id") or item.get("id"))]
 
 
 def pipeline_key_for_queue_item(app_name, item):
-    """Return the same per-media key used by Huntarr search submission."""
-    if app_name == "radarr" and item.get("media_id") is not None:
-        return "movies:" + str(item["media_id"])
-    if app_name == "sonarr" and item.get("episode_id") is not None:
-        return "episodes:" + str(item["episode_id"])
-    if (app_name == "sonarr" and item.get("media_id") is not None
-            and item.get("season_number") is not None):
-        return "season:%s:%s" % (item["media_id"], item["season_number"])
-    return "queue:" + str(item.get("download_id") or item.get("id"))
+    """Backward-compatible primary key helper."""
+    return pipeline_keys_for_queue_item(app_name, item)[0]
+
+
+def _pipeline_metadata(item, source="starr_queue"):
+    return json.dumps({
+        "source": source,
+        "download_id": str(item.get("download_id") or "")[:128],
+        "title": str(item.get("source_title") or item.get("name") or "")[:512],
+        "queue_id": str(item.get("id") or "")[:128],
+    }, separators=(",", ":"), sort_keys=True)
+
+
+def _processed_ids_for_keys(keys):
+    ids = []
+    for key in keys:
+        parts = str(key).split(":")
+        if parts[0] in ("episodes", "movies", "series") and len(parts) == 2:
+            ids.append(parts[1])
+        elif parts[0] == "season" and len(parts) == 3:
+            ids.append(f"{parts[1]}_{parts[2]}")
+    return list(dict.fromkeys(ids))
+
+
+def release_processed_memory(app_name, instance_name, keys):
+    """Release only failed media IDs; retain the instance's normal reset window."""
+    ids = _processed_ids_for_keys(keys)
+    return get_database().remove_processed_ids(app_name, str(instance_name), ids) if ids else 0
+
+
+def correlate_failed_download(pipeline, app_name, instance_name, item, retry_owner,
+                              cooldown_seconds=600, reason=None):
+    keys = pipeline.fail_correlated_items(
+        app_name, str(instance_name), pipeline_keys_for_queue_item(app_name, item),
+        item.get("download_id"), item.get("source_title") or item.get("name"),
+        retry_owner=retry_owner, cooldown_seconds=cooldown_seconds, reason=reason,
+    )
+    released = release_processed_memory(app_name, instance_name, keys)
+    swaparr_logger.info(
+        "Failed-download lifecycle correlated for %s/%s: retry owner=%s, items=%s, "
+        "processed-memory released=%s, cooldown=%ss",
+        app_name, instance_name, retry_owner, ",".join(keys) or "none", released,
+        int(cooldown_seconds),
+    )
+    return keys
+
+
+def reconcile_replacement_commands(pipeline, app_name, instance_name, instance_data,
+                                   command_ids=None):
+    """Retire accepted replacement commands only after Starr reports a terminal state."""
+    if app_name not in ("sonarr", "radarr"):
+        return
+    if command_ids is None:
+        command_ids = pipeline.pending_retry_commands(app_name, str(instance_name))
+    else:
+        still_pending = set(pipeline.pending_retry_commands(app_name, str(instance_name)))
+        command_ids = [str(command_id) for command_id in command_ids
+                       if str(command_id) in still_pending]
+    if not command_ids:
+        return
+    if app_name == "sonarr":
+        from src.primary.apps.sonarr.api import get_command_status
+        fetch = lambda command_id: get_command_status(
+            instance_data["api_url"], instance_data["api_key"],
+            instance_data.get("api_timeout", 120), command_id,
+        )
+    else:
+        from src.primary.apps.radarr.api import arr_request
+        fetch = lambda command_id: arr_request(
+            instance_data["api_url"], instance_data["api_key"],
+            instance_data.get("api_timeout", 120), f"command/{command_id}",
+            count_api=False,
+        )
+    for command_id in command_ids:
+        # Synthetic IDs mean Starr accepted an unusual body without returning an ID;
+        # keep the row unresolved rather than guessing whether the command finished.
+        if command_id.startswith("swaparr-"):
+            continue
+        status = fetch(command_id)
+        state = str((status or {}).get("state") or (status or {}).get("status") or "").lower()
+        if state == "completed":
+            if pipeline.transition_command(app_name, command_id, "no_grab"):
+                swaparr_logger.info(
+                    "Replacement command %s completed with no active queue item: retry owner=huntarr-fallback after cooldown",
+                    command_id,
+                )
+        elif state in ("failed", "aborted", "cancelled"):
+            if pipeline.transition_command(app_name, command_id, "failed"):
+                swaparr_logger.info(
+                    "Replacement command %s ended as %s: retry owner=huntarr-fallback after cooldown",
+                    command_id, state,
+                )
 
 
 def record_queue_lifecycle(pipeline, app_name, instance_name, item, state="downloading"):
     """Record queue evidence without reopening terminal rows or duplicate searches."""
-    item_key = pipeline_key_for_queue_item(app_name, item)
+    item_keys = pipeline_keys_for_queue_item(app_name, item)
+    metadata = _pipeline_metadata(item)
+    changed = pipeline.observe_active_items(
+        app_name, str(instance_name), item_keys,
+        download_id=item.get("download_id"),
+        title=item.get("source_title") or item.get("name"), metadata=metadata,
+    )
+    if isinstance(changed, list):
+        return bool(changed), item_keys[0]
+    item_key = item_keys[0]
     claimed = pipeline.claim_candidate(
-        app_name, str(instance_name), item_key, cooldown_seconds=0,
+        app_name, str(instance_name), item_key, cooldown_seconds=0, metadata=metadata,
     )
     if claimed:
-        transitioned = pipeline.transition(app_name, str(instance_name), item_key, state)
+        transitioned = pipeline.transition(
+            app_name, str(instance_name), item_key, state, metadata=metadata,
+        )
     else:
         transitioned = pipeline.observe_transition(
             app_name, str(instance_name), item_key, state,
         )
     return claimed or transitioned, item_key
 
-def trigger_search_for_item(app_name, api_url, api_key, item, api_timeout=120):
+def trigger_search_for_item(app_name, api_url, api_key, item, api_timeout=120,
+                            instance_name=None):
     """Trigger a search for the item that was removed"""
     api_version_map = {
         "radarr": "v3",
@@ -641,8 +794,8 @@ def trigger_search_for_item(app_name, api_url, api_key, item, api_timeout=120):
         # Different apps have different search endpoints and payload structures
         if app_name == "sonarr":
             # For Sonarr, we need the series ID and episode IDs
-            series_id = item.get("seriesId")
-            episode_ids = item.get("episodeIds", [])
+            series_id = item.get("series_id") or item.get("seriesId") or item.get("media_id")
+            episode_ids = item.get("episode_ids") or item.get("episodeIds", [])
             if series_id and episode_ids:
                 search_url = f"{api_url.rstrip('/')}/api/{api_version}/command"
                 payload = {
@@ -656,7 +809,7 @@ def trigger_search_for_item(app_name, api_url, api_key, item, api_timeout=120):
                 
         elif app_name == "radarr":
             # For Radarr, we need the movie ID
-            movie_id = item.get("movieId")
+            movie_id = item.get("movie_id") or item.get("movieId") or item.get("media_id")
             if movie_id:
                 search_url = f"{api_url.rstrip('/')}/api/{api_version}/command"
                 payload = {
@@ -718,16 +871,36 @@ def trigger_search_for_item(app_name, api_url, api_key, item, api_timeout=120):
         
         response = requests.post(search_url, headers=headers, json=payload, timeout=api_timeout, verify=verify_ssl)
         response.raise_for_status()
-        
-        swaparr_logger.info(f"Successfully triggered search for {item.get('name', 'unknown')} in {app_name}")
-        return True
+        try:
+            command_id = response.json().get("id")
+        except (ValueError, AttributeError):
+            command_id = None
+        command_id = str(command_id or f"swaparr-{int(time.time())}")
+        try:
+            from src.primary.stats_manager import increment_hourly_cap
+            increment_hourly_cap(
+                app_name, 1, instance_name=str(instance_name) if instance_name else None,
+            )
+        except Exception as exc:
+            # The external command exists; accounting failure must not submit it again.
+            swaparr_logger.error(
+                "Replacement search accounting failed for %s/%s: %s",
+                app_name, instance_name or "default", exc,
+            )
+        swaparr_logger.info(
+            "Replacement search accepted for %s in %s: retry owner=swaparr, command=%s",
+            item.get('name', 'unknown'), app_name, command_id,
+        )
+        return command_id
         
     except requests.exceptions.RequestException as e:
         swaparr_logger.error(f"Error triggering search for {item.get('name', 'unknown')} in {app_name}: {str(e)}")
         SWAPARR_STATS['errors_encountered'] += 1
         return False
 
-def delete_download(app_name, api_url, api_key, download_id, remove_from_client=True, item=None, trigger_search=False, api_timeout=120):
+def delete_download(app_name, api_url, api_key, download_id, remove_from_client=True,
+                    item=None, trigger_search=False, api_timeout=120,
+                    instance_name=None, pipeline=None, retry_cooldown_seconds=600):
     """Delete a download from a Starr app and optionally trigger a new search"""
     api_version_map = {
         "radarr": "v3",
@@ -739,7 +912,15 @@ def delete_download(app_name, api_url, api_key, download_id, remove_from_client=
     }
     
     api_version = api_version_map.get(app_name, "v3")
-    delete_url = f"{api_url.rstrip('/')}/api/{api_version}/queue/{download_id}?removeFromClient={str(remove_from_client).lower()}&blocklist=true"
+    delete_url = f"{api_url.rstrip('/')}/api/{api_version}/queue/{download_id}"
+    params = {
+        "removeFromClient": str(remove_from_client).lower(),
+        "blocklist": "true",
+    }
+    # Sonarr and Radarr v3 both pass this flag to MarkAsFailed. Other Arr
+    # queue APIs are intentionally left untouched rather than guessing support.
+    if app_name in ("sonarr", "radarr"):
+        params["skipRedownload"] = str(bool(trigger_search)).lower()
     headers = {'X-Api-Key': api_key}
     
     try:
@@ -749,20 +930,63 @@ def delete_download(app_name, api_url, api_key, download_id, remove_from_client=
         from src.primary.settings_manager import get_ssl_verify_setting
         verify_ssl = get_ssl_verify_setting()
         
-        response = requests.delete(delete_url, headers=headers, timeout=api_timeout, verify=verify_ssl)
+        response = requests.delete(
+            delete_url, headers=headers, params=params, timeout=api_timeout, verify=verify_ssl,
+        )
         response.raise_for_status()
-        swaparr_logger.info(f"Successfully removed download {download_id} from {app_name}")
+        retry_owner = "swaparr" if trigger_search else "starr"
+        swaparr_logger.info(
+            "Removed download %s from %s: retry owner=%s, skipRedownload=%s",
+            download_id, app_name, retry_owner,
+            params.get("skipRedownload", "unsupported"),
+        )
         SWAPARR_STATS['downloads_removed'] += 1
         increment_swaparr_stat("removals", 1)  # Track removals in persistent system
         
-        # Trigger search if requested and item data is available
+        correlated_keys = []
+        if pipeline is not None and instance_name is not None and item:
+            try:
+                correlated_keys = correlate_failed_download(
+                    pipeline, app_name, instance_name, item, retry_owner,
+                    cooldown_seconds=retry_cooldown_seconds,
+                    reason="Swaparr confirmed queue removal",
+                )
+            except Exception as exc:
+                swaparr_logger.error(
+                    "Confirmed removal lifecycle correlation failed for %s/%s: %s",
+                    app_name, instance_name, exc,
+                )
+
+        # Trigger exactly one search only after a confirmed deletion.
         if trigger_search and item:
-            swaparr_logger.info(f"Triggering new search for removed download: {item.get('name', 'unknown')}")
-            search_success = trigger_search_for_item(app_name, api_url, api_key, item, api_timeout)
-            if search_success:
-                swaparr_logger.info(f"Successfully triggered search after removal for: {item.get('name', 'unknown')}")
+            try:
+                command_id = trigger_search_for_item(
+                    app_name, api_url, api_key, item, api_timeout,
+                    instance_name=instance_name,
+                )
+            except Exception as exc:
+                command_id = None
+                swaparr_logger.error(
+                    "Replacement search failed unexpectedly for %s/%s: %s",
+                    app_name, instance_name or "default", exc,
+                )
+            if command_id:
+                if pipeline is not None and correlated_keys:
+                    try:
+                        pipeline.mark_retry_requested(
+                            app_name, str(instance_name), correlated_keys, command_id,
+                            retry_owner="swaparr",
+                        )
+                    except Exception as exc:
+                        swaparr_logger.error(
+                            "Accepted replacement lifecycle update failed for %s/%s command %s: %s",
+                            app_name, instance_name, command_id, exc,
+                        )
             else:
-                swaparr_logger.warning(f"Failed to trigger search after removal for: {item.get('name', 'unknown')}")
+                swaparr_logger.warning(
+                    "Replacement search failed for %s: retry owner=huntarr-fallback after cooldown",
+                    item.get('name', 'unknown'),
+                )
         
         return True
     except requests.exceptions.RequestException as e:
@@ -786,13 +1010,26 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
         
         # Scan Arr history for completions/failures regardless of current queue
         # state - this is independent of the queue-watching logic below.
-        scan_sonarr_history_for_activity(app_name, instance_name, instance_data)
+        try:
+            retry_cooldown_minutes = int(
+                settings.get("failed_download_retry_cooldown_minutes", 10)
+            )
+        except (TypeError, ValueError):
+            retry_cooldown_minutes = 10
+        retry_cooldown_seconds = max(1, min(retry_cooldown_minutes, 1440)) * 60
+        scan_sonarr_history_for_activity(
+            app_name, instance_name, instance_data,
+            retry_cooldown_seconds=retry_cooldown_seconds,
+        )
 
         # Get the download queue through the same local single-flight cache used by
         # Huntarr's dispatcher. A nearby hunt/Swaparr cycle can reuse this observation.
         from src.primary.apps._common.pipeline_state import get_pipeline_state
         pipeline = get_pipeline_state()
         lifecycle_instance = str(instance_data.get("instance_id") or instance_name)
+        pending_retries_before_queue = pipeline.pending_retry_commands(
+            app_name, lifecycle_instance,
+        ) if app_name in ("sonarr", "radarr") else []
         queue_response = pipeline.observe_queue(
             app_name, instance_name,
             lambda: get_queue_items(
@@ -812,7 +1049,33 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
         queue_items = queue_response.get("records") or []
 
         if len(queue_items) == 0:
+            try:
+                reconcile_replacement_commands(
+                    pipeline, app_name, lifecycle_instance, instance_data,
+                    command_ids=pending_retries_before_queue,
+                )
+            except Exception as exc:
+                swaparr_logger.warning(
+                    "Replacement command reconciliation unavailable for %s/%s: %s",
+                    app_name, lifecycle_instance, exc,
+                )
             return 0
+
+        # Sonarr exposes one queue row per episode for a shared download. Build one
+        # replacement payload containing every affected episode before the first sibling
+        # deletion removes the underlying download and suppresses duplicate calls.
+        if app_name == "sonarr":
+            episode_groups = {}
+            for queued_item in queue_items:
+                group_key = queued_item.get("download_id") or generate_item_hash(queued_item)
+                episode_groups.setdefault(str(group_key), []).extend(
+                    queued_item.get("episode_ids") or []
+                )
+            for queued_item in queue_items:
+                group_key = queued_item.get("download_id") or generate_item_hash(queued_item)
+                queued_item["episode_ids"] = list(dict.fromkeys(
+                    episode_groups.get(str(group_key), [])
+                ))
 
         # Load strike data and removed items for this app
         strike_data = load_strike_data(app_name)
@@ -833,6 +1096,14 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
         # would try to delete them too and get a 404 for every sibling entry.
         removed_hashes_this_cycle = set()
 
+        def _delete_item(item, trigger_search):
+            return delete_download(
+                app_name, instance_data["api_url"], instance_data["api_key"], item["id"],
+                settings.get("remove_from_client", True), item, trigger_search,
+                instance_data.get("api_timeout", 120), instance_name=lifecycle_instance,
+                pipeline=pipeline, retry_cooldown_seconds=retry_cooldown_seconds,
+            )
+
         # Process each queue item
         items_processed_this_run = 0
         for item in queue_items:
@@ -846,6 +1117,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             item_id = str(item["id"])
             item_state = "Normal"
             item_hash = generate_item_hash(item)
+            download_cycle_key = str(item.get("download_id") or item_hash)
 
             # Queue presence is durable evidence that this item reached downloading.
             # Keep Swaparr's queue rows separate from Huntarr media candidate keys while
@@ -860,7 +1132,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             # Same underlying download already removed earlier this cycle via a sibling
             # queue entry (see removed_hashes_this_cycle comment above) - skip it instead of
             # calling delete on an id that's already gone.
-            if item_hash in removed_hashes_this_cycle:
+            if download_cycle_key in removed_hashes_this_cycle:
                 item_state = "Skipped (same download already removed this cycle)"
                 swaparr_logger.debug(f"Skipping {item['name']} - same download already removed earlier this cycle")
                 continue
@@ -941,7 +1213,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                 if not settings.get("dry_run", False):
                     # Check if re-search is enabled for malicious removals
                     trigger_search = settings.get("research_removed", False)
-                    if delete_download(app_name, instance_data["api_url"], instance_data["api_key"], item["id"], True, item, trigger_search):
+                    if _delete_item(item, trigger_search):
                         swaparr_logger.info(f"Successfully removed malicious download: {item['name']}")
                         
                         # Mark as removed to prevent reappearance
@@ -953,7 +1225,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                         }
                         save_removed_items(app_name, removed_items)
                         removed_ids_this_cycle.add(item_id)
-                        removed_hashes_this_cycle.add(item_hash)
+                        removed_hashes_this_cycle.add(download_cycle_key)
                         log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Malicious: {malicious_reason}")
 
                         item_state = f"REMOVED (Malicious: {malicious_reason})"
@@ -975,7 +1247,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                 if not settings.get("dry_run", False):
                     # Check if re-search is enabled for quality-based removals
                     trigger_search = settings.get("research_removed", False)
-                    if delete_download(app_name, instance_data["api_url"], instance_data["api_key"], item["id"], True, item, trigger_search):
+                    if _delete_item(item, trigger_search):
                         swaparr_logger.info(f"Successfully removed quality-blocked download: {item['name']}")
                         
                         # Mark as removed to prevent reappearance
@@ -987,7 +1259,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                         }
                         save_removed_items(app_name, removed_items)
                         removed_ids_this_cycle.add(item_id)
-                        removed_hashes_this_cycle.add(item_hash)
+                        removed_hashes_this_cycle.add(download_cycle_key)
                         log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Quality: {quality_reason}")
 
                         item_state = f"REMOVED (Quality: {quality_reason})"
@@ -1018,7 +1290,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                 if not settings.get("dry_run", False):
                     # Check if re-search is enabled for age-based removals
                     trigger_search = settings.get("research_removed", False)
-                    if delete_download(app_name, instance_data["api_url"], instance_data["api_key"], item["id"], True, item, trigger_search):
+                    if _delete_item(item, trigger_search):
                         swaparr_logger.info(f"Successfully removed age-expired download: {item['name']}")
                         
                         # Mark as removed to prevent reappearance
@@ -1034,7 +1306,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                         strike_data[item_id]["removed"] = True
                         strike_data[item_id]["removed_time"] = datetime.utcnow().isoformat()
                         removed_ids_this_cycle.add(item_id)
-                        removed_hashes_this_cycle.add(item_hash)
+                        removed_hashes_this_cycle.add(download_cycle_key)
                         log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Age: {age_reason}",
                                             strike_data[item_id].get("strikes", 0))
 
@@ -1055,9 +1327,8 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                 swaparr_logger.warning(f"FAILED IMPORT DETECTED: {item['name']} - {import_reason}")
                 
                 if not settings.get("dry_run", False):
-                    # Always trigger search for failed imports (this is the main purpose)
-                    trigger_search = True
-                    if delete_download(app_name, instance_data["api_url"], instance_data["api_key"], item["id"], True, item, trigger_search):
+                    trigger_search = settings.get("research_removed", False)
+                    if _delete_item(item, trigger_search):
                         swaparr_logger.info(f"Successfully removed failed import: {item['name']}")
                         
                         # Mark as removed to prevent reappearance
@@ -1069,7 +1340,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                         }
                         save_removed_items(app_name, removed_items)
                         removed_ids_this_cycle.add(item_id)
-                        removed_hashes_this_cycle.add(item_hash)
+                        removed_hashes_this_cycle.add(download_cycle_key)
                         log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Failed Import: {import_reason}")
 
                         item_state = f"REMOVED (Failed Import: {import_reason})"
@@ -1090,7 +1361,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
 
                 if not settings.get("dry_run", False):
                     trigger_search = settings.get("research_removed", False)
-                    if delete_download(app_name, instance_data["api_url"], instance_data["api_key"], item["id"], True, item, trigger_search):
+                    if _delete_item(item, trigger_search):
                         swaparr_logger.info(f"Successfully removed download with error: {item['name']}")
 
                         removed_items[item_hash] = {
@@ -1101,7 +1372,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                         }
                         save_removed_items(app_name, removed_items)
                         removed_ids_this_cycle.add(item_id)
-                        removed_hashes_this_cycle.add(item_hash)
+                        removed_hashes_this_cycle.add(download_cycle_key)
                         log_activity_event(app_name, instance_name, item_id, item['name'], "removed", f"Download error: {error_reason}")
 
                         item_state = f"REMOVED (Download error: {error_reason})"
@@ -1275,7 +1546,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                     if not settings.get("dry_run", False):
                         # Check if re-search is enabled for strike-based removals
                         trigger_search = settings.get("research_removed", False)
-                        if delete_download(app_name, instance_data["api_url"], instance_data["api_key"], item["id"], True, item, trigger_search):
+                        if _delete_item(item, trigger_search):
                             swaparr_logger.info(f"Successfully removed {item['name']} after {settings.get('max_strikes', 3)} strikes")
                             
                             # Keep the item in strike data for reference but mark as removed
@@ -1290,7 +1561,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                                 "reason": strike_reason
                             }
                             removed_ids_this_cycle.add(item_id)
-                            removed_hashes_this_cycle.add(item_hash)
+                            removed_hashes_this_cycle.add(download_cycle_key)
                             log_activity_event(app_name, instance_name, item_id, item['name'], "removed",
                                                 f"Max strikes ({strike_reason})", current_strikes)
 
@@ -1303,6 +1574,17 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
                     item_state = f"Striked ({current_strikes}/{settings.get('max_strikes', 3)})"
             
             swaparr_logger.debug(f"Processed download: {item['name']} - State: {item_state}")
+
+        try:
+            reconcile_replacement_commands(
+                pipeline, app_name, lifecycle_instance, instance_data,
+                command_ids=pending_retries_before_queue,
+            )
+        except Exception as exc:
+            swaparr_logger.warning(
+                "Replacement command reconciliation unavailable for %s/%s: %s",
+                app_name, lifecycle_instance, exc,
+            )
         
         # Items that were in the previous snapshot but are no longer in the queue have left
         # for good this cycle. Purge their strike_data entry now: Sonarr can reuse the same
