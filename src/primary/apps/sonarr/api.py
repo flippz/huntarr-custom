@@ -864,7 +864,10 @@ def search_episode(api_url: str, api_key: str, api_timeout: int, episode_ids: Li
     except Exception as e:
         sonarr_logger.error(f"Error checking hourly API cap: {e}")
 
-    from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot, claim_search, finish_search_claim
+    from src.primary.apps._common.queue_dispatch import (
+        acquire_dispatch_slot, begin_search_submission, cancel_dispatch_slot,
+        claim_search, commit_search_submission, finish_search_claim,
+    )
     item_keys = [f"episodes:{item}" for item in sorted(set(episode_ids))]
     if not claim_search(item_keys):
         return None
@@ -873,28 +876,19 @@ def search_episode(api_url: str, api_key: str, api_timeout: int, episode_ids: Li
         return None
     
     try:
+        if not begin_search_submission():
+            return None
         endpoint = f"{api_url}/api/v3/command"
-        payload = {
-            "name": "EpisodeSearch",
-            "episodeIds": episode_ids
-        }
-        
-        # Get SSL verification setting
+        payload = {"name": "EpisodeSearch", "episodeIds": episode_ids}
         verify_ssl = get_ssl_verify_setting()
-        
         response = requests.post(endpoint, headers={"X-Api-Key": api_key}, json=payload, timeout=api_timeout, verify=verify_ssl)
         response.raise_for_status()
         command_id = response.json().get('id')
         if command_id:
-            from src.primary.apps._common.queue_dispatch import record_submission
-            from src.primary.stats_manager import increment_hourly_cap
-            record_submission()
-            finish_search_claim("search_submitted", command_id=command_id)
-            increment_hourly_cap("sonarr", 1, instance_name=instance_name)
+            commit_search_submission(command_id, "sonarr", instance_name)
         else:
             finish_search_claim("failed", cooldown_seconds=300)
         sonarr_logger.info(f"Triggered Sonarr search for episode IDs: {episode_ids}. Command ID: {command_id}")
-        # Exactly one hourly-cap slot is consumed by each accepted search command.
         return command_id
     except requests.exceptions.RequestException as e:
         finish_search_claim("failed", cooldown_seconds=300)
@@ -904,6 +898,8 @@ def search_episode(api_url: str, api_key: str, api_timeout: int, episode_ids: Li
         finish_search_claim("failed", cooldown_seconds=300)
         sonarr_logger.error(f"An unexpected error occurred while triggering Sonarr search: {e}")
         return None
+    finally:
+        cancel_dispatch_slot()
 
 def get_command_status(api_url: str, api_key: str, api_timeout: int, command_id: Union[int, str]) -> Optional[Dict[str, Any]]:
     """Get the status of a Sonarr command."""
@@ -1038,45 +1034,41 @@ def search_season(api_url: str, api_key: str, api_timeout: int, series_id: int, 
                   dispatch_slot_acquired: bool = False) -> Optional[Union[int, str]]:
     """Trigger a search for a specific season. One accepted command consumes one cap slot."""
 
-    # Check the search-submission cap before waiting for queue capacity.
+    from src.primary.apps._common.queue_dispatch import (
+        acquire_dispatch_slot, begin_search_submission, cancel_dispatch_slot,
+        claim_search, commit_search_submission, finish_search_claim,
+    )
     try:
-        from src.primary.stats_manager import check_hourly_cap_exceeded
-        if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
-            sonarr_logger.warning(f"🛑 Sonarr search-dispatch hourly limit reached - skipping season search for series {series_id}, season {season_number}")
-            return None
-    except Exception as e:
-        sonarr_logger.error(f"Error checking hourly API cap: {e}")
+        # A pre-acquired slot already owns an atomic hourly token.
+        if not dispatch_slot_acquired:
+            try:
+                from src.primary.stats_manager import check_hourly_cap_exceeded
+                if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
+                    sonarr_logger.warning(f"🛑 Sonarr search-dispatch hourly limit reached - skipping season search for series {series_id}, season {season_number}")
+                    return None
+            except Exception as e:
+                sonarr_logger.error(f"Error checking hourly API cap: {e}")
 
-    from src.primary.apps._common.queue_dispatch import claim_search, finish_search_claim
-    if not claim_search(f"season:{series_id}:{season_number}"):
-        return None
-    if not dispatch_slot_acquired:
-        from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot
-        if not acquire_dispatch_slot():
+        if not claim_search(f"season:{series_id}:{season_number}"):
+            return None
+        if not dispatch_slot_acquired and not acquire_dispatch_slot():
             finish_search_claim("timed_out", cooldown_seconds=60)
             return None
-    
-    try:
+        if not begin_search_submission():
+            return None
+
         endpoint = f"{api_url}/api/v3/command"
         payload = {
             "name": "SeasonSearch",
             "seriesId": series_id,
             "seasonNumber": season_number
         }
-        
-        # Get SSL verification setting
         verify_ssl = get_ssl_verify_setting()
-        
         response = requests.post(endpoint, headers={"X-Api-Key": api_key}, json=payload, timeout=api_timeout, verify=verify_ssl)
         response.raise_for_status()
         command_id = response.json().get('id')
         if command_id:
-            from src.primary.apps._common.queue_dispatch import record_submission
-            from src.primary.stats_manager import increment_hourly_cap
-            record_submission()
-            finish_search_claim("search_submitted", command_id=command_id)
-            # One SeasonSearch command is one hourly dispatch slot, not one per episode.
-            increment_hourly_cap("sonarr", 1, instance_name=instance_name)
+            commit_search_submission(command_id, "sonarr", instance_name)
         else:
             finish_search_claim("failed", cooldown_seconds=300)
         sonarr_logger.info(f"Triggered Sonarr season search for series ID: {series_id}, season: {season_number}. Command ID: {command_id}")
@@ -1089,6 +1081,8 @@ def search_season(api_url: str, api_key: str, api_timeout: int, series_id: int, 
         finish_search_claim("failed", cooldown_seconds=300)
         sonarr_logger.error(f"An unexpected error occurred while triggering Sonarr season search: {e}")
         return None
+    finally:
+        cancel_dispatch_slot()
 
 def get_cutoff_unmet_episodes_for_series(api_url: str, api_key: str, api_timeout: int, series_id: int, monitored_only: bool = True) -> List[Dict[str, Any]]:
     """
@@ -1410,28 +1404,26 @@ def series_search(api_url: str, api_key: str, api_timeout: int, series_id: int,
     if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
         sonarr_logger.warning("Sonarr search-dispatch hourly limit reached; SeriesSearch deferred")
         return None
-    from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot, claim_search, finish_search_claim
+    from src.primary.apps._common.queue_dispatch import (
+        acquire_dispatch_slot, begin_search_submission, cancel_dispatch_slot,
+        claim_search, commit_search_submission, finish_search_claim,
+    )
     if not claim_search(f"series:{series_id}"):
         return None
     if not acquire_dispatch_slot():
         finish_search_claim("timed_out", cooldown_seconds=60)
         return None
     try:
+        if not begin_search_submission():
+            return None
         endpoint = f"{api_url.rstrip('/')}/api/v3/command"
         payload = {"name": "SeriesSearch", "seriesId": series_id}
-        
-        # Get SSL verification setting
         verify_ssl = get_ssl_verify_setting()
-        
         response = requests.post(endpoint, headers={"X-Api-Key": api_key}, json=payload, timeout=api_timeout, verify=verify_ssl)
         response.raise_for_status()
         command_id = response.json().get('id')
         if command_id:
-            from src.primary.apps._common.queue_dispatch import record_submission
-            from src.primary.stats_manager import increment_hourly_cap
-            record_submission()
-            finish_search_claim("search_submitted", command_id=command_id)
-            increment_hourly_cap("sonarr", 1, instance_name=instance_name)
+            commit_search_submission(command_id, "sonarr", instance_name)
         else:
             finish_search_claim("failed", cooldown_seconds=300)
         sonarr_logger.info(f"Triggered Sonarr SeriesSearch for series ID: {series_id}. Command ID: {command_id}")
@@ -1444,6 +1436,8 @@ def series_search(api_url: str, api_key: str, api_timeout: int, series_id: int,
         finish_search_claim("failed", cooldown_seconds=300)
         sonarr_logger.error(f"Unexpected error triggering Sonarr SeriesSearch: {e}")
         return None
+    finally:
+        cancel_dispatch_slot()
 
 
 def get_or_create_tag(api_url: str, api_key: str, api_timeout: int, tag_label: str) -> Optional[int]:

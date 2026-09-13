@@ -264,44 +264,59 @@ class PipelineState:
 
     def transition(self, app_type: str, instance_name: str, item_key: str, state: str,
                    command_id: Optional[str] = None, cooldown_seconds: Optional[int] = None,
-                   metadata: Optional[str] = None) -> bool:
+                   metadata: Optional[str] = None, expected_states=None) -> bool:
         return self.transition_items(
             app_type, instance_name, [item_key], state, command_id=command_id,
             cooldown_seconds=cooldown_seconds, metadata=metadata,
+            expected_states=expected_states,
         )
 
     def transition_items(self, app_type: str, instance_name: str, item_keys, state: str,
                          command_id: Optional[str] = None,
                          cooldown_seconds: Optional[int] = None,
-                         metadata: Optional[str] = None) -> bool:
-        """Transition every existing row in a media batch in one transaction."""
+                         metadata: Optional[str] = None,
+                         expected_states=None) -> bool:
+        """Compare-and-set a complete batch without ever overwriting terminal rows."""
         if state not in LIFECYCLE_STATES:
             raise ValueError(f"invalid pipeline lifecycle state: {state}")
         keys = list(dict.fromkeys(str(item_key) for item_key in item_keys))
         if not keys:
             return False
+        allowed = tuple(sorted(expected_states if expected_states is not None else UNRESOLVED_STATES))
+        if not allowed:
+            return False
         now = int(self._clock())
         cooldown = now + max(0, int(cooldown_seconds or 0)) if cooldown_seconds is not None else None
+        key_placeholders = ",".join("?" for _ in keys)
+        state_placeholders = ",".join("?" for _ in allowed)
         with self.db.get_connection() as conn:
-            updated = 0
+            conn.execute("BEGIN IMMEDIATE")
+            eligible = conn.execute(
+                "SELECT COUNT(*) FROM pipeline_items WHERE app_type=? AND instance_name=? "
+                f"AND item_key IN ({key_placeholders}) AND state IN ({state_placeholders})",
+                (str(app_type), str(instance_name), *keys, *allowed),
+            ).fetchone()[0]
+            if eligible != len(keys):
+                return False
             for item_key in keys:
                 cursor = conn.execute(
                     "UPDATE pipeline_items SET state=?, command_id=COALESCE(?,command_id), "
                     "metadata=COALESCE(?,metadata), cooldown_until_epoch=COALESCE(?,cooldown_until_epoch), "
                     "updated_at_epoch=?, updated_at=CURRENT_TIMESTAMP "
-                    "WHERE app_type=? AND instance_name=? AND item_key=?",
+                    "WHERE app_type=? AND instance_name=? AND item_key=? "
+                    f"AND state IN ({state_placeholders})",
                     (state, None if command_id is None else str(command_id), metadata, cooldown, now,
-                     str(app_type), str(instance_name), item_key),
+                     str(app_type), str(instance_name), item_key, *allowed),
                 )
-                if cursor.rowcount == 1:
-                    updated += 1
-                    conn.execute(
-                        "INSERT INTO pipeline_item_events(app_type,instance_name,item_key,state,command_id,metadata,occurred_at_epoch) "
-                        "VALUES(?,?,?,?,?,?,?)",
-                        (str(app_type), str(instance_name), item_key, state,
-                         None if command_id is None else str(command_id), metadata, now),
-                    )
-            return updated == len(keys)
+                if cursor.rowcount != 1:
+                    raise RuntimeError("pipeline compare-and-set lost transaction ownership")
+                conn.execute(
+                    "INSERT INTO pipeline_item_events(app_type,instance_name,item_key,state,command_id,metadata,occurred_at_epoch) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (str(app_type), str(instance_name), item_key, state,
+                     None if command_id is None else str(command_id), metadata, now),
+                )
+            return True
 
     def observe_transition(self, app_type: str, instance_name: str, item_key: str,
                            state: str, cooldown_seconds: Optional[int] = None,
@@ -386,20 +401,31 @@ class PipelineState:
             raise ValueError(f"invalid pipeline lifecycle state: {state}")
         now = int(self._clock())
         cooldown = now + max(0, int(cooldown_seconds or 0)) if cooldown_seconds is not None else None
+        unresolved = tuple(sorted(UNRESOLVED_STATES))
+        placeholders = ",".join("?" for _ in unresolved)
         with self.db.get_connection() as conn:
-            cursor = conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT instance_name,item_key FROM pipeline_items "
+                "WHERE app_type=? AND command_id=? "
+                f"AND state IN ({placeholders})",
+                (str(app_type), str(command_id), *unresolved),
+            ).fetchall()
+            if not rows:
+                return False
+            conn.execute(
                 "UPDATE pipeline_items SET state=?, cooldown_until_epoch=COALESCE(?,cooldown_until_epoch), "
-                "updated_at_epoch=?, updated_at=CURRENT_TIMESTAMP WHERE app_type=? AND command_id=?",
-                (state, cooldown, now, str(app_type), str(command_id)),
+                "updated_at_epoch=?, updated_at=CURRENT_TIMESTAMP WHERE app_type=? AND command_id=? "
+                f"AND state IN ({placeholders})",
+                (state, cooldown, now, str(app_type), str(command_id), *unresolved),
             )
-            if cursor.rowcount:
+            for instance_name, item_key in rows:
                 conn.execute(
                     "INSERT INTO pipeline_item_events(app_type,instance_name,item_key,state,command_id,occurred_at_epoch) "
-                    "SELECT app_type,instance_name,item_key,?,command_id,? FROM pipeline_items "
-                    "WHERE app_type=? AND command_id=?",
-                    (state, now, str(app_type), str(command_id)),
+                    "VALUES(?,?,?,?,?,?)",
+                    (str(app_type), instance_name, item_key, state, str(command_id), now),
                 )
-            return cursor.rowcount > 0
+            return True
 
 
 _pipeline_state = PipelineState()

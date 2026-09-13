@@ -461,7 +461,10 @@ def movie_search(api_url: str, api_key: str, api_timeout: int, movie_ids: List[i
         radarr_logger.warning("Radarr search-dispatch hourly limit reached; MoviesSearch deferred")
         return None
 
-    from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot, claim_search, finish_search_claim
+    from src.primary.apps._common.queue_dispatch import (
+        acquire_dispatch_slot, begin_search_submission, cancel_dispatch_slot,
+        claim_search, commit_search_submission, finish_search_claim,
+    )
     item_keys = [f"movies:{item}" for item in sorted(set(movie_ids))]
     if not claim_search(item_keys):
         return None
@@ -469,27 +472,22 @@ def movie_search(api_url: str, api_key: str, api_timeout: int, movie_ids: List[i
         finish_search_claim("timed_out", cooldown_seconds=60)
         return None
         
-    endpoint = "command"
-    data = {
-        "name": "MoviesSearch",
-        "movieIds": movie_ids
-    }
-    
-    # Only accepted search commands consume the separate hourly dispatch cap.
-    response = arr_request(api_url, api_key, api_timeout, endpoint, method="POST", data=data, count_api=False)
-    if response and 'id' in response:
-        command_id = response['id']
-        from src.primary.apps._common.queue_dispatch import record_submission
-        from src.primary.stats_manager import increment_hourly_cap
-        record_submission()
-        finish_search_claim("search_submitted", command_id=command_id)
-        increment_hourly_cap("radarr", 1, instance_name=instance_name)
-        radarr_logger.debug(f"Triggered search for movie IDs: {movie_ids}. Command ID: {command_id}")
-        return command_id
-    else:
+    try:
+        if not begin_search_submission():
+            return None
+        endpoint = "command"
+        data = {"name": "MoviesSearch", "movieIds": movie_ids}
+        response = arr_request(api_url, api_key, api_timeout, endpoint, method="POST", data=data, count_api=False)
+        if response and 'id' in response:
+            command_id = response['id']
+            commit_search_submission(command_id, "radarr", instance_name)
+            radarr_logger.debug(f"Triggered search for movie IDs: {movie_ids}. Command ID: {command_id}")
+            return command_id
         finish_search_claim("failed", cooldown_seconds=300)
         radarr_logger.error(f"Failed to trigger search command for movie IDs {movie_ids}. Response: {response}")
         return None
+    finally:
+        cancel_dispatch_slot()
 
 def check_connection(api_url: str, api_key: str, api_timeout: int) -> bool:
     """Check the connection to Radarr API."""

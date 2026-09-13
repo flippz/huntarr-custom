@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, Optional, Union
 
-from src.primary.apps._common.pipeline_state import get_pipeline_state
+from src.primary.apps._common.pipeline_state import UNRESOLVED_STATES, get_pipeline_state
 
 
 @dataclass
@@ -38,6 +38,8 @@ class DispatchContext:
     decypharr_capacity_enabled: bool = False
     decypharr_config: Optional[dict] = None
     scheduler_held: bool = False
+    budget_reserved: bool = False
+    decypharr_reservation: object = None
 
 
 _local = threading.local()
@@ -69,8 +71,9 @@ def configure_dispatch(app_type: str, instance_name: str, settings: dict,
     key = (app_type, str(instance_name))
     with _lock:
         previous = _contexts.get(key)
-        if previous and previous.scheduler_held:
-            _release_shared(previous)
+        if previous and (previous.scheduler_held or previous.budget_reserved
+                         or previous.decypharr_reservation is not None):
+            _cancel_context(previous)
         recent = list(previous.recent_submissions) if previous else []
         last = previous.last_submission if previous else 0.0
         cache_name = str(queue_cache_name or instance_name)
@@ -120,9 +123,7 @@ def configure_dispatch(app_type: str, instance_name: str, settings: dict,
 
 
 def clear_dispatch() -> None:
-    context = getattr(_local, "context", None)
-    if context is not None:
-        _release_shared(context)
+    cancel_dispatch_slot()
     _local.context = None
 
 
@@ -134,9 +135,11 @@ def invalidate_dispatch_observation(app_type: str, instance_name: str) -> None:
     get_pipeline_state().invalidate_queue(app_type, cache_name)
 
 
-def _occupancy(context: DispatchContext, now: float):
+def _occupancy(context: DispatchContext, now: float, force: bool = False):
     context.recent_submissions[:] = [t for t in context.recent_submissions
                                      if now - t < _RECENT_GRACE_SECONDS]
+    if force and context.queue_cache_name:
+        get_pipeline_state().invalidate_queue(context.app_type, context.queue_cache_name)
     if context.queue_status:
         queue, active = context.queue_status()
     else:
@@ -159,12 +162,35 @@ def _release_shared(context: DispatchContext) -> None:
     context.scheduler_held = False
 
 
-def _decypharr_capacity(context: DispatchContext) -> dict:
+def _cancel_context(context: DispatchContext) -> None:
+    if context.decypharr_reservation is not None:
+        try:
+            from src.primary.apps.swaparr.decypharr_capacity import release_reservation
+            release_reservation(context.decypharr_config or {}, context.decypharr_reservation)
+        finally:
+            context.decypharr_reservation = None
+    if context.budget_reserved:
+        try:
+            from src.primary.stats_manager import release_hourly_cap_reservation
+            release_hourly_cap_reservation(context.app_type, context.instance_name)
+        finally:
+            context.budget_reserved = False
+    _release_shared(context)
+
+
+def cancel_dispatch_slot() -> None:
+    """Idempotently unwind every provisional grant when no POST was accepted."""
+    context: Optional[DispatchContext] = getattr(_local, "context", None)
+    if context is not None:
+        _cancel_context(context)
+
+
+def _decypharr_capacity(context: DispatchContext, force: bool = False) -> dict:
     if not context.decypharr_capacity_enabled:
         return {"enabled": False, "healthy": False, "free": None, "fail_open": True,
                 "reason": "Decypharr capacity disabled"}
     from src.primary.apps.swaparr.decypharr_capacity import get_capacity
-    return get_capacity(context.decypharr_config or {})
+    return get_capacity(context.decypharr_config or {}, force=force)
 
 
 def _search_budget(context: DispatchContext) -> dict:
@@ -180,7 +206,7 @@ def _search_budget(context: DispatchContext) -> dict:
         return {"remaining": None, "limit": None, "used": None}
 
 
-def acquire_dispatch_slot() -> bool:
+def _acquire_dispatch_slot() -> bool:
     """Wait responsively for min(Starr, Decypharr, budget) and a weighted turn."""
     context: Optional[DispatchContext] = getattr(_local, "context", None)
     if context is None:
@@ -266,25 +292,71 @@ def acquire_dispatch_slot() -> bool:
                     last_reason = waiting_reason or "waiting for weighted shared capacity turn"
                 else:
                     context.scheduler_held = True
-                    # Re-observe Starr capacity after the serialized grant. Recent reservations
-                    # from the previous holder are now visible before this caller can POST.
-                    occupancy2, queue2, active2, recent2 = _occupancy(context, time.monotonic())
-                    if occupancy2 is None or occupancy2 >= context.target_depth:
-                        _release_shared(context)
-                        last_reason = "shared capacity changed before dispatch; reconciling"
+                    # The grant is the serialization boundary: discard every pre-grant
+                    # observation, then reserve downstream and hourly capacity before POST.
+                    occupancy2, queue2, active2, recent2 = _occupancy(
+                        context, time.monotonic(), force=True,
+                    )
+                    decypharr2 = _decypharr_capacity(context, force=True)
+                    budget2 = _search_budget(context)
+                    decypharr_free2 = decypharr2.get("free") if decypharr2.get("healthy") else None
+                    budget_free2 = budget2.get("remaining")
+                    final_reason = None
+                    if occupancy2 is None:
+                        final_reason = "Starr capacity unavailable during final grant check"
+                    elif context.max_queue_size >= 0 and queue2 >= context.max_queue_size:
+                        final_reason = f"download queue {queue2} reached hard ceiling {context.max_queue_size}"
+                    elif occupancy2 >= context.target_depth:
+                        final_reason = f"Starr capacity full after grant ({occupancy2}/{context.target_depth})"
+                    elif decypharr2.get("healthy") and decypharr_free2 <= 0:
+                        final_reason = f"Decypharr capacity full after grant: {decypharr2.get('reason')}"
+                    elif budget_free2 is not None and budget_free2 <= 0:
+                        final_reason = (f"search budget exhausted after grant "
+                                        f"({budget2.get('used')}/{budget2.get('limit')})")
+
+                    if final_reason is None:
+                        from src.primary.stats_manager import try_reserve_hourly_cap
+                        budget_reservation = try_reserve_hourly_cap(
+                            context.app_type, context.instance_name,
+                        )
+                        if budget_reservation is False:
+                            final_reason = "final hourly search token was consumed by another dispatch"
+                        elif budget_reservation is True:
+                            context.budget_reserved = True
+
+                    if final_reason is None and decypharr2.get("healthy"):
+                        from src.primary.apps.swaparr.decypharr_capacity import try_reserve_slot
+                        decypharr_reservation = try_reserve_slot(context.decypharr_config or {})
+                        if decypharr_reservation is False:
+                            final_reason = "final Decypharr slot was consumed by another dispatch"
+                        elif decypharr_reservation is None:
+                            final_reason = "Decypharr capacity changed during final reservation"
+                        else:
+                            context.decypharr_reservation = decypharr_reservation
+
+                    if final_reason is not None:
+                        _cancel_context(context)
+                        last_reason = final_reason
                     else:
+                        final_free = min(
+                            value for value in (
+                                max(0, context.target_depth - occupancy2),
+                                None if decypharr_free2 is None else max(0, decypharr_free2 - 1),
+                                None if budget_free2 is None else max(0, budget_free2 - 1),
+                            ) if value is not None
+                        )
                         get_pipeline_state().set_runtime(
                             context.app_type, context.instance_name, slots_used=occupancy2,
-                            slots_target=context.target_depth, slots_free=max(0, effective_free or 0),
-                            queue=queue2, active_searches=active2, decypharr=decypharr,
+                            slots_target=context.target_depth, slots_free=final_free,
+                            queue=queue2, active_searches=active2, decypharr=decypharr2,
                             pause_reason=None,
                         )
                         context.logger.info(
-                            "Queue dispatch slot available for %s: Starr free=%d, Decypharr free=%s, "
+                            "Queue dispatch slot reserved for %s: Starr free=%d, Decypharr free=%s, "
                             "search budget=%s (weighted shared grant)",
                             context.instance_name, context.target_depth - occupancy2,
-                            decypharr_free if decypharr_free is not None else "fail-open",
-                            budget_free if budget_free is not None else "unknown",
+                            decypharr_free2 if decypharr_free2 is not None else "fail-open",
+                            budget_free2 if budget_free2 is not None else "unknown",
                         )
                         return True
             else:
@@ -326,22 +398,39 @@ def acquire_dispatch_slot() -> bool:
             time.sleep(min(0.5, end - time.monotonic()))
 
 
-def record_submission() -> None:
-    """Reserve capacity immediately after a successful command submission."""
-    context: Optional[DispatchContext] = getattr(_local, "context", None)
-    if context is None:
-        return
+def acquire_dispatch_slot() -> bool:
+    """Acquire a slot and guarantee exceptional exits cannot leak its ownership."""
+    try:
+        return _acquire_dispatch_slot()
+    except BaseException:
+        cancel_dispatch_slot()
+        raise
+
+
+def _commit_reserved_capacity(context: DispatchContext) -> None:
+    """Commit provisional tokens after Starr accepts the POST, then release the grant."""
     now = time.monotonic()
     with _lock:
         context.last_submission = now
         context.recent_submissions.append(now)
-    if context.decypharr_capacity_enabled:
+    # A failed-open budget observation could not reserve before POST. Consume the
+    # ordinary counter while still holding the scheduler grant in that rare case.
+    if not context.budget_reserved:
         try:
-            from src.primary.apps.swaparr.decypharr_capacity import reserve_slot
-            reserve_slot(context.decypharr_config or {})
+            from src.primary.stats_manager import increment_hourly_cap
+            increment_hourly_cap(context.app_type, 1, instance_name=context.instance_name)
         except Exception:
             pass
+    context.budget_reserved = False  # reserved token is now the committed count
+    context.decypharr_reservation = None  # retained in the shared grace ledger
     _release_shared(context)
+
+
+def record_submission() -> None:
+    """Backward-compatible accepted-POST capacity commit."""
+    context: Optional[DispatchContext] = getattr(_local, "context", None)
+    if context is not None:
+        _commit_reserved_capacity(context)
 
 
 def claim_search(item_keys: Union[str, Iterable[str]]) -> bool:
@@ -359,23 +448,69 @@ def claim_search(item_keys: Union[str, Iterable[str]]) -> bool:
     if not claimed:
         context.logger.info("Search deferred for %s: one or more items already unresolved or cooling down: %s",
                             context.instance_name, ", ".join(keys))
+        cancel_dispatch_slot()
     return claimed
 
 
-def finish_search_claim(state: str, command_id=None, cooldown_seconds: Optional[int] = None) -> None:
+def begin_search_submission() -> bool:
+    """Transfer lifecycle ownership from candidate immediately before the POST."""
     context: Optional[DispatchContext] = getattr(_local, "context", None)
     if context is None:
-        return
+        return True
+    if not context.scheduler_held or not context.current_item_keys:
+        cancel_dispatch_slot()
+        return False
+    transitioned = get_pipeline_state().transition_items(
+        context.app_type, context.instance_name, context.current_item_keys,
+        "search_submitted", expected_states={"candidate"},
+    )
+    if not transitioned:
+        context.logger.info(
+            "Search submission cancelled for %s: lifecycle claim is no longer candidate",
+            context.instance_name,
+        )
+        context.current_item_keys = []
+        cancel_dispatch_slot()
+        return False
+    return True
+
+
+def commit_search_submission(command_id, app_type: Optional[str] = None,
+                             instance_name: Optional[str] = None) -> bool:
+    """Attach the accepted command ID without overwriting webhook-terminalized rows."""
+    context: Optional[DispatchContext] = getattr(_local, "context", None)
+    if context is None:
+        # Direct API use outside a configured worker retains the pre-scheduler behavior.
+        if app_type:
+            from src.primary.stats_manager import increment_hourly_cap
+            increment_hourly_cap(app_type, 1, instance_name=instance_name)
+        return True
+    try:
+        return get_pipeline_state().transition_items(
+            context.app_type, context.instance_name, context.current_item_keys,
+            "search_submitted", command_id=command_id, expected_states={"search_submitted"},
+        )
+    finally:
+        # The external command exists even if local lifecycle persistence fails.
+        _commit_reserved_capacity(context)
+
+
+def finish_search_claim(state: str, command_id=None, cooldown_seconds: Optional[int] = None) -> bool:
+    context: Optional[DispatchContext] = getattr(_local, "context", None)
+    if context is None:
+        return False
     if not context.current_item_keys:
-        _release_shared(context)
-        return
-    get_pipeline_state().transition_items(
+        cancel_dispatch_slot()
+        return False
+    transitioned = get_pipeline_state().transition_items(
         context.app_type, context.instance_name, context.current_item_keys, state,
         command_id=command_id, cooldown_seconds=cooldown_seconds,
+        expected_states=UNRESOLVED_STATES,
     )
     if state in {"completed", "no_grab", "failed", "timed_out"}:
         context.current_item_keys = []
-    _release_shared(context)
+    cancel_dispatch_slot()
+    return transitioned
 
 
 def mark_command(command_id, state: str, cooldown_seconds: Optional[int] = None) -> bool:

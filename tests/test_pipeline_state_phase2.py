@@ -92,6 +92,25 @@ class PipelineLifecycleTests(unittest.TestCase):
         self.now += 31
         self.assertTrue(restarted.claim_candidate("radarr", "one", "movies:9"))
 
+    def test_expected_candidate_cas_cannot_reopen_webhook_terminalized_row(self):
+        self.assertTrue(self.state.claim_candidate("sonarr", "one", "episodes:3"))
+        self.assertTrue(self.state.transition(
+            "sonarr", "one", "episodes:3", "failed", expected_states={"candidate"},
+        ))
+        self.assertFalse(self.state.transition(
+            "sonarr", "one", "episodes:3", "search_submitted",
+            expected_states={"candidate"},
+        ))
+        # Ordinary transitions are also terminal-safe by default.
+        self.assertFalse(self.state.transition(
+            "sonarr", "one", "episodes:3", "search_submitted",
+        ))
+        with self.state.db.get_connection() as conn:
+            row = conn.execute(
+                "SELECT state FROM pipeline_items WHERE item_key='episodes:3'"
+            ).fetchone()
+        self.assertEqual(row[0], "failed")
+
     def test_command_transition_updates_serialized_row(self):
         self.state.claim_candidate("sonarr", "one", "episodes:3")
         self.state.transition("sonarr", "one", "episodes:3", "search_submitted", command_id="7")
@@ -256,6 +275,7 @@ class BatchDispatchAndSwaparrTests(unittest.TestCase):
         pipeline.transition_items.assert_called_once_with(
             "radarr", "one", ["movies:3", "movies:1"], "search_submitted",
             command_id=9, cooldown_seconds=None,
+            expected_states=queue_dispatch.UNRESOLVED_STATES,
         )
 
     def test_dispatch_full_poll_is_reused_by_swaparr_without_queue_refetch(self):

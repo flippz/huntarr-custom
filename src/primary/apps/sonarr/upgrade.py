@@ -386,29 +386,37 @@ def process_upgrade_seasons_mode(
             if command_wait_attempts <= 0:
                 sonarr_logger.error("Force exact-season replacement requires command waiting; skipping unsafe fire-and-forget search")
                 continue
-            from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot
-            dispatch_slot_acquired = acquire_dispatch_slot()
-            if not dispatch_slot_acquired:
-                continue
-            from src.primary.apps.sonarr.season_recovery import (
-                mark_search_started, prepare_exact_season, utc_now_iso,
+            from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot, cancel_dispatch_slot
+            try:
+                dispatch_slot_acquired = acquire_dispatch_slot()
+                if not dispatch_slot_acquired:
+                    continue
+                from src.primary.apps.sonarr.season_recovery import (
+                    mark_search_started, prepare_exact_season, utc_now_iso,
+                )
+                recovery_id = prepare_exact_season(
+                    api_url, api_key, api_timeout, instance_name, series_id, season_number
+                )
+                if recovery_id is None:
+                    sonarr_logger.error("Skipping forced search: exact-season staging was not safe")
+                    continue
+                search_started_at = utc_now_iso()
+                if not mark_search_started(instance_name, recovery_id, search_started_at):
+                    sonarr_logger.error("Skipping forced search: could not arm durable recovery journal")
+                    from src.primary.apps.sonarr.season_recovery import recover_pending
+                    recover_pending(api_url, api_key, api_timeout, instance_name)
+                    continue
+                search_command_id = sonarr_api.search_season(
+                    api_url, api_key, api_timeout, series_id, season_number,
+                    instance_name=instance_name, dispatch_slot_acquired=True,
+                )
+            finally:
+                cancel_dispatch_slot()
+        else:
+            search_command_id = sonarr_api.search_season(
+                api_url, api_key, api_timeout, series_id, season_number,
+                instance_name=instance_name, dispatch_slot_acquired=False,
             )
-            recovery_id = prepare_exact_season(
-                api_url, api_key, api_timeout, instance_name, series_id, season_number
-            )
-            if recovery_id is None:
-                sonarr_logger.error("Skipping forced search: exact-season staging was not safe")
-                continue
-            search_started_at = utc_now_iso()
-            if not mark_search_started(instance_name, recovery_id, search_started_at):
-                sonarr_logger.error("Skipping forced search: could not arm durable recovery journal")
-                from src.primary.apps.sonarr.season_recovery import recover_pending
-                recover_pending(api_url, api_key, api_timeout, instance_name)
-                continue
-        search_command_id = sonarr_api.search_season(
-            api_url, api_key, api_timeout, series_id, season_number,
-            instance_name=instance_name, dispatch_slot_acquired=dispatch_slot_acquired,
-        )
         command_completed = False
         if search_command_id:
             command_completed = wait_for_command(

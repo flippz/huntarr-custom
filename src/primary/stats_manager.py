@@ -208,6 +208,43 @@ def increment_hourly_cap(app_type: str, count: int = 1, instance_name: Optional[
             logger.error(f"Error incrementing hourly cap for {app_type}: {e}")
             return False
 
+def try_reserve_hourly_cap(app_type: str, instance_name: str) -> Optional[bool]:
+    """Atomically reserve one per-instance search token.
+
+    Returns True when reserved, False when the limit is full, and None when telemetry
+    is unavailable so callers can preserve the historical fail-open behavior.
+    """
+    if app_type not in ("sonarr", "radarr"):
+        return None
+    instance_name = _normalize_instance_name(instance_name)
+    check_hourly_reset()
+    with hourly_lock:
+        try:
+            db = get_database()
+            current = db.get_hourly_caps_per_instance(app_type).get(instance_name, {}).get("api_hits", 0)
+            limit = _get_instance_hourly_cap_limit(app_type, instance_name)
+            if int(current) >= int(limit):
+                return False
+            db.increment_hourly_cap_per_instance(app_type, instance_name, 1)
+            logger.debug("Reserved hourly dispatch token for %s/%s", app_type, instance_name)
+            return True
+        except Exception as e:
+            logger.error("Error reserving hourly cap for %s/%s: %s", app_type, instance_name, e)
+            return None
+
+
+def release_hourly_cap_reservation(app_type: str, instance_name: str) -> None:
+    """Release one provisional token after a pre-POST cancellation/failure."""
+    instance_name = _normalize_instance_name(instance_name)
+    with hourly_lock:
+        try:
+            get_database().release_hourly_cap_per_instance(app_type, instance_name)
+            logger.debug("Released hourly dispatch token for %s/%s", app_type, instance_name)
+        except Exception as e:
+            logger.error("Error releasing hourly cap reservation for %s/%s: %s",
+                         app_type, instance_name, e)
+
+
 def _get_instance_hourly_cap_limit(app_type: str, instance_key: str) -> int:
     """Get the hourly API cap limit for a single instance from settings. instance_key may be display name or instance_id."""
     try:

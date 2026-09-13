@@ -146,6 +146,64 @@ class DefaultsAndPlumbingTests(unittest.TestCase):
         self.assertTrue(process.call_args.kwargs["force_season_replacement"])
 
 
+class DispatchOwnershipRegressionTests(unittest.TestCase):
+    def tearDown(self):
+        queue_dispatch.clear_dispatch()
+
+    def _forced_season(self, prepare_result, mark_result=True):
+        episode = {
+            "id": 9, "seriesId": 7, "seasonNumber": 2,
+            "airDateUtc": "2020-01-01T00:00:00Z",
+            "series": {"title": "Show"},
+        }
+        patches = [
+            mock.patch.object(sonarr_api, "get_cutoff_unmet_episodes_random_page", return_value=[episode]),
+            mock.patch.object(sonarr_upgrade, "is_processed", return_value=False),
+            mock.patch.object(sonarr_upgrade, "check_hourly_cap_exceeded", return_value=False),
+            mock.patch.object(queue_dispatch, "acquire_dispatch_slot", return_value=True),
+            mock.patch.object(queue_dispatch, "cancel_dispatch_slot"),
+            mock.patch("src.primary.apps.sonarr.season_recovery.prepare_exact_season", return_value=prepare_result),
+            mock.patch("src.primary.apps.sonarr.season_recovery.mark_search_started", return_value=mark_result),
+            mock.patch("src.primary.apps.sonarr.season_recovery.recover_pending", return_value=True),
+            mock.patch.object(sonarr_api, "search_season"),
+        ]
+        entered = [patch.start() for patch in patches]
+        try:
+            result = sonarr_upgrade.process_upgrade_seasons_mode(
+                "http://sonarr", "key", "instance", 10, True, 1, 1, 2,
+                lambda: False, force_season_replacement=True,
+            )
+            return result, entered[4], entered[8]
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+
+    def test_forced_season_prepare_failure_releases_preacquired_grant(self):
+        result, cancel, search = self._forced_season(None)
+        self.assertFalse(result)
+        cancel.assert_called_once_with()
+        search.assert_not_called()
+
+    def test_forced_season_journal_arm_failure_releases_preacquired_grant(self):
+        result, cancel, search = self._forced_season("journal", mark_result=False)
+        self.assertFalse(result)
+        cancel.assert_called_once_with()
+        search.assert_not_called()
+
+    def test_terminalization_between_claim_and_post_prevents_post(self):
+        with mock.patch.object(queue_dispatch, "claim_search", return_value=True), \
+             mock.patch.object(queue_dispatch, "acquire_dispatch_slot", return_value=True), \
+             mock.patch.object(queue_dispatch, "begin_search_submission", return_value=False), \
+             mock.patch.object(queue_dispatch, "cancel_dispatch_slot") as cancel, \
+             mock.patch.object(sonarr_api.requests, "post") as post:
+            result = sonarr_api.search_episode(
+                "http://sonarr", "key", 10, [9], instance_name="instance",
+            )
+        self.assertIsNone(result)
+        post.assert_not_called()
+        cancel.assert_called_once_with()
+
+
 class SearchCapTests(unittest.TestCase):
     def tearDown(self):
         queue_dispatch.clear_dispatch()

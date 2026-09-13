@@ -498,6 +498,21 @@ class StateMixin:
                   current_hour, increment, increment, current_hour))
             conn.commit()
 
+    def release_hourly_cap_per_instance(self, app_type: str, instance_name: str) -> None:
+        """Release one same-hour provisional dispatch token without allowing negatives."""
+        import datetime
+        key = (instance_name or "Default").strip() if isinstance(instance_name, str) else "Default"
+        key = key if key else "Default"
+        current_hour = datetime.datetime.now().hour
+        with self.get_connection() as conn:
+            conn.execute('''
+                UPDATE hourly_caps_per_instance
+                SET api_hits = CASE WHEN api_hits > 0 THEN api_hits - 1 ELSE 0 END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE app_type = ? AND instance_name = ? AND last_reset_hour = ?
+            ''', (app_type, key, current_hour))
+            conn.commit()
+
     def get_sleep_data(self, app_type: str = None) -> Dict[str, Any]:
         """Get sleep/cycle data for an app or all apps"""
         with self.get_connection() as conn:

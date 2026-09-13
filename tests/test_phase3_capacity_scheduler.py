@@ -1,9 +1,13 @@
 """Focused Phase 3 Decypharr capacity, weighted fairness, and status tests."""
 
+import os
+import tempfile
 import threading
 import time
 import unittest
 from unittest import mock
+
+os.environ.setdefault("HUNTARR_CONFIG_DIR", tempfile.mkdtemp(prefix="huntarr_phase3_capacity_"))
 
 from src.primary.apps._common import queue_dispatch
 from src.primary.apps._common.shared_scheduler import WeightedDispatchScheduler, get_shared_scheduler
@@ -75,6 +79,30 @@ class DecypharrCapacityTests(unittest.TestCase):
         result = decypharr_capacity.get_capacity({})
         self.assertFalse(result["enabled"])
         self.assertTrue(result["fail_open"])
+
+    def test_only_one_concurrent_waiter_can_reserve_final_decypharr_slot(self):
+        with mock.patch.object(decypharr_capacity, "_read_capacity", return_value={
+            "healthy": True, "active": 1, "limit": 2, "free": 1,
+            "reason": "Decypharr 1/2 active",
+        }):
+            decypharr_capacity.get_capacity(self.config, monotonic=lambda: 0)
+        barrier = threading.Barrier(3)
+        results = []
+
+        def reserve():
+            barrier.wait()
+            results.append(decypharr_capacity.try_reserve_slot(
+                self.config, monotonic=lambda: 1,
+            ))
+
+        threads = [threading.Thread(target=reserve) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(2)
+        self.assertEqual(sum(result is False for result in results), 1)
+        self.assertEqual(sum(result not in (False, None) for result in results), 1)
 
 
 class WeightedSchedulerTests(unittest.TestCase):
@@ -201,6 +229,99 @@ class DispatchCapacityStatusTests(unittest.TestCase):
         self.assertEqual(runtime["decypharr"], unavailable)
         self.assertIsNone(runtime["pause_reason"])
         self.assertIn("fail-open", runtime["decypharr"]["reason"])
+
+    def test_exception_after_scheduler_grant_cannot_leak_grant(self):
+        context = self.configure()
+        with mock.patch.object(queue_dispatch, "_occupancy", side_effect=[
+                (0, 0, 0, 0), RuntimeError("final Starr refresh failed")]), \
+             mock.patch.object(queue_dispatch, "_decypharr_capacity", return_value={
+                 "enabled": True, "healthy": True, "free": 2, "fail_open": False,
+                 "reason": "Decypharr 0/2 active",
+             }):
+            with self.assertRaisesRegex(RuntimeError, "final Starr refresh failed"):
+                queue_dispatch.acquire_dispatch_slot()
+        self.assertFalse(context.scheduler_held)
+        self.assertIsNone(get_shared_scheduler()._holder)
+
+    def test_cancel_unwinds_scheduler_budget_and_decypharr_reservations_once(self):
+        context = self.configure()
+        context.scheduler_held = True
+        context.budget_reserved = True
+        context.decypharr_reservation = object()
+        with mock.patch.object(get_shared_scheduler(), "release") as release_grant, \
+             mock.patch("src.primary.stats_manager.release_hourly_cap_reservation") as release_budget, \
+             mock.patch("src.primary.apps.swaparr.decypharr_capacity.release_reservation") as release_decy:
+            queue_dispatch.cancel_dispatch_slot()
+            queue_dispatch.cancel_dispatch_slot()
+        release_grant.assert_called_once_with("sonarr", "s")
+        release_budget.assert_called_once_with("sonarr", "s")
+        release_decy.assert_called_once()
+        self.assertFalse(context.scheduler_held)
+        self.assertFalse(context.budget_reserved)
+        self.assertIsNone(context.decypharr_reservation)
+
+    def test_final_grant_check_rejects_newly_full_decypharr_capacity(self):
+        self.configure()
+        available = {"enabled": True, "healthy": True, "free": 1, "fail_open": False,
+                     "reason": "Decypharr 1/2 active"}
+        full = {"enabled": True, "healthy": True, "free": 0, "fail_open": False,
+                "reason": "Decypharr 2/2 active"}
+        with mock.patch.object(queue_dispatch, "_decypharr_capacity",
+                               side_effect=[available, full]) as capacity, \
+             mock.patch("src.primary.stats_manager.try_reserve_hourly_cap") as reserve_budget:
+            self.assertFalse(queue_dispatch.acquire_dispatch_slot())
+        self.assertEqual(capacity.call_args_list[-1].kwargs, {"force": True})
+        reserve_budget.assert_not_called()
+        self.assertIn("Decypharr capacity full after grant",
+                      self.pipeline.runtime_values[("sonarr", "s")]["pause_reason"])
+
+    def test_final_grant_check_rejects_consumed_last_hourly_token(self):
+        self.configure()
+        decy = {"enabled": True, "healthy": True, "free": 2, "fail_open": False,
+                "reason": "Decypharr 0/2 active"}
+        with mock.patch.object(queue_dispatch, "_decypharr_capacity", return_value=decy), \
+             mock.patch.object(queue_dispatch, "_search_budget", side_effect=[
+                 {"remaining": 1, "limit": 5, "used": 4},
+                 {"remaining": 0, "limit": 5, "used": 5},
+             ]), \
+             mock.patch("src.primary.stats_manager.try_reserve_hourly_cap") as reserve_budget:
+            self.assertFalse(queue_dispatch.acquire_dispatch_slot())
+        reserve_budget.assert_not_called()
+        self.assertIn("search budget exhausted after grant",
+                      self.pipeline.runtime_values[("sonarr", "s")]["pause_reason"])
+
+    def test_atomic_hourly_reservation_allows_only_final_token(self):
+        from src.primary import stats_manager
+
+        class BudgetDB:
+            def __init__(self):
+                self.used = 4
+
+            def get_hourly_caps_per_instance(self, _app):
+                return {"s": {"api_hits": self.used}}
+
+            def increment_hourly_cap_per_instance(self, _app, _instance, count):
+                self.used += count
+
+        database = BudgetDB()
+        barrier = threading.Barrier(3)
+        results = []
+
+        def reserve():
+            barrier.wait()
+            results.append(stats_manager.try_reserve_hourly_cap("sonarr", "s"))
+
+        with mock.patch.object(stats_manager, "get_database", return_value=database), \
+             mock.patch.object(stats_manager, "_get_instance_hourly_cap_limit", return_value=5), \
+             mock.patch.object(stats_manager, "check_hourly_reset"):
+            threads = [threading.Thread(target=reserve) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join(2)
+        self.assertCountEqual(results, [True, False])
+        self.assertEqual(database.used, 5)
 
     def test_search_budget_is_part_of_minimum_gate(self):
         self.configure()
