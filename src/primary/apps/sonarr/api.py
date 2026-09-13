@@ -865,8 +865,8 @@ def search_episode(api_url: str, api_key: str, api_timeout: int, episode_ids: Li
         sonarr_logger.error(f"Error checking hourly API cap: {e}")
 
     from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot, claim_search, finish_search_claim
-    item_key = "episodes:" + ",".join(str(item) for item in sorted(episode_ids))
-    if not claim_search(item_key):
+    item_keys = [f"episodes:{item}" for item in sorted(set(episode_ids))]
+    if not claim_search(item_keys):
         return None
     if not acquire_dispatch_slot():
         finish_search_claim("timed_out", cooldown_seconds=60)

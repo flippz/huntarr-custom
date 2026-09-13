@@ -773,6 +773,7 @@ def app_specific_loop(app_type: str) -> None:
             if app_type in ("sonarr", "radarr"):
                 try:
                     from src.primary.apps._common.queue_dispatch import configure_dispatch
+                    from src.primary.apps.swaparr.handler import get_queue_items as get_shared_queue_items
                     active_search_count = getattr(api_module, "get_active_search_command_count")
                     combined_settings["max_download_queue_size"] = max_queue_size
                     configure_dispatch(
@@ -782,6 +783,9 @@ def app_specific_loop(app_type: str) -> None:
                         stop_check=stop_check_func,
                         logger=app_logger,
                         queue_cache_name=instance_name,
+                        queue_items=lambda: get_shared_queue_items(
+                            app_type, api_url, api_key, api_timeout,
+                        ),
                     )
                 except Exception as e:
                     app_logger.error("Unable to configure safe queue dispatch for %s: %s", instance_name, e)

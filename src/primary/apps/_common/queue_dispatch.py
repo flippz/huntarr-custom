@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Iterable, Optional, Union
 
 from src.primary.apps._common.pipeline_state import get_pipeline_state
 
@@ -27,11 +27,13 @@ class DispatchContext:
     queue_size: Callable[[], int]
     active_searches: Callable[[], int]
     logger: object
+    queue_cache_name: Optional[str] = None
     recent_submissions: list = field(default_factory=list)
     last_submission: float = 0.0
     queue_status: Optional[Callable[[], tuple]] = None
     poll_interval: float = 5.0
-    current_item_key: Optional[str] = None
+    last_capacity: Optional[tuple] = None
+    current_item_keys: list = field(default_factory=list)
 
 
 _local = threading.local()
@@ -43,7 +45,8 @@ _RECENT_GRACE_SECONDS = 120.0
 def configure_dispatch(app_type: str, instance_name: str, settings: dict,
                        queue_size: Callable[[], int], active_searches: Callable[[], int],
                        stop_check: Callable[[], bool], logger,
-                       queue_cache_name: Optional[str] = None) -> DispatchContext:
+                       queue_cache_name: Optional[str] = None,
+                       queue_items: Optional[Callable[[], list]] = None) -> DispatchContext:
     """Configure queue dispatch for the current instance worker thread."""
     def _integer(name, default, minimum):
         try:
@@ -63,26 +66,33 @@ def configure_dispatch(app_type: str, instance_name: str, settings: dict,
         cache_name = str(queue_cache_name or instance_name)
 
         def _fetch_status():
-            queue = queue_size()
+            records = queue_items() if queue_items is not None else None
+            if queue_items is not None and records is None:
+                raise RuntimeError("queue records unavailable")
+            queue = len(records) if records is not None else queue_size()
             active = active_searches()
             if queue < 0 or active < 0:
                 raise RuntimeError("queue/command status unavailable")
-            return {"queue": queue, "active": active}
+            return {"records": records, "queue": queue, "active": active}
 
         def _queue_status():
             value = get_pipeline_state().observe_queue(app_type, cache_name, _fetch_status)
-            # Swaparr may have just populated the shared cache with normalized queue
-            # records. Reuse that queue observation and only poll the command endpoint.
-            if isinstance(value, list):
-                active = active_searches()
-                return (len(value), active if active >= 0 else -1)
-            if not isinstance(value, dict):
+            if not value.get("healthy"):
                 return -1, -1
-            return int(value.get("queue", -1)), int(value.get("active", -1))
+            queue = value.get("queue")
+            active = value.get("active")
+            # Swaparr may have populated the shared cache first. Reuse its full queue
+            # observation and fetch only the independent command-capacity endpoint.
+            if active is None:
+                active = active_searches()
+                if active >= 0:
+                    get_pipeline_state().merge_queue(app_type, cache_name, active=active)
+            return (int(queue) if queue is not None else -1,
+                    int(active) if active is not None else -1)
 
         context = DispatchContext(app_type, str(instance_name), target, maximum,
                                   interval, redispatch, stop_check, queue_size,
-                                  active_searches, logger, recent, last,
+                                  active_searches, logger, cache_name, recent, last,
                                   queue_status=_queue_status)
         _contexts[key] = context
     _local.context = context
@@ -141,6 +151,8 @@ def acquire_dispatch_slot() -> bool:
                 )
                 return False
             last_reason = "queue/command status unavailable"
+            # The shared cache owns unhealthy 30..300s backoff. Avoid forcing a fresh
+            # request here; this loop merely waits before consulting that cache again.
             context.poll_interval = min(300.0, max(30.0, context.poll_interval * 2.0))
         elif context.max_queue_size >= 0 and queue >= context.max_queue_size:
             reason = f"download queue {queue} reached hard ceiling {context.max_queue_size}"
@@ -157,9 +169,7 @@ def acquire_dispatch_slot() -> bool:
         elif occupancy >= context.target_depth:
             last_reason = (f"effective occupancy {occupancy}/{context.target_depth} "
                            f"(queue={queue}, active searches={active}, recent reservations={recent})")
-            context.poll_interval = 5.0
         else:
-            context.poll_interval = min(30.0, max(5.0, context.poll_interval * 1.5))
             interval_left = context.minimum_interval - (now - context.last_submission)
             if interval_left <= 0:
                 get_pipeline_state().set_runtime(
@@ -175,6 +185,15 @@ def acquire_dispatch_slot() -> bool:
                 )
                 return True
             last_reason = f"minimum dispatch interval ({interval_left:.1f}s remaining)"
+
+        if occupancy is not None:
+            capacity = (queue, active, recent, occupancy >= context.target_depth,
+                        context.max_queue_size >= 0 and queue >= context.max_queue_size)
+            if context.last_capacity is None or capacity != context.last_capacity:
+                context.poll_interval = 5.0
+            else:
+                context.poll_interval = min(30.0, max(5.0, context.poll_interval * 1.5))
+            context.last_capacity = capacity
 
         remaining = deadline - now
         if remaining <= 0:
@@ -208,32 +227,34 @@ def record_submission() -> None:
         context.recent_submissions.append(now)
 
 
-def claim_search(item_key: str) -> bool:
-    """Atomically reserve an item before dispatch, blocking unresolved duplicates."""
+def claim_search(item_keys: Union[str, Iterable[str]]) -> bool:
+    """Atomically reserve every media item in a command, blocking partial batches."""
     context: Optional[DispatchContext] = getattr(_local, "context", None)
     if context is None:
         return True
-    claimed = get_pipeline_state().claim_candidate(
-        context.app_type, context.instance_name, str(item_key),
+    keys = [item_keys] if isinstance(item_keys, str) else list(item_keys)
+    keys = list(dict.fromkeys(str(item_key) for item_key in keys))
+    claimed = get_pipeline_state().claim_candidates(
+        context.app_type, context.instance_name, keys,
         cooldown_seconds=max(300, int(context.redispatch_wait)),
     )
-    context.current_item_key = str(item_key) if claimed else None
+    context.current_item_keys = keys if claimed else []
     if not claimed:
-        context.logger.info("Search deferred for %s: item %s already unresolved or cooling down",
-                            context.instance_name, item_key)
+        context.logger.info("Search deferred for %s: one or more items already unresolved or cooling down: %s",
+                            context.instance_name, ", ".join(keys))
     return claimed
 
 
 def finish_search_claim(state: str, command_id=None, cooldown_seconds: Optional[int] = None) -> None:
     context: Optional[DispatchContext] = getattr(_local, "context", None)
-    if context is None or not context.current_item_key:
+    if context is None or not context.current_item_keys:
         return
-    get_pipeline_state().transition(
-        context.app_type, context.instance_name, context.current_item_key, state,
+    get_pipeline_state().transition_items(
+        context.app_type, context.instance_name, context.current_item_keys, state,
         command_id=command_id, cooldown_seconds=cooldown_seconds,
     )
     if state in {"completed", "no_grab", "failed", "timed_out"}:
-        context.current_item_key = None
+        context.current_item_keys = []
 
 
 def mark_command(command_id, state: str, cooldown_seconds: Optional[int] = None) -> bool:

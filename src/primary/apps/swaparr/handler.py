@@ -196,22 +196,26 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
                 lifecycle_instance = str(instance_data.get("instance_id") or instance_name)
                 episode = record.get("episode") or {}
                 series_id = record.get("seriesId") or (record.get("series") or {}).get("id")
-                if series_id is not None and episode.get("seasonNumber") is not None:
-                    pipeline_key = "season:%s:%s" % (series_id, episode["seasonNumber"])
-                elif episode.get("id") is not None:
+                if episode.get("id") is not None:
                     pipeline_key = "episodes:" + str(episode["id"])
+                elif series_id is not None and episode.get("seasonNumber") is not None:
+                    pipeline_key = "season:%s:%s" % (series_id, episode["seasonNumber"])
                 else:
                     pipeline_key = "queue:" + str(download_id)
-                pipeline.claim_candidate(app_name, lifecycle_instance, pipeline_key, cooldown_seconds=0)
+                claimed = pipeline.claim_candidate(
+                    app_name, lifecycle_instance, pipeline_key, cooldown_seconds=0,
+                )
                 torrent = torrent_statuses.get((download_id or "").lower())
                 torrent_note = f" (torrent client status: {torrent.get('state')})" if torrent else ""
 
                 if record.get("eventType") == "downloadFolderImported":
-                    pipeline.transition(app_name, lifecycle_instance, pipeline_key, "imported")
-                    pipeline.transition(app_name, lifecycle_instance, pipeline_key, "completed", cooldown_seconds=300)
+                    if claimed:
+                        pipeline.transition(app_name, lifecycle_instance, pipeline_key, "imported")
+                        pipeline.transition(app_name, lifecycle_instance, pipeline_key, "completed", cooldown_seconds=300)
                     log_activity_event(app_name, instance_name, download_id, name, "completed")
                 else:
-                    pipeline.transition(app_name, lifecycle_instance, pipeline_key, "failed", cooldown_seconds=300)
+                    if claimed:
+                        pipeline.transition(app_name, lifecycle_instance, pipeline_key, "failed", cooldown_seconds=300)
                     # Sonarr's own message for this event is the most direct signal available
                     # (e.g. a download client error or "Manually marked as failed"); surface it
                     # before falling back to the generic label.
@@ -497,7 +501,9 @@ def get_queue_items(app_name, api_url, api_key, api_timeout=120):
         except requests.exceptions.RequestException as e:
             swaparr_logger.error(f"Error fetching queue for {app_name} (page {page}): {str(e)}")
             SWAPARR_STATS['errors_encountered'] += 1
-            break
+            # Never publish a partial/empty queue as healthy. Callers use this failure to
+            # retain the previous observation and apply the shared unhealthy backoff.
+            raise RuntimeError(f"queue fetch failed for {app_name} page {page}") from e
     
     swaparr_logger.debug(f"Fetched {len(all_records)} queue items for {app_name} using {page} API calls")
     
@@ -567,6 +573,29 @@ def parse_queue_items(records, item_type, app_name):
         })
     
     return queue_items
+
+
+def pipeline_key_for_queue_item(app_name, item):
+    """Return the same per-media key used by Huntarr search submission."""
+    if app_name == "radarr" and item.get("media_id") is not None:
+        return "movies:" + str(item["media_id"])
+    if app_name == "sonarr" and item.get("episode_id") is not None:
+        return "episodes:" + str(item["episode_id"])
+    if (app_name == "sonarr" and item.get("media_id") is not None
+            and item.get("season_number") is not None):
+        return "season:%s:%s" % (item["media_id"], item["season_number"])
+    return "queue:" + str(item.get("download_id") or item.get("id"))
+
+
+def record_queue_lifecycle(pipeline, app_name, instance_name, item, state="downloading"):
+    """Claim and transition one Swaparr row without mutating a failed claim."""
+    item_key = pipeline_key_for_queue_item(app_name, item)
+    claimed = pipeline.claim_candidate(
+        app_name, str(instance_name), item_key, cooldown_seconds=0,
+    )
+    if claimed:
+        pipeline.transition(app_name, str(instance_name), item_key, state)
+    return claimed, item_key
 
 def trigger_search_for_item(app_name, api_url, api_key, item, api_timeout=120):
     """Trigger a search for the item that was removed"""
@@ -740,9 +769,21 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
         lifecycle_instance = str(instance_data.get("instance_id") or instance_name)
         queue_response = pipeline.observe_queue(
             app_name, instance_name,
-            lambda: get_queue_items(app_name, instance_data["api_url"], instance_data["api_key"]),
+            lambda: get_queue_items(
+                app_name, instance_data["api_url"], instance_data["api_key"],
+                instance_data.get("api_timeout", 120),
+            ),
+            require_records=True,
         )
-        queue_items = queue_response
+        # Never act on retained stale rows after a failed poll: queue deletion decisions
+        # require a current healthy observation.
+        if not queue_response.get("healthy"):
+            swaparr_logger.warning(
+                "Skipping Swaparr processing for %s/%s: shared queue observation is unhealthy",
+                app_name, instance_name,
+            )
+            return 0
+        queue_items = queue_response.get("records") or []
 
         if len(queue_items) == 0:
             return 0
@@ -783,16 +824,7 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             # Queue presence is durable evidence that this item reached downloading.
             # Keep Swaparr's queue rows separate from Huntarr media candidate keys while
             # recording both in the shared lifecycle table.
-            if app_name == "radarr" and item.get("media_id") is not None:
-                pipeline_key = "movies:" + str(item["media_id"])
-            elif app_name == "sonarr" and item.get("media_id") is not None and item.get("season_number") is not None:
-                pipeline_key = "season:%s:%s" % (item["media_id"], item["season_number"])
-            elif app_name == "sonarr" and item.get("episode_id") is not None:
-                pipeline_key = "episodes:" + str(item["episode_id"])
-            else:
-                pipeline_key = "queue:" + str(item.get("download_id") or item_id)
-            pipeline.claim_candidate(app_name, lifecycle_instance, pipeline_key, cooldown_seconds=0)
-            pipeline.transition(app_name, lifecycle_instance, pipeline_key, "downloading")
+            record_queue_lifecycle(pipeline, app_name, lifecycle_instance, item)
 
             SWAPARR_STATS['total_processed'] += 1
             if not settings.get("dry_run", False):

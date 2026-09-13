@@ -159,6 +159,28 @@ class SearchCapTests(unittest.TestCase):
         self.assertEqual(command_id, 456)
         increment.assert_called_once_with("radarr", 1, instance_name="instance-2")
 
+    @mock.patch("src.primary.stats_manager.increment_hourly_cap")
+    @mock.patch("src.primary.stats_manager.check_hourly_cap_exceeded", return_value=False)
+    @mock.patch.object(sonarr_api.requests, "post", return_value=_Response())
+    def test_sonarr_episode_batch_claims_each_episode_key(self, _post, _check, _increment):
+        with mock.patch.object(queue_dispatch, "claim_search", return_value=True) as claim:
+            self.assertEqual(
+                sonarr_api.search_episode("http://sonarr", "key", 10, [8, 3, 8]),
+                123,
+            )
+        claim.assert_called_once_with(["episodes:3", "episodes:8"])
+
+    @mock.patch("src.primary.stats_manager.increment_hourly_cap")
+    @mock.patch("src.primary.stats_manager.check_hourly_cap_exceeded", return_value=False)
+    @mock.patch.object(radarr_api, "arr_request", return_value={"id": 456})
+    def test_radarr_batch_claims_each_movie_key(self, _request, _check, _increment):
+        fake_logger = types.ModuleType("src.primary.utils.clean_logger")
+        fake_logger.get_instance_name_for_cap = lambda: "instance-2"
+        with mock.patch.dict(sys.modules, {"src.primary.utils.clean_logger": fake_logger}), \
+             mock.patch.object(queue_dispatch, "claim_search", return_value=True) as claim:
+            self.assertEqual(radarr_api.movie_search("http://radarr", "key", 10, [9, 2, 9]), 456)
+        claim.assert_called_once_with(["movies:2", "movies:9"])
+
     def test_command_status_polling_is_explicitly_uncounted(self):
         with mock.patch.object(radarr_api, "arr_request", return_value={"state": "completed"}) as request:
             self.assertTrue(radarr_api.wait_for_command("http://radarr", "key", 10, 4, 0, 1))

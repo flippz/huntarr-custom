@@ -462,8 +462,8 @@ def movie_search(api_url: str, api_key: str, api_timeout: int, movie_ids: List[i
         return None
 
     from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot, claim_search, finish_search_claim
-    item_key = "movies:" + ",".join(str(item) for item in sorted(movie_ids))
-    if not claim_search(item_key):
+    item_keys = [f"movies:{item}" for item in sorted(set(movie_ids))]
+    if not claim_search(item_keys):
         return None
     if not acquire_dispatch_slot():
         finish_search_claim("timed_out", cooldown_seconds=60)
