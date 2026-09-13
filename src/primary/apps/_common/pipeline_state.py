@@ -402,26 +402,51 @@ class PipelineState:
             return []
         now = int(self._clock())
         changed = []
-        saw_existing = False
         active_states = tuple(sorted(UNRESOLVED_STATES - {"imported"}))
         with self.db.get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            for item_key in keys:
-                row = conn.execute(
-                    "SELECT state,metadata FROM pipeline_items WHERE app_type=? AND instance_name=? AND item_key=?",
-                    (str(app_type), str(instance_name), item_key),
-                ).fetchone()
+            rows = conn.execute(
+                "SELECT item_key,state,metadata FROM pipeline_items WHERE app_type=? AND instance_name=?",
+                (str(app_type), str(instance_name)),
+            ).fetchall()
+            by_key = {str(key): (state, old_metadata) for key, state, old_metadata in rows}
+
+            def can_activate(row):
                 if not row:
-                    continue
-                saw_existing = True
+                    return False
                 state, old_metadata = row
                 old = self._metadata_dict(old_metadata)
-                can_reopen_retry = (
+                return state in active_states or (
                     state == "failed" and download_id and
                     str(download_id) != str(old.get("failed_download_id") or old.get("download_id") or "")
                 )
-                if state not in active_states and not can_reopen_retry:
-                    continue
+
+            exact_direct = [
+                key for key in keys if can_activate(by_key.get(key))
+                and key.split(":", 1)[0] in {"episodes", "movies"}
+            ]
+            has_strong_direct = any(
+                key.split(":", 1)[0] in {"episodes", "movies"} for key in keys
+            )
+            download_matches = []
+            if download_id:
+                download_matches = [
+                    key for key, row in by_key.items() if can_activate(row)
+                    and str(self._metadata_dict(row[1]).get("download_id") or "").lower()
+                    == str(download_id).lower()
+                ]
+            selected = list(dict.fromkeys(exact_direct + download_matches))
+            if not selected and not has_strong_direct:
+                broader_direct = [
+                    key for key in keys if can_activate(by_key.get(key))
+                    and key.split(":", 1)[0] in {"season", "series", "queue"}
+                ]
+                selected = broader_direct if len(broader_direct) == 1 else []
+
+            for item_key in selected:
+                state, old_metadata = by_key[item_key]
+                old = self._metadata_dict(old_metadata)
+                can_reopen_retry = state == "failed"
                 merged = self._metadata_json(
                     metadata or old_metadata, download_id=str(download_id or "")[:128],
                     title=str(title or "")[:512],
@@ -429,7 +454,7 @@ class PipelineState:
                     reason=("replacement active in Starr queue" if can_reopen_retry else None),
                 )
                 cursor = conn.execute(
-                    "UPDATE pipeline_items SET state='downloading', metadata=?, updated_at_epoch=?, "
+                    "UPDATE pipeline_items SET state='downloading', command_id=NULL, metadata=?, updated_at_epoch=?, "
                     "updated_at=CURRENT_TIMESTAMP WHERE app_type=? AND instance_name=? AND item_key=?",
                     (merged, now, str(app_type), str(instance_name), item_key),
                 )
@@ -440,7 +465,7 @@ class PipelineState:
                         "VALUES(?,?,?,'downloading',?,?)",
                         (str(app_type), str(instance_name), item_key, merged, now),
                     )
-        return changed if saw_existing else None
+        return changed if any(key in by_key for key in keys) or download_matches else None
 
     def fail_correlated_items(self, app_type: str, instance_name: str, item_keys,
                               download_id: Optional[str], title: Optional[str],
@@ -460,15 +485,30 @@ class PipelineState:
                 (str(app_type), str(instance_name), *unresolved),
             ).fetchall()
             by_key = {str(key): metadata for key, metadata in rows}
-            selected = [key for key in direct if key in by_key]
+            exact_direct = [
+                key for key in direct if key in by_key
+                and key.split(":", 1)[0] in {"episodes", "movies"}
+            ]
+            has_strong_direct = any(
+                key.split(":", 1)[0] in {"episodes", "movies"} for key in direct
+            )
             if download_id:
                 download_matches = [
                     str(key) for key, metadata in rows
                     if str(self._metadata_dict(metadata).get("download_id") or "").lower()
                     == str(download_id).lower()
                 ]
-                selected = list(dict.fromkeys(selected + download_matches))
-            if not selected and title:
+            else:
+                download_matches = []
+            selected = list(dict.fromkeys(exact_direct + download_matches))
+            if not selected and not has_strong_direct:
+                broader_direct = [
+                    key for key in direct if key in by_key
+                    and key.split(":", 1)[0] in {"season", "series", "queue"}
+                ]
+                # A broad media key is safe only when it is the sole possible direct row.
+                selected = broader_direct if len(broader_direct) == 1 else []
+            if not selected and not has_strong_direct and title:
                 normalized = str(title).strip().casefold()
                 matches = [
                     str(key) for key, metadata in rows
@@ -514,6 +554,89 @@ class PipelineState:
                         (str(app_type), str(instance_name), item_key, merged, now),
                     )
             return selected
+
+    def complete_correlated_items(self, app_type: str, instance_name: str, item_keys,
+                                  download_id: Optional[str], title: Optional[str],
+                                  cooldown_seconds: int = 300) -> list:
+        """Close every strongly correlated unresolved row as imported then completed."""
+        direct = list(dict.fromkeys(str(key) for key in item_keys if key))
+        now = int(self._clock())
+        cooldown = now + max(0, int(cooldown_seconds))
+        unresolved = tuple(sorted(UNRESOLVED_STATES))
+        placeholders = ",".join("?" for _ in unresolved)
+        with self.db.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT item_key,state,metadata FROM pipeline_items WHERE app_type=? AND instance_name=? "
+                f"AND state IN ({placeholders})",
+                (str(app_type), str(instance_name), *unresolved),
+            ).fetchall()
+            by_key = {str(key): (state, metadata) for key, state, metadata in rows}
+            exact_direct = [
+                key for key in direct if key in by_key
+                and key.split(":", 1)[0] in {"episodes", "movies"}
+            ]
+            has_strong_direct = any(
+                key.split(":", 1)[0] in {"episodes", "movies"} for key in direct
+            )
+            download_matches = []
+            if download_id:
+                download_matches = [
+                    str(key) for key, _state, metadata in rows
+                    if str(self._metadata_dict(metadata).get("download_id") or "").lower()
+                    == str(download_id).lower()
+                ]
+            selected = list(dict.fromkeys(exact_direct + download_matches))
+            if not selected and not has_strong_direct:
+                broader_direct = [
+                    key for key in direct if key in by_key
+                    and key.split(":", 1)[0] in {"season", "series", "queue"}
+                ]
+                selected = broader_direct if len(broader_direct) == 1 else []
+            if not selected and not has_strong_direct and title:
+                normalized = str(title).strip().casefold()
+                matches = [
+                    str(key) for key, _state, metadata in rows
+                    if str(self._metadata_dict(metadata).get("title") or "").strip().casefold()
+                    == normalized
+                ]
+                selected = matches if len(matches) == 1 else []
+            completed = []
+            for item_key in selected:
+                state, old_metadata = by_key[item_key]
+                merged = self._metadata_json(
+                    old_metadata, source="history_import",
+                    download_id=str(download_id or "")[:128],
+                    title=str(title or "")[:512], reason="import completed",
+                )
+                if state != "imported":
+                    cursor = conn.execute(
+                        "UPDATE pipeline_items SET state='imported',command_id=NULL,metadata=?,"
+                        "updated_at_epoch=?,updated_at=CURRENT_TIMESTAMP WHERE app_type=? AND instance_name=? "
+                        f"AND item_key=? AND state IN ({placeholders})",
+                        (merged, now, str(app_type), str(instance_name), item_key, *unresolved),
+                    )
+                    if cursor.rowcount != 1:
+                        continue
+                    conn.execute(
+                        "INSERT INTO pipeline_item_events(app_type,instance_name,item_key,state,metadata,occurred_at_epoch) "
+                        "VALUES(?,?,?,'imported',?,?)",
+                        (str(app_type), str(instance_name), item_key, merged, now),
+                    )
+                cursor = conn.execute(
+                    "UPDATE pipeline_items SET state='completed',command_id=NULL,metadata=?,"
+                    "cooldown_until_epoch=?,updated_at_epoch=?,updated_at=CURRENT_TIMESTAMP "
+                    "WHERE app_type=? AND instance_name=? AND item_key=? AND state='imported'",
+                    (merged, cooldown, now, str(app_type), str(instance_name), item_key),
+                )
+                if cursor.rowcount == 1:
+                    completed.append(item_key)
+                    conn.execute(
+                        "INSERT INTO pipeline_item_events(app_type,instance_name,item_key,state,metadata,occurred_at_epoch) "
+                        "VALUES(?,?,?,'completed',?,?)",
+                        (str(app_type), str(instance_name), item_key, merged, now),
+                    )
+            return completed
 
     def mark_retry_requested(self, app_type: str, instance_name: str, item_keys,
                              command_id: str, retry_owner: str = "swaparr") -> list:
@@ -698,20 +821,21 @@ class PipelineState:
             return {"duplicate": False, "transitioned": transitioned}
 
     def transition_command(self, app_type: str, command_id: str, state: str,
-                           cooldown_seconds: Optional[int] = None) -> bool:
+                           cooldown_seconds: Optional[int] = None,
+                           expected_states=None) -> bool:
         if state not in LIFECYCLE_STATES:
             raise ValueError(f"invalid pipeline lifecycle state: {state}")
         now = int(self._clock())
         cooldown = now + max(0, int(cooldown_seconds or 0)) if cooldown_seconds is not None else None
-        unresolved = tuple(sorted(UNRESOLVED_STATES))
-        placeholders = ",".join("?" for _ in unresolved)
+        allowed = tuple(sorted(expected_states if expected_states is not None else UNRESOLVED_STATES))
+        placeholders = ",".join("?" for _ in allowed)
         with self.db.get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 "SELECT instance_name,item_key FROM pipeline_items "
                 "WHERE app_type=? AND command_id=? "
                 f"AND state IN ({placeholders})",
-                (str(app_type), str(command_id), *unresolved),
+                (str(app_type), str(command_id), *allowed),
             ).fetchall()
             if not rows:
                 return False
@@ -719,7 +843,7 @@ class PipelineState:
                 "UPDATE pipeline_items SET state=?, cooldown_until_epoch=COALESCE(?,cooldown_until_epoch), "
                 "updated_at_epoch=?, updated_at=CURRENT_TIMESTAMP WHERE app_type=? AND command_id=? "
                 f"AND state IN ({placeholders})",
-                (state, cooldown, now, str(app_type), str(command_id), *unresolved),
+                (state, cooldown, now, str(app_type), str(command_id), *allowed),
             )
             for instance_name, item_key in rows:
                 conn.execute(

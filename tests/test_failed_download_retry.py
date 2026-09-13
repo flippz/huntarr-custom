@@ -155,7 +155,10 @@ class LifecycleCorrelationTests(unittest.TestCase):
 
     def test_queue_ids_correlate_episode_season_and_movie(self):
         for key in ("episodes:4080", "season:7:4"):
-            self.pipeline.claim_candidate("sonarr", "one", key, cooldown_seconds=0)
+            self.pipeline.claim_candidate(
+                "sonarr", "one", key, cooldown_seconds=0,
+                metadata=json.dumps({"download_id": "download-a"}),
+            )
             self.pipeline.transition("sonarr", "one", key, "grabbed")
         keys = self.pipeline.fail_correlated_items(
             "sonarr", "one", ["episodes:4080", "season:7:4", "series:7"],
@@ -238,6 +241,139 @@ class LifecycleCorrelationTests(unittest.TestCase):
             self.pipeline.candidate_availability("sonarr", "one", ["episodes:8"])["unresolved"],
             ["episodes:8"],
         )
+
+    def test_active_replacement_detaches_command_and_cannot_be_retired_as_no_grab(self):
+        self.pipeline.claim_candidate("sonarr", "one", "episodes:18", cooldown_seconds=0)
+        self.pipeline.transition(
+            "sonarr", "one", "episodes:18", "downloading",
+            metadata=json.dumps({"download_id": "old"}),
+        )
+        keys = self.pipeline.fail_correlated_items(
+            "sonarr", "one", ["episodes:18"], "old", "Title", "swaparr",
+            cooldown_seconds=600,
+        )
+        self.pipeline.mark_retry_requested("sonarr", "one", keys, "77")
+        self.assertEqual(self.pipeline.pending_retry_commands("sonarr", "one"), ["77"])
+        self.assertEqual(self.pipeline.observe_active_items(
+            "sonarr", "one", ["episodes:18"], download_id="new", title="Title",
+        ), ["episodes:18"])
+        with self.pipeline.db.get_connection() as conn:
+            state, command_id = conn.execute(
+                "SELECT state,command_id FROM pipeline_items WHERE item_key='episodes:18'"
+            ).fetchone()
+        self.assertEqual((state, command_id), ("downloading", None))
+        self.now[0] = 2000
+        with mock.patch("src.primary.apps.sonarr.api.get_command_status", return_value={"status": "completed"}) as status:
+            handler.reconcile_replacement_commands(
+                self.pipeline, "sonarr", "one",
+                {"api_url": "http://sonarr", "api_key": "secret", "api_timeout": 30},
+                command_ids=["77"],
+            )
+        status.assert_not_called()
+        self.assertEqual(self._row("episodes:18")[0], "downloading")
+        self.assertEqual(
+            self.pipeline.candidate_availability("sonarr", "one", ["episodes:18"])["unresolved"],
+            ["episodes:18"],
+        )
+
+        # Defense in depth: even a stale legacy command ID on downloading cannot CAS
+        # to no_grab through completed-command reconciliation.
+        with self.pipeline.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE pipeline_items SET command_id='legacy-77' WHERE item_key='episodes:18'"
+            )
+        self.assertFalse(self.pipeline.transition_command(
+            "sonarr", "legacy-77", "no_grab", expected_states={"search_submitted"},
+        ))
+        self.assertEqual(self._row("episodes:18")[0], "downloading")
+
+    def test_success_closes_episode_season_and_series_across_restart(self):
+        metadata = json.dumps({"download_id": "success-download", "title": "Show.S04E10"})
+        keys = ["episodes:4080", "season:7:4", "series:7"]
+        for key in keys:
+            self.pipeline.claim_candidate("sonarr", "success", key, cooldown_seconds=0, metadata=metadata)
+            self.pipeline.transition(
+                "sonarr", "success", key, "downloading", command_id="88",
+            )
+        self.pipeline.claim_candidate("sonarr", "success", "episodes:999", cooldown_seconds=0)
+        self.pipeline.transition("sonarr", "success", "episodes:999", "completed")
+        self.assertEqual(self.pipeline.complete_correlated_items(
+            "sonarr", "success", keys, "SUCCESS-DOWNLOAD", "Show.S04E10",
+        ), keys)
+        restarted = PipelineState(db=self.pipeline.db, clock=lambda: self.now[0])
+        with restarted.db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT item_key,state,command_id FROM pipeline_items WHERE instance_name='success' "
+                "ORDER BY item_key"
+            ).fetchall()
+            events = conn.execute(
+                "SELECT item_key,state FROM pipeline_item_events WHERE instance_name='success' "
+                "AND item_key IN ('episodes:4080','season:7:4','series:7') "
+                "AND state IN ('imported','completed') ORDER BY item_key,id"
+            ).fetchall()
+        self.assertEqual(rows, [
+            ("episodes:4080", "completed", None),
+            ("episodes:999", "completed", None),
+            ("season:7:4", "completed", None),
+            ("series:7", "completed", None),
+        ])
+        self.assertEqual(len(events), 6)
+
+    def test_strong_id_does_not_fail_unrelated_broad_claims_or_release_their_memory(self):
+        rows = {
+            "episodes:4080": "target-download",
+            "season:7:4": "other-season-download",
+            "series:7": "other-series-download",
+            "season:8:1": "target-download",
+        }
+        for key, download_id in rows.items():
+            self.pipeline.claim_candidate(
+                "sonarr", "strict", key, cooldown_seconds=0,
+                metadata=json.dumps({"download_id": download_id}),
+            )
+            self.pipeline.transition("sonarr", "strict", key, "downloading")
+        state_db = mock.Mock()
+        state_db.remove_processed_ids.return_value = 2
+        item = {
+            "episode_id": 4080, "episode_ids": [4080], "series_id": 7,
+            "season_number": 4, "download_id": "target-download", "name": "Target",
+        }
+        with mock.patch.object(handler, "get_database", return_value=state_db):
+            correlated = handler.correlate_failed_download(
+                self.pipeline, "sonarr", "strict", item, "starr", cooldown_seconds=600,
+            )
+        self.assertEqual(correlated, ["episodes:4080", "season:8:1"])
+        self.assertEqual(self._row("season:7:4")[0], "downloading")
+        self.assertEqual(self._row("series:7")[0], "downloading")
+        state_db.remove_processed_ids.assert_called_once_with(
+            "sonarr", "strict", ["4080", "8_1"],
+        )
+
+    def test_active_evidence_does_not_attach_unrelated_broad_claims(self):
+        rows = {
+            "episodes:4080": "old-target",
+            "season:7:4": "unrelated-season",
+            "series:7": "unrelated-series",
+            "season:8:1": "new-target",
+        }
+        for key, download_id in rows.items():
+            self.pipeline.claim_candidate(
+                "sonarr", "active-strict", key, cooldown_seconds=0,
+                metadata=json.dumps({"download_id": download_id}),
+            )
+            self.pipeline.transition("sonarr", "active-strict", key, "failed", cooldown_seconds=0)
+        changed = self.pipeline.observe_active_items(
+            "sonarr", "active-strict",
+            ["episodes:4080", "season:7:4", "series:7"],
+            download_id="new-target", title="Replacement",
+        )
+        self.assertEqual(changed, ["episodes:4080"])
+        with self.pipeline.db.get_connection() as conn:
+            states = dict(conn.execute(
+                "SELECT item_key,state FROM pipeline_items WHERE instance_name='active-strict'"
+            ).fetchall())
+        self.assertEqual(states["season:7:4"], "failed")
+        self.assertEqual(states["series:7"], "failed")
 
     def test_processed_memory_release_maps_exact_media_ids(self):
         db = mock.Mock()
@@ -325,6 +461,47 @@ class LifecycleCorrelationTests(unittest.TestCase):
         state, cooldown, metadata = self._row("episodes:4080")
         self.assertEqual((state, cooldown), ("failed", 1600))
         self.assertEqual(json.loads(metadata)["retry_owner"], "starr")
+
+    def test_history_import_closes_all_correlated_rows(self):
+        metadata = json.dumps({"download_id": "import-download", "title": "Show.S04E10"})
+        keys = ["episodes:4080", "season:7:4", "series:7"]
+        for key in keys:
+            self.pipeline.claim_candidate(
+                "sonarr", "import-instance", key, cooldown_seconds=0, metadata=metadata,
+            )
+            self.pipeline.transition("sonarr", "import-instance", key, "downloading")
+        history = {"records": [{
+            "id": 2, "date": "2026-09-13T17:01:00Z",
+            "eventType": "downloadFolderImported", "downloadId": "import-download",
+            "sourceTitle": "Show.S04E10", "seriesId": 7,
+            "episode": {"id": 4080, "seasonNumber": 4},
+        }]}
+        activity_db = mock.Mock()
+        activity_db.get_swaparr_state_data.return_value = {}
+        activity_db.has_recent_swaparr_activity.return_value = False
+        instance = {
+            "api_url": "http://sonarr", "api_key": "secret",
+            "instance_id": "import-instance",
+        }
+        nzbdav = types.ModuleType("src.primary.apps.nzbdav_routes")
+        nzbdav.get_nzbdav_failure_context = mock.Mock(return_value={})
+        with mock.patch.object(handler, "get_database", return_value=activity_db), \
+             mock.patch("src.primary.apps.sonarr.api.arr_request", return_value=history), \
+             mock.patch("src.primary.apps._common.pipeline_state.get_pipeline_state", return_value=self.pipeline), \
+             mock.patch("src.primary.apps.swaparr.torrent_status.get_torrent_statuses", return_value={}), \
+             mock.patch("src.primary.apps.swaparr.torrent_status.get_decypharr_failure_context", return_value={}), \
+             mock.patch.dict(sys.modules, {"src.primary.apps.nzbdav_routes": nzbdav}):
+            handler.scan_sonarr_history_for_activity("sonarr", "Display", instance)
+        with self.pipeline.db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT item_key,state,command_id FROM pipeline_items "
+                "WHERE instance_name='import-instance' ORDER BY item_key"
+            ).fetchall()
+        self.assertEqual(rows, [
+            ("episodes:4080", "completed", None),
+            ("season:7:4", "completed", None),
+            ("series:7", "completed", None),
+        ])
 
 
 if __name__ == "__main__":

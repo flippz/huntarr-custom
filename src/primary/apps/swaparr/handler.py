@@ -200,20 +200,18 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data,
                 pipeline = get_pipeline_state()
                 lifecycle_instance = str(instance_data.get("instance_id") or instance_name)
                 pipeline_keys = pipeline_keys_for_history_record(app_name, record)
-                pipeline_key = pipeline_keys[0]
                 torrent = torrent_statuses.get((download_id or "").lower())
                 torrent_note = f" (torrent client status: {torrent.get('state')})" if torrent else ""
 
                 if record.get("eventType") == "downloadFolderImported":
-                    claimed = pipeline.claim_candidate(
-                        app_name, lifecycle_instance, pipeline_key, cooldown_seconds=0,
+                    completed_keys = pipeline.complete_correlated_items(
+                        app_name, lifecycle_instance, pipeline_keys, download_id, name,
+                        cooldown_seconds=300,
                     )
-                    if claimed:
-                        pipeline.transition(app_name, lifecycle_instance, pipeline_key, "imported")
-                    else:
-                        pipeline.observe_transition(app_name, lifecycle_instance, pipeline_key, "imported")
-                    pipeline.observe_transition(
-                        app_name, lifecycle_instance, pipeline_key, "completed", cooldown_seconds=300,
+                    swaparr_logger.info(
+                        "Successful import lifecycle correlated for %s/%s: items=%s",
+                        app_name, lifecycle_instance,
+                        ",".join(completed_keys) or "none",
                     )
                     if not suppress_activity:
                         log_activity_event(app_name, instance_name, download_id, name, "completed")
@@ -737,13 +735,17 @@ def reconcile_replacement_commands(pipeline, app_name, instance_name, instance_d
         status = fetch(command_id)
         state = str((status or {}).get("state") or (status or {}).get("status") or "").lower()
         if state == "completed":
-            if pipeline.transition_command(app_name, command_id, "no_grab"):
+            if pipeline.transition_command(
+                app_name, command_id, "no_grab", expected_states={"search_submitted"},
+            ):
                 swaparr_logger.info(
                     "Replacement command %s completed with no active queue item: retry owner=huntarr-fallback after cooldown",
                     command_id,
                 )
         elif state in ("failed", "aborted", "cancelled"):
-            if pipeline.transition_command(app_name, command_id, "failed"):
+            if pipeline.transition_command(
+                app_name, command_id, "failed", expected_states={"search_submitted"},
+            ):
                 swaparr_logger.info(
                     "Replacement command %s ended as %s: retry owner=huntarr-fallback after cooldown",
                     command_id, state,
