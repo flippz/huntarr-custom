@@ -191,12 +191,27 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
                     continue
 
                 download_id = record.get("downloadId")
+                from src.primary.apps._common.pipeline_state import get_pipeline_state
+                pipeline = get_pipeline_state()
+                lifecycle_instance = str(instance_data.get("instance_id") or instance_name)
+                episode = record.get("episode") or {}
+                series_id = record.get("seriesId") or (record.get("series") or {}).get("id")
+                if series_id is not None and episode.get("seasonNumber") is not None:
+                    pipeline_key = "season:%s:%s" % (series_id, episode["seasonNumber"])
+                elif episode.get("id") is not None:
+                    pipeline_key = "episodes:" + str(episode["id"])
+                else:
+                    pipeline_key = "queue:" + str(download_id)
+                pipeline.claim_candidate(app_name, lifecycle_instance, pipeline_key, cooldown_seconds=0)
                 torrent = torrent_statuses.get((download_id or "").lower())
                 torrent_note = f" (torrent client status: {torrent.get('state')})" if torrent else ""
 
                 if record.get("eventType") == "downloadFolderImported":
+                    pipeline.transition(app_name, lifecycle_instance, pipeline_key, "imported")
+                    pipeline.transition(app_name, lifecycle_instance, pipeline_key, "completed", cooldown_seconds=300)
                     log_activity_event(app_name, instance_name, download_id, name, "completed")
                 else:
+                    pipeline.transition(app_name, lifecycle_instance, pipeline_key, "failed", cooldown_seconds=300)
                     # Sonarr's own message for this event is the most direct signal available
                     # (e.g. a download client error or "Manually marked as failed"); surface it
                     # before falling back to the generic label.
@@ -545,7 +560,10 @@ def parse_queue_items(records, item_type, app_name):
             "eta": eta_seconds,
             "protocol": record.get("protocol", "unknown").lower(),
             "error_message": record.get("errorMessage", ""),
-            "download_id": record.get("downloadId")
+            "download_id": record.get("downloadId"),
+            "media_id": (record.get(item_type) or {}).get("id"),
+            "episode_id": (record.get("episode") or {}).get("id"),
+            "season_number": (record.get("episode") or {}).get("seasonNumber")
         })
     
     return queue_items
@@ -715,8 +733,15 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
         # state - this is independent of the queue-watching logic below.
         scan_sonarr_history_for_activity(app_name, instance_name, instance_data)
 
-        # Get the download queue
-        queue_response = get_queue_items(app_name, instance_data["api_url"], instance_data["api_key"])
+        # Get the download queue through the same local single-flight cache used by
+        # Huntarr's dispatcher. A nearby hunt/Swaparr cycle can reuse this observation.
+        from src.primary.apps._common.pipeline_state import get_pipeline_state
+        pipeline = get_pipeline_state()
+        lifecycle_instance = str(instance_data.get("instance_id") or instance_name)
+        queue_response = pipeline.observe_queue(
+            app_name, instance_name,
+            lambda: get_queue_items(app_name, instance_data["api_url"], instance_data["api_key"]),
+        )
         queue_items = queue_response
 
         if len(queue_items) == 0:
@@ -754,6 +779,20 @@ def process_stalled_downloads(app_name, instance_name, instance_data, settings):
             item_id = str(item["id"])
             item_state = "Normal"
             item_hash = generate_item_hash(item)
+
+            # Queue presence is durable evidence that this item reached downloading.
+            # Keep Swaparr's queue rows separate from Huntarr media candidate keys while
+            # recording both in the shared lifecycle table.
+            if app_name == "radarr" and item.get("media_id") is not None:
+                pipeline_key = "movies:" + str(item["media_id"])
+            elif app_name == "sonarr" and item.get("media_id") is not None and item.get("season_number") is not None:
+                pipeline_key = "season:%s:%s" % (item["media_id"], item["season_number"])
+            elif app_name == "sonarr" and item.get("episode_id") is not None:
+                pipeline_key = "episodes:" + str(item["episode_id"])
+            else:
+                pipeline_key = "queue:" + str(item.get("download_id") or item_id)
+            pipeline.claim_candidate(app_name, lifecycle_instance, pipeline_key, cooldown_seconds=0)
+            pipeline.transition(app_name, lifecycle_instance, pipeline_key, "downloading")
 
             SWAPARR_STATS['total_processed'] += 1
             if not settings.get("dry_run", False):

@@ -461,8 +461,12 @@ def movie_search(api_url: str, api_key: str, api_timeout: int, movie_ids: List[i
         radarr_logger.warning("Radarr search-dispatch hourly limit reached; MoviesSearch deferred")
         return None
 
-    from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot
+    from src.primary.apps._common.queue_dispatch import acquire_dispatch_slot, claim_search, finish_search_claim
+    item_key = "movies:" + ",".join(str(item) for item in sorted(movie_ids))
+    if not claim_search(item_key):
+        return None
     if not acquire_dispatch_slot():
+        finish_search_claim("timed_out", cooldown_seconds=60)
         return None
         
     endpoint = "command"
@@ -478,10 +482,12 @@ def movie_search(api_url: str, api_key: str, api_timeout: int, movie_ids: List[i
         from src.primary.apps._common.queue_dispatch import record_submission
         from src.primary.stats_manager import increment_hourly_cap
         record_submission()
+        finish_search_claim("search_submitted", command_id=command_id)
         increment_hourly_cap("radarr", 1, instance_name=instance_name)
         radarr_logger.debug(f"Triggered search for movie IDs: {movie_ids}. Command ID: {command_id}")
         return command_id
     else:
+        finish_search_claim("failed", cooldown_seconds=300)
         radarr_logger.error(f"Failed to trigger search command for movie IDs {movie_ids}. Response: {response}")
         return None
 
@@ -513,13 +519,19 @@ def wait_for_command(api_url: str, api_key: str, api_timeout: int, command_id: i
         if response and 'state' in response:
             state = response['state']
             if state == "completed":
+                from src.primary.apps._common.queue_dispatch import mark_command
+                mark_command(command_id, "command_complete")
                 return True
             elif state == "failed":
+                from src.primary.apps._common.queue_dispatch import mark_command
+                mark_command(command_id, "failed", cooldown_seconds=300)
                 radarr_logger.error(f"Command {command_id} failed")
                 return False
         time.sleep(delay_seconds)
         attempts += 1
     radarr_logger.warning(f"Timed out waiting for command {command_id} to complete")
+    from src.primary.apps._common.queue_dispatch import mark_command
+    mark_command(command_id, "timed_out", cooldown_seconds=300)
     return False
 
 def check_grabbed(api_url: str, api_key: str, api_timeout: int,

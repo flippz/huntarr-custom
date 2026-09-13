@@ -640,7 +640,9 @@ def app_specific_loop(app_type: str) -> None:
                     # Fallback to general settings if instance doesn't have it set
                     general_settings = settings_manager.load_settings('general')
                     max_queue_size = general_settings.get("minimum_download_queue_size", -1)
-                if max_queue_size >= 0:
+                # Sonarr/Radarr enforce this through the shared dispatcher below, which
+                # combines queue + command observations and avoids a duplicate preflight poll.
+                if max_queue_size >= 0 and app_type not in ("sonarr", "radarr"):
                     try:
                         instance_api_timeout = instance_details.get("api_timeout", 120)
                         current_queue_size = get_queue_size(api_url, api_key, instance_api_timeout)
@@ -779,6 +781,7 @@ def app_specific_loop(app_type: str) -> None:
                         active_searches=lambda: active_search_count(api_url, api_key, api_timeout),
                         stop_check=stop_check_func,
                         logger=app_logger,
+                        queue_cache_name=instance_name,
                     )
                 except Exception as e:
                     app_logger.error("Unable to configure safe queue dispatch for %s: %s", instance_name, e)

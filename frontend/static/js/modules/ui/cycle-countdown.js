@@ -14,6 +14,8 @@ window.CycleCountdown = (function() {
     const pendingResets = {};
     // Per-instance cycle activity (e.g. "Season Search (360/600)" or "Processing missing") when running
     const cycleActivities = {};
+    // Per-instance queue/search pipeline accounting supplied by Phase 2.
+    const pipelineStatuses = {};
     // List of apps to track (movie_hunt, tv_hunt first so they appear first when configured)
     const trackedApps = ['movie_hunt', 'tv_hunt', 'sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'whisparr-v3', 'eros', 'swaparr'];
     
@@ -307,7 +309,7 @@ window.CycleCountdown = (function() {
             
             const timerElement = document.createElement('div');
             timerElement.className = 'cycle-timer inline-timer';
-            timerElement.innerHTML = '<i class="fas fa-clock"></i> <span class="timer-value">Starting Cycle</span>';
+            timerElement.innerHTML = '<i class="fas fa-clock"></i> <span class="timer-value">Starting Cycle</span><small class="pipeline-status"></small>';
             if (app === 'eros') timerElement.style.cssText = 'border-left: 2px solid #ff45b7 !important;';
             timerElement.classList.add(cssClass);
             timerElement.setAttribute('data-app-type', app);
@@ -389,6 +391,7 @@ window.CycleCountdown = (function() {
                             runningCycles[key] = inst.cyclelock !== undefined ? inst.cyclelock : true;
                             pendingResets[key] = inst.pending_reset === true;
                             cycleActivities[key] = inst.cycle_activity || null;
+                            pipelineStatuses[key] = inst.pipeline || null;
                             dataProcessed = true;
                         }
                         runningCycles[app] = false;
@@ -558,6 +561,7 @@ window.CycleCountdown = (function() {
             const isPendingReset = pendingResets[key] === true;
             const timeRemaining = nextCycleTime ? (nextCycleTime - now) : 0;
             const isExpired = nextCycleTime && timeRemaining <= 0;
+            renderPipelineStatus(timerElement, key);
             
             let formattedTime = 'Starting Cycle';
             if (nextCycleTime && !isExpired && !isRunning && !isPendingReset) {
@@ -595,6 +599,28 @@ window.CycleCountdown = (function() {
         });
     }
     
+    function renderPipelineStatus(timerElement, key) {
+        const pipeline = pipelineStatuses[key];
+        let status = timerElement.querySelector('.pipeline-status');
+        if (!status) {
+            status = document.createElement('small');
+            status.className = 'pipeline-status';
+            timerElement.appendChild(status);
+        }
+        if (!pipeline) { status.textContent = ''; return; }
+        const parts = [];
+        if (pipeline.slots_target !== undefined && pipeline.slots_target !== null) {
+            const used = pipeline.slots_used === null || pipeline.slots_used === undefined ? '?' : pipeline.slots_used;
+            parts.push('Slots ' + used + '/' + pipeline.slots_target);
+        }
+        if (pipeline.search_budget_limit !== undefined && pipeline.search_budget_limit !== null) {
+            parts.push('Searches ' + (pipeline.search_budget_used || 0) + '/' + pipeline.search_budget_limit);
+        }
+        if (pipeline.pause_reason) parts.push('Paused: ' + pipeline.pause_reason);
+        status.textContent = parts.length ? ' · ' + parts.join(' · ') : '';
+        timerElement.title = pipeline.pause_reason || parts.join(' · ');
+    }
+
     // Update timer styling based on remaining time
     function updateTimerStyle(timerElement, timeRemaining) {
         // Get the timer value element

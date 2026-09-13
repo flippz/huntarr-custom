@@ -327,6 +327,9 @@ def process_cutoff_upgrades(
                                                         movie_id=movie_id,
                                                         search_start_iso=_search_start_iso)
                     update_history_status(_entry_id, 'grabbed' if _grabbed else 'searched')
+                    from src.primary.apps._common.queue_dispatch import mark_command
+                    mark_command(search_result, 'grabbed' if _grabbed else 'no_grab',
+                                 cooldown_seconds=None if _grabbed else 300)
                 else:
                     update_history_status(_entry_id, 'failed')
             

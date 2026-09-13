@@ -60,6 +60,25 @@ def _get_user_timezone():
         import pytz
         return pytz.UTC
 
+def _pipeline_summary(app_type: str, instance_id: str, instance_settings: dict) -> dict:
+    """UI-safe queue slots, search budget, and exact dispatcher pause reason."""
+    from src.primary.apps._common.pipeline_state import get_pipeline_state
+    runtime = get_pipeline_state().runtime(app_type, instance_id)
+    target = int(instance_settings.get("target_queue_depth", 3) or 3)
+    summary = {
+        "slots_used": runtime.get("slots_used"),
+        "slots_target": runtime.get("slots_target", target),
+        "pause_reason": runtime.get("pause_reason"),
+    }
+    try:
+        from src.primary.stats_manager import get_hourly_cap_status
+        budget = get_hourly_cap_status(app_type, instance_name=instance_id)
+        summary["search_budget_used"] = budget.get("current_usage", 0)
+        summary["search_budget_limit"] = budget.get("limit", instance_settings.get("hourly_cap"))
+    except Exception:
+        pass
+    return summary
+
 def update_sleep_json(app_type: str, next_cycle_time: datetime.datetime, cyclelock: bool = None,
                       instance_name: Optional[str] = None, log_name: Optional[str] = None) -> None:
     """
@@ -183,6 +202,11 @@ def get_cycle_status(app_type: Optional[str] = None) -> Dict[str, Any]:
                                 db.set_sleep_data_per_instance(app_type, str(iid), next_cycle_time=default_next, cycle_lock=False)
                             except Exception as e:
                                 logger.debug("Could not persist default next_cycle for %s/%s: %s", app_type, name, e)
+                    for configured_instance in configured:
+                        name = configured_instance.get("instance_name", "Default")
+                        iid = str(configured_instance.get("instance_id") or name)
+                        if name in instances:
+                            instances[name]["pipeline"] = _pipeline_summary(app_type, iid, configured_instance)
                     return {"app": app_type, "instances": instances}
                 
                 # Single-app logic (e.g. swaparr)
@@ -292,6 +316,20 @@ def get_cycle_status(app_type: Optional[str] = None) -> Dict[str, Any]:
                                     logger.debug("Could not persist default next_cycle for %s/%s: %s", app, inst_name, e)
                         if "_id_to_name" in result[app]:
                             del result[app]["_id_to_name"]
+                for app in arr_apps:
+                    app_result = result.get(app)
+                    if not app_result or "instances" not in app_result:
+                        continue
+                    try:
+                        app_module = __import__(f"src.primary.apps.{app}", fromlist=["get_configured_instances"])
+                        configured = list(app_module.get_configured_instances(quiet=True))
+                    except Exception:
+                        configured = []
+                    for configured_instance in configured:
+                        name = configured_instance.get("instance_name", "Default")
+                        iid = str(configured_instance.get("instance_id") or name)
+                        if name in app_result["instances"]:
+                            app_result["instances"][name]["pipeline"] = _pipeline_summary(app, iid, configured_instance)
                 return result
         except Exception as e:
             logger.error(f"Error getting cycle status: {e}")

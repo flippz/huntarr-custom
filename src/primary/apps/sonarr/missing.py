@@ -406,6 +406,9 @@ def process_missing_seasons_packs_mode(
                                                             season_number=season_number,
                                                             search_start_iso=_search_start_iso)
                         update_history_status(_entry_id, 'grabbed' if _grabbed else 'searched')
+                        from src.primary.apps._common.queue_dispatch import mark_command
+                        mark_command(command_id, 'grabbed' if _grabbed else 'no_grab',
+                                     cooldown_seconds=None if _grabbed else 300)
                     else:
                         update_history_status(_entry_id, 'failed')
         else:
@@ -833,6 +836,9 @@ def process_missing_episodes_mode(
                                                         episode_id=int(episode_id),
                                                         search_start_iso=_search_start_iso)
                     update_history_status(_entry_id, 'grabbed' if _grabbed else 'searched')
+                    from src.primary.apps._common.queue_dispatch import mark_command
+                    mark_command(search_successful, 'grabbed' if _grabbed else 'no_grab',
+                                 cooldown_seconds=None if _grabbed else 300)
                 else:
                     update_history_status(_entry_id, 'failed')
 

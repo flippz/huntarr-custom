@@ -1373,6 +1373,53 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 )
             ''')
 
+            # Shared Huntarr/Swaparr per-item pipeline journal. Additive and idempotent:
+            # existing installations retain all data and gain this table on startup.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS pipeline_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    app_type TEXT NOT NULL,
+                    instance_name TEXT NOT NULL,
+                    item_key TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'candidate','search_submitted','command_complete','grabbed',
+                        'downloading','imported','completed','no_grab','failed','timed_out'
+                    )),
+                    command_id TEXT,
+                    metadata TEXT,
+                    cooldown_until_epoch INTEGER DEFAULT 0,
+                    updated_at_epoch INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(app_type, instance_name, item_key)
+                )
+            ''')
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_pipeline_items_command
+                ON pipeline_items (app_type, command_id)
+            ''')
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_pipeline_items_unresolved
+                ON pipeline_items (app_type, instance_name, state, cooldown_until_epoch)
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS pipeline_item_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    app_type TEXT NOT NULL,
+                    instance_name TEXT NOT NULL,
+                    item_key TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    command_id TEXT,
+                    metadata TEXT,
+                    occurred_at_epoch INTEGER NOT NULL,
+                    occurred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_pipeline_item_events_lookup
+                ON pipeline_item_events (app_type, instance_name, item_key, occurred_at_epoch)
+            ''')
+
             # Create sleep_data table for cycle tracking (single-app e.g. swaparr)
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS sleep_data (
