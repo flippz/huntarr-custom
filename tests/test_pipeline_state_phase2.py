@@ -277,34 +277,54 @@ class BatchDispatchAndSwaparrTests(unittest.TestCase):
         self.assertEqual(snapshot["records"], records)
         self.assertEqual(queue_calls, [1])
 
-    def test_swaparr_uses_episode_key_and_does_not_transition_failed_claim(self):
+    def test_swaparr_uses_episode_key_and_does_not_reopen_terminal_row(self):
         pipeline = mock.Mock()
         pipeline.claim_candidate.return_value = False
-        claimed, key = swaparr_handler.record_queue_lifecycle(
+        pipeline.observe_transition.return_value = False
+        recorded, key = swaparr_handler.record_queue_lifecycle(
             pipeline, "sonarr", "instance-id",
             {"id": 10, "download_id": "download", "media_id": 4,
              "season_number": 2, "episode_id": 99},
         )
-        self.assertFalse(claimed)
+        self.assertFalse(recorded)
         self.assertEqual(key, "episodes:99")
         pipeline.transition.assert_not_called()
+        pipeline.observe_transition.assert_called_once_with(
+            "sonarr", "instance-id", "episodes:99", "downloading",
+        )
 
-    def test_swaparr_failed_claim_preserves_unresolved_database_row(self):
+    def test_swaparr_queue_evidence_advances_existing_unresolved_row(self):
         pipeline = PipelineState(db=_DB(), clock=lambda: 1000)
         self.assertTrue(pipeline.claim_candidate("sonarr", "one", "episodes:99"))
         self.assertTrue(pipeline.transition(
             "sonarr", "one", "episodes:99", "search_submitted", command_id="12",
         ))
-        claimed, _key = swaparr_handler.record_queue_lifecycle(
+        recorded, _key = swaparr_handler.record_queue_lifecycle(
             pipeline, "sonarr", "one",
             {"id": 10, "media_id": 4, "season_number": 2, "episode_id": 99},
         )
-        self.assertFalse(claimed)
+        self.assertTrue(recorded)
         with pipeline.db.get_connection() as conn:
             state = conn.execute(
                 "SELECT state FROM pipeline_items WHERE item_key='episodes:99'"
             ).fetchone()[0]
-        self.assertEqual(state, "search_submitted")
+        self.assertEqual(state, "downloading")
+
+    def test_swaparr_queue_evidence_does_not_overwrite_terminal_row(self):
+        pipeline = PipelineState(db=_DB(), clock=lambda: 1000)
+        self.assertTrue(pipeline.claim_candidate("radarr", "one", "movies:7"))
+        self.assertTrue(pipeline.transition(
+            "radarr", "one", "movies:7", "completed", cooldown_seconds=300,
+        ))
+        recorded, _key = swaparr_handler.record_queue_lifecycle(
+            pipeline, "radarr", "one", {"id": 10, "media_id": 7},
+        )
+        self.assertFalse(recorded)
+        with pipeline.db.get_connection() as conn:
+            state = conn.execute(
+                "SELECT state FROM pipeline_items WHERE item_key='movies:7'"
+            ).fetchone()[0]
+        self.assertEqual(state, "completed")
 
 
 if __name__ == "__main__":

@@ -211,11 +211,19 @@ def scan_sonarr_history_for_activity(app_name, instance_name, instance_data):
                 if record.get("eventType") == "downloadFolderImported":
                     if claimed:
                         pipeline.transition(app_name, lifecycle_instance, pipeline_key, "imported")
-                        pipeline.transition(app_name, lifecycle_instance, pipeline_key, "completed", cooldown_seconds=300)
+                    else:
+                        pipeline.observe_transition(app_name, lifecycle_instance, pipeline_key, "imported")
+                    pipeline.observe_transition(
+                        app_name, lifecycle_instance, pipeline_key, "completed", cooldown_seconds=300,
+                    )
                     log_activity_event(app_name, instance_name, download_id, name, "completed")
                 else:
                     if claimed:
                         pipeline.transition(app_name, lifecycle_instance, pipeline_key, "failed", cooldown_seconds=300)
+                    else:
+                        pipeline.observe_transition(
+                            app_name, lifecycle_instance, pipeline_key, "failed", cooldown_seconds=300,
+                        )
                     # Sonarr's own message for this event is the most direct signal available
                     # (e.g. a download client error or "Manually marked as failed"); surface it
                     # before falling back to the generic label.
@@ -588,14 +596,18 @@ def pipeline_key_for_queue_item(app_name, item):
 
 
 def record_queue_lifecycle(pipeline, app_name, instance_name, item, state="downloading"):
-    """Claim and transition one Swaparr row without mutating a failed claim."""
+    """Record queue evidence without reopening terminal rows or duplicate searches."""
     item_key = pipeline_key_for_queue_item(app_name, item)
     claimed = pipeline.claim_candidate(
         app_name, str(instance_name), item_key, cooldown_seconds=0,
     )
     if claimed:
-        pipeline.transition(app_name, str(instance_name), item_key, state)
-    return claimed, item_key
+        transitioned = pipeline.transition(app_name, str(instance_name), item_key, state)
+    else:
+        transitioned = pipeline.observe_transition(
+            app_name, str(instance_name), item_key, state,
+        )
+    return claimed or transitioned, item_key
 
 def trigger_search_for_item(app_name, api_url, api_key, item, api_timeout=120):
     """Trigger a search for the item that was removed"""

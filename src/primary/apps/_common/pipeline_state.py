@@ -295,6 +295,38 @@ class PipelineState:
                     )
             return updated == len(keys)
 
+    def observe_transition(self, app_type: str, instance_name: str, item_key: str,
+                           state: str, cooldown_seconds: Optional[int] = None,
+                           metadata: Optional[str] = None) -> bool:
+        """Advance an existing unresolved item from external queue/history evidence.
+
+        This deliberately cannot revive or overwrite a terminal row. It lets Swaparr
+        advance Huntarr's unresolved claim without treating the observation as a new
+        search candidate, preserving duplicate-search protection.
+        """
+        if state not in LIFECYCLE_STATES:
+            raise ValueError(f"invalid pipeline lifecycle state: {state}")
+        now = int(self._clock())
+        cooldown = now + max(0, int(cooldown_seconds or 0)) if cooldown_seconds is not None else None
+        unresolved = tuple(sorted(UNRESOLVED_STATES))
+        placeholders = ",".join("?" for _ in unresolved)
+        with self.db.get_connection() as conn:
+            cursor = conn.execute(
+                "UPDATE pipeline_items SET state=?, metadata=COALESCE(?,metadata), "
+                "cooldown_until_epoch=COALESCE(?,cooldown_until_epoch), updated_at_epoch=?, "
+                "updated_at=CURRENT_TIMESTAMP WHERE app_type=? AND instance_name=? AND item_key=? "
+                f"AND state IN ({placeholders})",
+                (state, metadata, cooldown, now, str(app_type), str(instance_name),
+                 str(item_key), *unresolved),
+            )
+            if cursor.rowcount == 1:
+                conn.execute(
+                    "INSERT INTO pipeline_item_events(app_type,instance_name,item_key,state,metadata,occurred_at_epoch) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (str(app_type), str(instance_name), str(item_key), state, metadata, now),
+                )
+            return cursor.rowcount == 1
+
     def transition_command(self, app_type: str, command_id: str, state: str,
                            cooldown_seconds: Optional[int] = None) -> bool:
         if state not in LIFECYCLE_STATES:
