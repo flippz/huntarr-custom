@@ -474,6 +474,29 @@ def _commit_reserved_capacity(context: DispatchContext) -> None:
     _release_shared(context)
 
 
+def _commit_search_without_queue_submission(context: DispatchContext) -> None:
+    """Commit the search token while unwinding capacity reserved for a possible grab."""
+    if not context.budget_reserved:
+        try:
+            from src.primary.stats_manager import increment_hourly_cap
+            increment_hourly_cap(context.app_type, 1, instance_name=context.instance_name)
+        except Exception:
+            pass
+    context.budget_reserved = False
+    try:
+        if context.decypharr_reservation is not None:
+            from src.primary.apps.swaparr.decypharr_capacity import release_reservation
+            release_reservation(context.decypharr_config or {}, context.decypharr_reservation)
+    except Exception as exc:
+        context.logger.warning(
+            "Failed to release unused Decypharr reservation for %s: %s",
+            context.instance_name, exc,
+        )
+    finally:
+        context.decypharr_reservation = None
+        _release_shared(context)
+
+
 def record_submission() -> None:
     """Backward-compatible accepted-POST capacity commit."""
     context: Optional[DispatchContext] = getattr(_local, "context", None)
@@ -553,6 +576,48 @@ def commit_search_submission(command_id, app_type: Optional[str] = None,
     finally:
         # The external command exists even if local lifecycle persistence fails.
         _commit_reserved_capacity(context)
+
+
+def finish_interactive_search(state: str, app_type: str, instance_name: Optional[str],
+                              cooldown_seconds: Optional[int] = None,
+                              queue_submission: bool = False) -> bool:
+    """Finish a synchronous interactive search and count its one indexer operation.
+
+    A successful grab retains the queue/Decypharr grace reservation. A no-result or
+    failed grab consumed the search budget but did not create queue work, so those
+    provisional reservations are released.
+    """
+    context: Optional[DispatchContext] = getattr(_local, "context", None)
+    if context is None:
+        try:
+            from src.primary.stats_manager import increment_hourly_cap
+            increment_hourly_cap(app_type, 1, instance_name=instance_name)
+        except Exception:
+            pass
+        return True
+    transitioned = False
+    try:
+        if context.current_item_keys:
+            transitioned = get_pipeline_state().transition_items(
+                context.app_type, context.instance_name, context.current_item_keys, state,
+                cooldown_seconds=cooldown_seconds,
+                expected_states={"search_submitted"},
+            )
+        return transitioned
+    except Exception as exc:
+        # The synchronous Sonarr operation already happened. Capacity accounting and
+        # grant release must still complete even if durable state persistence failed.
+        context.logger.error(
+            "Failed to persist interactive-search lifecycle for %s: %s",
+            context.instance_name, exc,
+        )
+        return False
+    finally:
+        context.current_item_keys = []
+        if queue_submission:
+            _commit_reserved_capacity(context)
+        else:
+            _commit_search_without_queue_submission(context)
 
 
 def finish_search_claim(state: str, command_id=None, cooldown_seconds: Optional[int] = None) -> bool:

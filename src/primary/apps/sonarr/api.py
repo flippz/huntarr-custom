@@ -1044,6 +1044,148 @@ def search_season(api_url: str, api_key: str, api_timeout: int, series_id: int, 
     finally:
         cancel_dispatch_slot()
 
+
+def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
+                            season_number: int) -> bool:
+    """Apply Sonarr's explicit season-pack, mapping, and decision fields strictly."""
+    if not isinstance(release, dict) or release.get("fullSeason") is not True:
+        return False
+    if release.get("mappedSeriesId") != series_id:
+        return False
+    if release.get("mappedSeasonNumber") != season_number:
+        return False
+    if release.get("approved") is not True or release.get("downloadAllowed") is not True:
+        return False
+    if release.get("rejected") is True or release.get("temporarilyRejected") is True:
+        return False
+    if release.get("rejections"):
+        return False
+    return bool(release.get("guid")) and release.get("indexerId") is not None
+
+
+def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
+                          series_id: int, season_number: int,
+                          episode_ids: List[int],
+                          instance_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Run Sonarr's season interactive search and grab its best acceptable full pack.
+
+    Sonarr 4 exposes season manual search as ``GET /api/v3/release`` with
+    ``seriesId`` and ``seasonNumber``. Results carry ``fullSeason`` and Sonarr's
+    mapped/decision fields, and are already prioritized via ``releaseWeight``.
+    The sanctioned grab is ``POST /api/v3/release`` with the cached result's
+    ``guid`` and ``indexerId``. This function never falls back to episode results.
+    """
+    try:
+        from src.primary.stats_manager import check_hourly_cap_exceeded
+        if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
+            sonarr_logger.warning(
+                "🛑 Sonarr search-dispatch hourly limit reached - skipping strict season-pack search for series %s, season %s",
+                series_id, season_number,
+            )
+            return None
+    except Exception as exc:
+        sonarr_logger.error("Error checking hourly API cap: %s", exc)
+
+    from src.primary.apps._common.queue_dispatch import (
+        acquire_dispatch_slot, begin_search_submission, cancel_dispatch_slot,
+        claim_search, finish_interactive_search, finish_search_claim, publish_noop,
+    )
+    keys = [f"season:{series_id}:{season_number}"]
+    keys.extend(f"episodes:{episode_id}" for episode_id in sorted(set(episode_ids)))
+    if not claim_search(keys):
+        return None
+    if not acquire_dispatch_slot():
+        finish_search_claim("timed_out", cooldown_seconds=60)
+        return None
+
+    search_accepted = False
+    try:
+        if not begin_search_submission():
+            return None
+
+        endpoint = f"{api_url}/api/v3/release"
+        headers = {"X-Api-Key": api_key}
+        verify_ssl = get_ssl_verify_setting()
+        response = requests.get(
+            endpoint, headers=headers,
+            params={"seriesId": series_id, "seasonNumber": season_number},
+            timeout=api_timeout, verify=verify_ssl,
+        )
+        response.raise_for_status()
+        search_accepted = True
+        releases = response.json()
+        if not isinstance(releases, list):
+            raise ValueError("Sonarr season interactive search returned a non-list response")
+
+        ranked = sorted(
+            enumerate(releases),
+            key=lambda pair: (
+                pair[1].get("releaseWeight")
+                if isinstance(pair[1], dict) and isinstance(pair[1].get("releaseWeight"), int)
+                else pair[0],
+                pair[0],
+            ),
+        )
+        acceptable = [release for _, release in ranked
+                      if _acceptable_season_pack(release, series_id, season_number)]
+        if not acceptable:
+            reason = "no acceptable season pack"
+            publish_noop(reason)
+            finish_interactive_search(
+                "no_grab", "sonarr", instance_name, cooldown_seconds=300,
+                queue_submission=False,
+            )
+            sonarr_logger.info(
+                "Strict season-pack search found no acceptable pack for series %s, season %s",
+                series_id, season_number,
+            )
+            return None
+
+        selected = acceptable[0]
+        grab_response = requests.post(
+            endpoint, headers=headers,
+            json={"guid": selected["guid"], "indexerId": selected["indexerId"]},
+            timeout=api_timeout, verify=verify_ssl,
+        )
+        grab_response.raise_for_status()
+        finish_interactive_search(
+            "grabbed", "sonarr", instance_name, queue_submission=True,
+        )
+        sonarr_logger.info(
+            "Grabbed Sonarr-ranked strict season pack for series %s, season %s: %s",
+            series_id, season_number, selected.get("title", selected["guid"]),
+        )
+        return selected
+    except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
+        if search_accepted:
+            finish_interactive_search(
+                "failed", "sonarr", instance_name, cooldown_seconds=300,
+                queue_submission=False,
+            )
+        else:
+            finish_search_claim("failed", cooldown_seconds=300)
+        sonarr_logger.error(
+            "Strict season-pack search/grab failed for series %s, season %s: %s",
+            series_id, season_number, exc,
+        )
+        return None
+    except Exception as exc:
+        if search_accepted:
+            finish_interactive_search(
+                "failed", "sonarr", instance_name, cooldown_seconds=300,
+                queue_submission=False,
+            )
+        else:
+            finish_search_claim("failed", cooldown_seconds=300)
+        sonarr_logger.error(
+            "Unexpected strict season-pack search/grab failure for series %s, season %s: %s",
+            series_id, season_number, exc, exc_info=True,
+        )
+        return None
+    finally:
+        cancel_dispatch_slot()
+
+
 def get_cutoff_unmet_episodes_for_series(api_url: str, api_key: str, api_timeout: int, series_id: int, monitored_only: bool = True) -> List[Dict[str, Any]]:
     """
     Get all cutoff unmet episodes for a specific series, handling pagination.

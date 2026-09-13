@@ -230,8 +230,8 @@ def process_missing_seasons_packs_mode(
     search_order: str = "random",
 ) -> bool:
     """
-    Process missing seasons using the SeasonSearch command
-    This mode is optimized for torrent users who rely on season packs
+    Process missing seasons using Sonarr's season-level interactive search.
+    This mode strictly grabs full-season packs and never falls back to episodes.
     Uses a direct episode lookup approach which is much more efficient
     """
     processed_any = False
@@ -335,9 +335,13 @@ def process_missing_seasons_packs_mode(
                 'series_id': series_id,
                 'season_number': season_number,
                 'series_title': series_title,
-                'episode_count': 0
+                'episode_count': 0,
+                'episode_ids': [],
             }
         missing_seasons[key]['episode_count'] += 1
+        episode_id = episode.get('id')
+        if episode_id is not None:
+            missing_seasons[key]['episode_ids'].append(episode_id)
     
     # Convert to list and sort by episode count (most missing episodes first)
     seasons_list = list(missing_seasons.values())
@@ -411,11 +415,14 @@ def process_missing_seasons_packs_mode(
         
         sonarr_logger.info(f"Searching for season pack: {series_title} - Season {season_number} (contains {episode_count} missing episodes)")
 
-        _search_start_iso = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
-        # Trigger an API call to search for the entire season (pass instance_name for per-instance API cap)
-        command_id = sonarr_api.search_season(api_url, api_key, api_timeout, series_id, season_number, instance_name=instance_name)
+        # Dispatch permission and lifecycle claims are acquired inside this helper
+        # before Sonarr is allowed to perform the synchronous indexer search.
+        selected_pack = sonarr_api.grab_best_season_pack(
+            api_url, api_key, api_timeout, series_id, season_number,
+            season.get('episode_ids', []), instance_name=instance_name,
+        )
         
-        if command_id:
+        if selected_pack:
             processed_any = True
             processed_count += 1
             
@@ -430,7 +437,11 @@ def process_missing_seasons_packs_mode(
             
             # Log to history system
             media_name = f"{series_title} - Season {season_number} (contains {episode_count} missing episodes)"
-            _entry_id = log_processed_media("sonarr", media_name, season_id, instance_name, "missing", display_name_for_log=instance_display_name or instance_name)
+            log_processed_media(
+                "sonarr", media_name, season_id, instance_name, "missing",
+                display_name_for_log=instance_display_name or instance_name,
+                status='grabbed',
+            )
             sonarr_logger.debug(f"Logged history entry for season pack: {media_name}")
             
             # CRITICAL FIX: Use increment_stat_only to avoid double-counting API calls
@@ -439,27 +450,11 @@ def process_missing_seasons_packs_mode(
                 increment_media_stat_only("sonarr", "hunted", 1, instance_name)
             sonarr_logger.debug(f"Incremented sonarr hunted statistics for {episode_count} episodes in season pack (API call already tracked separately)")
             
-            # Wait for command to complete if configured
-            if command_wait_delay > 0 and command_wait_attempts > 0:
-                _cmd_success = wait_for_command(
-                    api_url, api_key, api_timeout, command_id,
-                    command_wait_delay, command_wait_attempts, "Season Search", stop_check,
-                    instance_name=instance_name
-                )
-                if _entry_id:
-                    if _cmd_success:
-                        _grabbed = sonarr_api.check_grabbed(api_url, api_key, api_timeout,
-                                                            series_id=series_id,
-                                                            season_number=season_number,
-                                                            search_start_iso=_search_start_iso)
-                        update_history_status(_entry_id, 'grabbed' if _grabbed else 'searched')
-                        from src.primary.apps._common.queue_dispatch import mark_command
-                        mark_command(command_id, 'grabbed' if _grabbed else 'no_grab',
-                                     cooldown_seconds=None if _grabbed else 300)
-                    else:
-                        update_history_status(_entry_id, 'failed')
         else:
-            sonarr_logger.error(f"Failed to trigger search for {series_title}.")
+            sonarr_logger.info(
+                "Strict season-pack search did not grab a pack for %s - Season %s.",
+                series_title, season_number,
+            )
     
     sonarr_logger.info(f"Missing: processed {processed_count} season packs")
     return processed_any
