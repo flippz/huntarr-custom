@@ -57,8 +57,99 @@ def _rejected_release(guid, weight, rejections, **changes):
     )
 
 
+class CutoffOnlyRejectionTextTests(unittest.TestCase):
+    """Unit coverage for the single-entry matcher (_cutoff_only_rejection_text)."""
+
+    def test_exact_valid_examples_match(self):
+        valid = [
+            "Existing file meets cutoff: WEB DL-1080p",
+            "Existing file meets cutoff: X",
+            "Existing file meets cutoff: HDTV-720p",
+            "Existing file meets cutoff: Multi Word Quality Name",
+            "Existing file meets cutoff: :",  # colon is a valid non-whitespace suffix char
+        ]
+        for text in valid:
+            with self.subTest(text=text):
+                self.assertTrue(sonarr_api._cutoff_only_rejection_text(text))
+
+    def test_bare_prefix_with_no_suffix_is_rejected(self):
+        self.assertFalse(sonarr_api._cutoff_only_rejection_text("Existing file meets cutoff:"))
+
+    def test_no_space_after_colon_is_rejected(self):
+        self.assertFalse(sonarr_api._cutoff_only_rejection_text("Existing file meets cutoff:WEB DL-1080p"))
+
+    def test_empty_suffix_after_required_space_is_rejected(self):
+        self.assertFalse(sonarr_api._cutoff_only_rejection_text("Existing file meets cutoff: "))
+
+    def test_whitespace_only_suffix_is_rejected(self):
+        for suffix in (" ", "  ", "   ", "\t"):
+            with self.subTest(suffix=repr(suffix)):
+                self.assertFalse(sonarr_api._cutoff_only_rejection_text(
+                    f"Existing file meets cutoff:{suffix}"
+                ))
+
+    def test_double_space_after_colon_is_rejected(self):
+        # Exactly one space is Sonarr's literal format string; two spaces means the
+        # first suffix character is itself whitespace, which is not tolerated.
+        self.assertFalse(sonarr_api._cutoff_only_rejection_text("Existing file meets cutoff:  WEB DL-1080p"))
+
+    def test_leading_whitespace_on_whole_string_is_rejected(self):
+        self.assertFalse(sonarr_api._cutoff_only_rejection_text(" Existing file meets cutoff: WEB DL-1080p"))
+
+    def test_trailing_whitespace_on_whole_string_is_rejected(self):
+        for text in (
+            "Existing file meets cutoff: WEB DL-1080p ",
+            "Existing file meets cutoff: WEB DL-1080p\t",
+            "Existing file meets cutoff: WEB DL-1080p\n",
+        ):
+            with self.subTest(text=repr(text)):
+                self.assertFalse(sonarr_api._cutoff_only_rejection_text(text))
+
+    def test_not_stripped_before_matching(self):
+        # A caller must never see this normalized to valid via .strip() - the raw
+        # string is matched exactly as Sonarr sent it.
+        self.assertFalse(sonarr_api._cutoff_only_rejection_text("  Existing file meets cutoff: WEB DL-1080p  "))
+
+    def test_wrong_case_is_rejected(self):
+        self.assertFalse(sonarr_api._cutoff_only_rejection_text("existing file meets cutoff: WEB DL-1080p"))
+
+    def test_extra_leading_text_is_rejected(self):
+        self.assertFalse(sonarr_api._cutoff_only_rejection_text("Foo: Existing file meets cutoff: WEB DL-1080p"))
+
+    def test_similar_but_distinct_sonarr_reasons_are_rejected(self):
+        # Real, distinct Sonarr UpgradeDiskSpecification rejection texts that must
+        # never be treated as the narrow cutoff-only condition.
+        distinct_reasons = [
+            "Existing file on disk is of equal or higher preference: WEBDL-1080p",
+            "Existing file on disk is of equal or higher revision: v2",
+            "Existing file on disk meets quality cutoff: WEB DL-1080p",
+            "Existing file on disk meets Custom Format cutoff: 100",
+            "Existing file on disk has a equal or higher Custom Format score: 50",
+            "Existing file on disk has Custom Format score within Custom Format score increment: 10",
+            "Existing file on disk and Quality Profile 'HD' does not allow upgrades",
+        ]
+        for reason in distinct_reasons:
+            with self.subTest(reason=reason):
+                self.assertFalse(sonarr_api._cutoff_only_rejection_text(reason))
+
+    def test_non_string_entries_are_always_rejected(self):
+        # Object/dict entries are not a shape Sonarr's ReleaseResource ever emits and
+        # must never be defensively coerced or accepted, regardless of their keys.
+        non_string_cases = [
+            None, "", 42, 3.14, True, False,
+            ["nested", "list"],
+            {"reason": "Existing file meets cutoff: WEB DL-1080p"},
+            {"message": "Existing file meets cutoff: WEB DL-1080p"},
+            {"unexpectedKey": "Existing file meets cutoff: WEB DL-1080p"},
+            {},
+        ]
+        for entry in non_string_cases:
+            with self.subTest(entry=entry):
+                self.assertFalse(sonarr_api._cutoff_only_rejection_text(entry))
+
+
 class CutoffOnlyRejectionMatchingTests(unittest.TestCase):
-    """Unit coverage for the narrow allowlist matcher itself (_cutoff_only_rejections)."""
+    """Unit coverage for the whole-release allowlist matcher (_cutoff_only_rejections)."""
 
     def test_single_exact_cutoff_message_matches(self):
         release = _rejected_release("r1", 0, ["Existing file meets cutoff: WEB DL-1080p"])
@@ -71,6 +162,7 @@ class CutoffOnlyRejectionMatchingTests(unittest.TestCase):
         release = _rejected_release("r1", 0, [
             "Existing file meets cutoff: WEB DL-1080p",
             "Existing file meets cutoff: HDTV-720p",
+            "Existing file meets cutoff: Bluray-1080p",
         ])
         self.assertTrue(sonarr_api._cutoff_only_rejections(release))
 
@@ -81,9 +173,21 @@ class CutoffOnlyRejectionMatchingTests(unittest.TestCase):
         ])
         self.assertFalse(sonarr_api._cutoff_only_rejections(release))
 
+    def test_mixed_cutoff_and_malformed_entry_fails_closed(self):
+        release = _rejected_release("r1", 0, [
+            "Existing file meets cutoff: WEB DL-1080p",
+            "Existing file meets cutoff: ",
+        ])
+        self.assertFalse(sonarr_api._cutoff_only_rejections(release))
+
+    def test_mixed_cutoff_and_object_entry_fails_closed(self):
+        release = _rejected_release("r1", 0, [
+            "Existing file meets cutoff: WEB DL-1080p",
+            {"reason": "Existing file meets cutoff: WEB DL-1080p"},
+        ])
+        self.assertFalse(sonarr_api._cutoff_only_rejections(release))
+
     def test_similar_but_distinct_reasons_do_not_match(self):
-        # These are real, distinct Sonarr UpgradeDiskSpecification rejection texts that
-        # must never be treated as the narrow cutoff-only condition.
         distinct_reasons = [
             "Existing file on disk is of equal or higher preference: WEBDL-1080p",
             "Existing file on disk is of equal or higher revision: v2",
@@ -108,25 +212,26 @@ class CutoffOnlyRejectionMatchingTests(unittest.TestCase):
             ["Existing file meets cutoff: WEB DL-1080p", ""],
             ["Existing file meets cutoff: WEB DL-1080p", 42],
             ["Existing file meets cutoff: WEB DL-1080p", ["nested", "list"]],
+            ["Existing file meets cutoff: WEB DL-1080p", " Existing file meets cutoff: HDTV-720p"],
+            ["Existing file meets cutoff: WEB DL-1080p", "Existing file meets cutoff: HDTV-720p "],
+            ["Existing file meets cutoff: WEB DL-1080p", "Existing file meets cutoff:"],
             [{"unexpectedKey": "Existing file meets cutoff: WEB DL-1080p"}],
             [{"reason": 123}],
+            [{"reason": "Existing file meets cutoff: WEB DL-1080p"}],
         ]
         for rejections in malformed_cases:
             with self.subTest(rejections=rejections):
                 release = _rejected_release("r1", 0, rejections)
                 self.assertFalse(sonarr_api._cutoff_only_rejections(release))
 
-    def test_object_shaped_rejection_with_proven_reason_key_matches(self):
-        # Defensive support only: Sonarr's ReleaseResource always emits plain strings
-        # today, but a dict with a string `reason` key is accepted as a proven shape.
-        release = _rejected_release("r1", 0, [
-            {"reason": "Existing file meets cutoff: WEB DL-1080p"},
-        ])
-        self.assertTrue(sonarr_api._cutoff_only_rejections(release))
-
     def test_non_list_rejections_fails_closed(self):
         release = _rejected_release("r1", 0, [])
         release["rejections"] = "Existing file meets cutoff: WEB DL-1080p"
+        self.assertFalse(sonarr_api._cutoff_only_rejections(release))
+
+    def test_none_rejections_fails_closed(self):
+        release = _rejected_release("r1", 0, [])
+        release["rejections"] = None
         self.assertFalse(sonarr_api._cutoff_only_rejections(release))
 
 
@@ -182,6 +287,52 @@ class AcceptableSeasonPackOverrideTests(unittest.TestCase):
             temporarilyRejected=True,
         )
         self.assertFalse(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "sonarr_default", allow_cutoff_override=True,
+        ))
+
+    def test_enabled_override_requires_exact_decision_state_booleans(self):
+        # Every field in the override decision-state gate (approved, rejected,
+        # temporarilyRejected) must compare with `is`, not truthiness. A missing,
+        # None, or otherwise-typed value must fail closed exactly like the disabled
+        # path, never falling through to the cutoff-only rejection check.
+        base_rejections = ["Existing file meets cutoff: WEB DL-1080p"]
+        cases = {
+            "approved_none": {"approved": None},
+            "approved_missing": {"approved": "__DELETE__"},
+            "approved_string_false": {"approved": "false"},
+            "approved_zero": {"approved": 0},
+            "rejected_none": {"rejected": None},
+            "rejected_missing": {"rejected": "__DELETE__"},
+            "rejected_false": {"rejected": False},
+            "rejected_string_true": {"rejected": "true"},
+            "temporarily_rejected_none": {"temporarilyRejected": None},
+            "temporarily_rejected_missing": {"temporarilyRejected": "__DELETE__"},
+            "temporarily_rejected_true": {"temporarilyRejected": True},
+            "temporarily_rejected_string_false": {"temporarilyRejected": "false"},
+        }
+        for name, overrides in cases.items():
+            with self.subTest(case=name):
+                release = _rejected_release("r1", 0, base_rejections)
+                for key, value in overrides.items():
+                    if value == "__DELETE__":
+                        release.pop(key, None)
+                    else:
+                        release[key] = value
+                self.assertFalse(sonarr_api._acceptable_season_pack(
+                    release, 7, 2, "sonarr_default", allow_cutoff_override=True,
+                ))
+
+    def test_enabled_override_exact_valid_decision_state_is_accepted(self):
+        # The positive control for the matrix above: approved is False, rejected is
+        # True, temporarilyRejected is False, exactly (all _rejected_release
+        # defaults) - this must still qualify.
+        release = _rejected_release(
+            "r1", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+        )
+        self.assertIs(release["approved"], False)
+        self.assertIs(release["rejected"], True)
+        self.assertIs(release["temporarilyRejected"], False)
+        self.assertTrue(sonarr_api._acceptable_season_pack(
             release, 7, 2, "sonarr_default", allow_cutoff_override=True,
         ))
 

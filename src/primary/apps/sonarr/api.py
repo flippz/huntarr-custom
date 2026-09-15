@@ -1156,50 +1156,48 @@ def _resolve_missing_pack_client(api_url: str, api_key: str, api_timeout: int,
 
 
 # Sonarr's ReleaseResource always serializes `Rejections` as `IEnumerable<string>`
-# (see Sonarr.Api.V3.Indexers.ReleaseResource). The single, exact rejection text this
-# override is allowed to see through is emitted by UpgradeDiskSpecification.IsSatisfiedBy
-# as `DownloadSpecDecision.Reject(DownloadRejectionReason.DiskCutoffMet,
-# "Existing file meets cutoff: {0}", qualityCutoff)` - one instance per existing episode
-# file in the pack that already meets its quality cutoff. Sibling "existing file" rejects
-# ("...is of equal or higher preference", "...meets quality cutoff" (disk, not cutoff),
-# "...meets Custom Format cutoff", "...has a equal or higher Custom Format score",
-# "...does not allow upgrades") use different, deliberately non-matching text.
-_CUTOFF_ONLY_REJECTION_RE = re.compile(r"^Existing file meets cutoff:.*$")
+# (see Sonarr.Api.V3.Indexers.ReleaseResource) - object/dict entries are not a shape
+# Sonarr ever emits and are rejected outright, not defensively coerced. The single,
+# exact rejection text this override is allowed to see through is emitted by
+# UpgradeDiskSpecification.IsSatisfiedBy as `DownloadSpecDecision.Reject(
+# DownloadRejectionReason.DiskCutoffMet, "Existing file meets cutoff: {0}",
+# qualityCutoff)` - one instance per existing episode file in the pack that already
+# meets its quality cutoff. `{0}` is a quality name, which Sonarr always renders as a
+# non-empty string, so the required suffix after the colon+space is non-empty and
+# non-whitespace-only. Sibling "existing file" rejects ("...is of equal or higher
+# preference", "...meets quality cutoff" (disk, not cutoff), "...meets Custom Format
+# cutoff", "...has a equal or higher Custom Format score", "...does not allow
+# upgrades") use different, deliberately non-matching text. The prefix requires
+# exactly one space after the colon (Sonarr's literal format string); no leading or
+# trailing whitespace is tolerated anywhere in the raw string - a proxy or logging
+# layer that reformats the message is not a proven, trusted shape.
+_CUTOFF_ONLY_REJECTION_RE = re.compile(r"^Existing file meets cutoff: \S(?:.*\S)?\Z")
 
 
-def _rejection_text(entry: Any) -> Optional[str]:
-    """Extract rejection text from a proven Sonarr shape only; else None (fail closed).
+def _cutoff_only_rejection_text(entry: Any) -> bool:
+    """True only for a plain `str` matching the exact anchored cutoff-only format.
 
-    Sonarr's release API only ever emits plain strings for `rejections`. A dict shape
-    is accepted defensively (e.g. a `reason`/`message` key) in case a future Sonarr
-    version wraps rejections in an object, but only when it holds a plain string in one
-    of those keys - anything else (nested objects, lists, numbers) is not a proven shape
-    and returns None so the caller fails closed.
+    Sonarr's release API only ever emits plain strings for `rejections` entries; any
+    non-string (including a dict/object, even one that looks like it carries a
+    `reason`/`message` key) is not a proven Sonarr shape and fails closed. Leading or
+    trailing whitespace on the raw string, a bare `"Existing file meets cutoff:"` with
+    no suffix, the no-space colon form, and a whitespace-only suffix are all rejected -
+    the string is matched exactly as received, with no stripping/normalizing.
     """
-    if isinstance(entry, str):
-        return entry
-    if isinstance(entry, dict):
-        for key in ("reason", "message"):
-            value = entry.get(key)
-            if isinstance(value, str):
-                return value
-    return None
+    if not isinstance(entry, str) or entry == "":
+        return False
+    return bool(_CUTOFF_ONLY_REJECTION_RE.match(entry))
 
 
 def _cutoff_only_rejections(release: Dict[str, Any]) -> bool:
-    """True only if every rejection entry is present, string-shaped, and matches the
-    narrow 'Existing file meets cutoff: ...' text. Empty, malformed, or unrecognized
-    entries fail closed (return False), as does a release with no rejections at all
-    (callers only reach here when `approved` is False and rejections must explain why).
+    """True only if every rejection entry is a plain string matching the narrow
+    'Existing file meets cutoff: <quality>' text exactly. Empty, malformed, object, or
+    unrecognized entries fail closed (return False), as does an empty rejections list.
     """
     rejections = release.get("rejections")
     if not isinstance(rejections, list) or not rejections:
         return False
-    for entry in rejections:
-        text = _rejection_text(entry)
-        if not text or not _CUTOFF_ONLY_REJECTION_RE.match(text.strip()):
-            return False
-    return True
+    return all(_cutoff_only_rejection_text(entry) for entry in rejections)
 
 
 def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
@@ -1208,12 +1206,16 @@ def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
                             allow_cutoff_override: bool = False) -> bool:
     """Apply Sonarr's explicit season-pack, mapping, and decision fields strictly.
 
-    When `allow_cutoff_override` is True, a release that fails only Sonarr's
-    approved/rejected checks may still qualify if every rejection Sonarr reported is
-    exclusively the narrow 'Existing file meets cutoff' condition (see
-    `_cutoff_only_rejections`). All other requirements (fullSeason, exact
-    series/season mapping, downloadAllowed, protocol, guid/indexerId) are unchanged
-    and still strictly enforced either way.
+    When `allow_cutoff_override` is True, a release may still qualify despite failing
+    Sonarr's approval check, but only in the exact, unambiguous decision state:
+    `approved is False`, `rejected is True`, `temporarilyRejected is False` (each
+    compared with `is`, not truthiness - a missing/None/other-typed field never
+    qualifies), and a nonempty `rejections` list where every entry is exclusively the
+    narrow 'Existing file meets cutoff: <quality>' text (see `_cutoff_only_rejections`).
+    Any other or malformed decision-state combination fails closed exactly like the
+    disabled path. All other requirements (fullSeason, exact series/season mapping,
+    downloadAllowed, protocol, guid/indexerId) are unchanged and still strictly
+    enforced either way.
     """
     if not isinstance(release, dict) or release.get("fullSeason") is not True:
         return False
@@ -1224,11 +1226,19 @@ def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
     if release.get("downloadAllowed") is not True:
         return False
     if release.get("approved") is not True:
-        if not allow_cutoff_override:
-            return False
-        if release.get("temporarilyRejected") is True:
-            return False
-        if not _cutoff_only_rejections(release):
+        # Only a release in Sonarr's exact, unambiguous "hard rejected, not temporary"
+        # decision state is even considered for override: approved must be literally
+        # False (not None/missing/any other falsy value), rejected must be literally
+        # True, and temporarilyRejected must be literally False (not None/missing/True).
+        # Any deviation - a malformed/partial decision payload - fails closed exactly
+        # like the disabled path, never falling through to the override check.
+        if (
+            not allow_cutoff_override
+            or release.get("approved") is not False
+            or release.get("rejected") is not True
+            or release.get("temporarilyRejected") is not False
+            or not _cutoff_only_rejections(release)
+        ):
             return False
     elif release.get("rejected") is True or release.get("temporarilyRejected") is True or release.get("rejections"):
         # Sonarr should not mark approved=True with a hard/temporary reject or any
