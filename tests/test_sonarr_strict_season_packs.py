@@ -42,7 +42,10 @@ def _release(guid, weight, **changes):
             {"id": 101, "seasonNumber": 2, "episodeNumber": 1, "title": "Ep 1"},
             {"id": 102, "seasonNumber": 2, "episodeNumber": 2, "title": "Ep 2"},
         ],
-        "quality": {"quality": {"id": 4, "name": "HDTV-720p"}, "revision": {"version": 1, "real": 0}},
+        "quality": {
+            "quality": {"id": 4, "name": "HDTV-720p", "source": "television", "resolution": 720},
+            "revision": {"version": 1, "real": 0, "isRepack": False},
+        },
         "languages": [{"id": 1, "name": "English"}],
         "approved": True,
         "downloadAllowed": True,
@@ -851,7 +854,183 @@ class CutoffOverrideGrabTests(unittest.TestCase):
         )
         # Simulate a corrupted/inconsistent payload by calling the helper directly
         # with a mismatched requested series id.
-        self.assertIsNone(sonarr_api._build_override_fields(cutoff_only, 999))
+        self.assertIsNone(sonarr_api._build_override_fields(cutoff_only, 999, 2))
+
+    def test_enabled_override_bool_mapped_series_id_fails_closed(self):
+        # bool is an int subclass in Python - a stray True/False mappedSeriesId that
+        # happens to equal series_id via Python's bool==int comparison must never
+        # pass; only a genuine int is a proven Sonarr shape.
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            mappedSeriesId=True,
+        )
+        self.assertIsNone(sonarr_api._build_override_fields(cutoff_only, 1, 2))
+
+    def test_enabled_override_cross_season_episode_entry_fails_closed(self):
+        # mappedEpisodeInfo containing an entry from a different season must never
+        # be included or silently accepted - the override must never broaden onto
+        # another season's episodes.
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            mappedEpisodeInfo=[
+                {"id": 101, "seasonNumber": 2, "episodeNumber": 1},
+                {"id": 201, "seasonNumber": 3, "episodeNumber": 1},
+            ],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_bool_episode_season_number_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            mappedEpisodeInfo=[{"id": 101, "seasonNumber": True, "episodeNumber": 1}],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_missing_episode_season_number_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            mappedEpisodeInfo=[{"id": 101, "episodeNumber": 1}],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_scalar_quality_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            quality="HDTV-720p",
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_empty_dict_quality_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            quality={},
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_quality_missing_inner_quality_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            quality={"revision": {"version": 1, "real": 0, "isRepack": False}},
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_quality_missing_revision_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            quality={"quality": {"id": 4, "name": "HDTV-720p", "source": "television", "resolution": 720}},
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_quality_bool_id_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            quality={
+                "quality": {"id": True, "name": "HDTV-720p", "source": "television", "resolution": 720},
+                "revision": {"version": 1, "real": 0, "isRepack": False},
+            },
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_quality_empty_name_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            quality={
+                "quality": {"id": 4, "name": "", "source": "television", "resolution": 720},
+                "revision": {"version": 1, "real": 0, "isRepack": False},
+            },
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_quality_non_bool_is_repack_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            quality={
+                "quality": {"id": 4, "name": "HDTV-720p", "source": "television", "resolution": 720},
+                "revision": {"version": 1, "real": 0, "isRepack": "false"},
+            },
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_scalar_language_entry_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            languages=["English"],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_bool_language_id_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            languages=[{"id": True, "name": "English"}],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_language_missing_name_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            languages=[{"id": 1, "name": ""}],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_mixed_valid_and_malformed_language_entries_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            languages=[{"id": 1, "name": "English"}, "French"],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_accepts_proven_valid_quality_and_language_shapes(self):
+        # Real Sonarr shapes, including a legitimately non-positive language id
+        # (Original == -2, Unknown == 0 per NzbDrone.Core.Languages.Language) and a
+        # multi-entry language list, must be accepted and passed through untouched.
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            quality={
+                "quality": {"id": 7, "name": "Bluray-1080p", "source": "bluray", "resolution": 1080},
+                "revision": {"version": 2, "real": 1, "isRepack": True},
+            },
+            languages=[{"id": -2, "name": "Original"}, {"id": 1, "name": "English"}],
+        )
+        patches = self._dispatch_patches() + (
+            mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
+            mock.patch.object(sonarr_api.requests, "post", return_value=_Response({})),
+        )
+        entered = [patch.start() for patch in patches]
+        self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
+
+        result = sonarr_api.grab_best_season_pack(
+            "http://sonarr", "secret", 10, 7, 2, [11], "main",
+            allow_cutoff_override=True,
+        )
+        self.assertEqual(result["guid"], "cutoff-only")
+        post_kwargs = entered[9].call_args.kwargs
+        self.assertEqual(post_kwargs["json"]["quality"], cutoff_only["quality"])
+        self.assertEqual(post_kwargs["json"]["languages"], cutoff_only["languages"])
+
+    def test_override_fields_deep_copies_quality_and_languages(self):
+        # P2: the returned quality/languages must be independent copies - mutating
+        # the POST payload (as callers commonly do) must never alter the selected
+        # release dict that Huntarr continues to hold/log/tag from.
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+        )
+        fields = sonarr_api._build_override_fields(cutoff_only, 7, 2)
+        self.assertIsNotNone(fields)
+        self.assertIsNot(fields["quality"], cutoff_only["quality"])
+        self.assertIsNot(fields["quality"]["quality"], cutoff_only["quality"]["quality"])
+        self.assertIsNot(fields["quality"]["revision"], cutoff_only["quality"]["revision"])
+        self.assertIsNot(fields["languages"], cutoff_only["languages"])
+        self.assertIsNot(fields["languages"][0], cutoff_only["languages"][0])
+
+        fields["quality"]["quality"]["name"] = "Tampered"
+        fields["quality"]["revision"]["version"] = 999
+        fields["languages"][0]["name"] = "Tampered"
+        fields["languages"].append({"id": 99, "name": "Injected"})
+
+        self.assertEqual(cutoff_only["quality"]["quality"]["name"], "HDTV-720p")
+        self.assertEqual(cutoff_only["quality"]["revision"]["version"], 1)
+        self.assertEqual(cutoff_only["languages"][0]["name"], "English")
+        self.assertEqual(len(cutoff_only["languages"]), 1)
 
 
 class InteractiveDispatchAccountingTests(unittest.TestCase):

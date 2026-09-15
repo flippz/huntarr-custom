@@ -4,6 +4,7 @@ Sonarr-specific API functions
 Handles all communication with the Sonarr API
 """
 
+import copy
 import re
 import requests
 import json
@@ -1251,7 +1252,58 @@ def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
     return bool(release.get("guid")) and release.get("indexerId") is not None
 
 
-def _build_override_fields(release: Dict[str, Any], series_id: int) -> Optional[Dict[str, Any]]:
+def _is_strict_int(value: Any) -> bool:
+    """True only for a plain ``int``; ``bool`` is an ``int`` subclass in Python and
+    is explicitly excluded so a stray True/False can never pass as a Sonarr id."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _valid_quality_model_shape(quality: Any) -> bool:
+    """True only for a dict matching Sonarr's ``QualityModel`` JSON shape exactly
+    (NzbDrone.Core.Qualities.QualityModel/Quality/Revision): a nonempty dict with a
+    nested ``quality`` dict carrying an int (non-bool) ``id`` and a non-empty ``name``
+    string, and a nested ``revision`` dict carrying int (non-bool) ``version``/``real``
+    and a ``bool`` ``isRepack``. Sonarr always serializes both nested objects, never a
+    scalar/None/missing sub-object, so anything else is not a proven live shape and
+    fails closed rather than being coerced or partially trusted.
+    """
+    if not isinstance(quality, dict) or not quality:
+        return False
+    inner_quality = quality.get("quality")
+    if not isinstance(inner_quality, dict):
+        return False
+    if not _is_strict_int(inner_quality.get("id")):
+        return False
+    if not isinstance(inner_quality.get("name"), str) or not inner_quality.get("name"):
+        return False
+    revision = quality.get("revision")
+    if not isinstance(revision, dict):
+        return False
+    if not _is_strict_int(revision.get("version")):
+        return False
+    if not _is_strict_int(revision.get("real")):
+        return False
+    if not isinstance(revision.get("isRepack"), bool):
+        return False
+    return True
+
+
+def _valid_language_entry_shape(entry: Any) -> bool:
+    """True only for a dict matching Sonarr's ``Language`` JSON shape exactly
+    (NzbDrone.Core.Languages.Language): an int (non-bool) ``id`` (which may
+    legitimately be 0 "Unknown" or -2 "Original" - no positivity constraint) and a
+    non-empty string ``name``. A bare scalar/bool/string entry is not a proven Sonarr
+    shape and fails closed.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if not _is_strict_int(entry.get("id")):
+        return False
+    return isinstance(entry.get("name"), str) and bool(entry.get("name"))
+
+
+def _build_override_fields(release: Dict[str, Any], series_id: int,
+                           season_number: int) -> Optional[Dict[str, Any]]:
     """Build the exact extra fields Sonarr's ReleaseController requires when
     ``shouldOverride`` is true, sourced only from the selected ReleaseResource.
 
@@ -1261,27 +1313,35 @@ def _build_override_fields(release: Dict[str, Any], series_id: int) -> Optional[
     ``Languages``. It then clones the cached ``RemoteEpisode``, re-resolves
     ``Series``/``Episodes`` from those exact fields, and overwrites
     ``ParsedEpisodeInfo.Quality``/``Languages`` with them - so any field sourced
-    incorrectly (wrong series, partial episode list, fabricated quality/languages)
-    silently redirects or corrupts the grab rather than failing.
+    incorrectly (wrong series, partial/cross-season episode list, fabricated
+    quality/languages) silently redirects or corrupts the grab rather than failing.
 
     ``episodeIds`` is deliberately sourced from the release's own
-    ``mappedEpisodeInfo`` (``ReleaseEpisodeResource.Id`` per
-    Sonarr.Api.V3.Indexers.ReleaseResource) - the full pack's mapped episode
-    entries - not from Huntarr's missing-episode list, which is only a subset
-    when some episodes in the pack already exist. ``mappedSeriesId`` (already
-    required to equal ``series_id`` by ``_acceptable_season_pack``) is used
-    for the ``seriesId`` field for the same reason: it is Sonarr's own mapping
+    ``mappedEpisodeInfo`` (``ReleaseEpisodeResource`` per
+    Sonarr.Api.V3.Indexers.ReleaseResource, carrying ``id``/``seasonNumber``/
+    ``episodeNumber``) - the full pack's mapped episode entries - not from Huntarr's
+    missing-episode list, which is only a subset when some episodes in the pack
+    already exist. Every entry's ``seasonNumber`` must equal the exact requested
+    ``season_number``: Sonarr never returns cross-season entries for a season search,
+    so any mismatch means the payload is not the proven shape and the override must
+    never broaden onto another season's episodes. ``mappedSeriesId`` (already required
+    to equal ``series_id`` by ``_acceptable_season_pack``) is independently re-checked
+    here for the ``seriesId`` field for the same reason: it is Sonarr's own mapping
     for this exact release, not merely the value Huntarr requested.
 
     Returns None (fail closed, no POST) if any required field is absent from the
-    release payload or does not match Sonarr's proven shape: ``mappedSeriesId``
-    must equal ``series_id`` exactly; ``mappedEpisodeInfo`` must be a nonempty
-    list of dict entries each with an ``int`` (non-bool) ``id``; ``quality`` must
-    be a present, non-null value (opaque - copied verbatim, never inspected or
-    reconstructed); ``languages`` must be a list (copied verbatim, entries
-    opaque). Never invents or widens any of these values.
+    release payload or does not match Sonarr's proven shape: ``mappedSeriesId`` must
+    be an int (non-bool) equal to ``series_id`` exactly; ``mappedEpisodeInfo`` must be
+    a nonempty list of dict entries each with an int (non-bool) ``id`` and an int
+    (non-bool) ``seasonNumber`` equal to ``season_number`` exactly; ``quality`` must
+    match Sonarr's ``QualityModel`` shape (see ``_valid_quality_model_shape``);
+    ``languages`` must be a list of entries each matching Sonarr's ``Language`` shape
+    (see ``_valid_language_entry_shape``). ``quality`` and ``languages`` are deep-copied
+    before being returned so a caller mutating the payload can never alter the
+    selected release dict. Never invents or widens any of these values.
     """
-    if release.get("mappedSeriesId") != series_id:
+    mapped_series_id = release.get("mappedSeriesId")
+    if not _is_strict_int(mapped_series_id) or mapped_series_id != series_id:
         return None
 
     episode_info = release.get("mappedEpisodeInfo")
@@ -1292,25 +1352,30 @@ def _build_override_fields(release: Dict[str, Any], series_id: int) -> Optional[
         if not isinstance(entry, dict):
             return None
         episode_id = entry.get("id")
-        if not isinstance(episode_id, int) or isinstance(episode_id, bool):
+        if not _is_strict_int(episode_id):
+            return None
+        entry_season_number = entry.get("seasonNumber")
+        if not _is_strict_int(entry_season_number) or entry_season_number != season_number:
             return None
         episode_ids.append(episode_id)
     if not episode_ids:
         return None
 
-    if "quality" not in release or release.get("quality") is None:
+    quality = release.get("quality")
+    if not _valid_quality_model_shape(quality):
         return None
-    quality = release["quality"]
 
     languages = release.get("languages")
-    if not isinstance(languages, list):
+    if not isinstance(languages, list) or not all(
+        _valid_language_entry_shape(entry) for entry in languages
+    ):
         return None
 
     return {
         "seriesId": series_id,
         "episodeIds": episode_ids,
-        "quality": quality,
-        "languages": languages,
+        "quality": copy.deepcopy(quality),
+        "languages": copy.deepcopy(languages),
     }
 
 
@@ -1437,7 +1502,7 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
         if resolved_client_id is not None:
             grab_body["downloadClientId"] = resolved_client_id
         if cutoff_override_used:
-            override_fields = _build_override_fields(selected, series_id)
+            override_fields = _build_override_fields(selected, series_id, season_number)
             if override_fields is None:
                 finish_interactive_search(
                     "no_grab", "sonarr", instance_name, cooldown_seconds=300,
