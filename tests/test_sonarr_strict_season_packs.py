@@ -38,6 +38,12 @@ def _release(guid, weight, **changes):
         "fullSeason": True,
         "mappedSeriesId": 7,
         "mappedSeasonNumber": 2,
+        "mappedEpisodeInfo": [
+            {"id": 101, "seasonNumber": 2, "episodeNumber": 1, "title": "Ep 1"},
+            {"id": 102, "seasonNumber": 2, "episodeNumber": 2, "title": "Ep 2"},
+        ],
+        "quality": {"quality": {"id": 4, "name": "HDTV-720p"}, "revision": {"version": 1, "real": 0}},
+        "languages": [{"id": 1, "name": "English"}],
         "approved": True,
         "downloadAllowed": True,
         "rejected": False,
@@ -629,6 +635,8 @@ class CutoffOverrideGrabTests(unittest.TestCase):
         post_kwargs = entered[9].call_args.kwargs
         self.assertEqual(post_kwargs["json"], {
             "guid": "cutoff-only", "indexerId": 5, "shouldOverride": True,
+            "seriesId": 7, "episodeIds": [101, 102],
+            "quality": cutoff_only["quality"], "languages": cutoff_only["languages"],
         })
 
     def test_enabled_override_normal_approved_candidate_omits_should_override(self):
@@ -649,7 +657,9 @@ class CutoffOverrideGrabTests(unittest.TestCase):
         )
         self.assertEqual(result["guid"], "normal")
         post_kwargs = entered[9].call_args.kwargs
-        self.assertNotIn("shouldOverride", post_kwargs["json"])
+        self.assertEqual(post_kwargs["json"], {"guid": "normal", "indexerId": 5})
+        for key in ("shouldOverride", "seriesId", "episodeIds", "quality", "languages"):
+            self.assertNotIn(key, post_kwargs["json"])
 
     def test_enabled_override_skips_earlier_mixed_rejection_selects_later_cutoff_only(self):
         # Sonarr ranking order must be preserved: an earlier-ranked candidate with an
@@ -659,6 +669,9 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             "earlier-mixed", 0,
             ["Existing file meets cutoff: WEB DL-1080p", "Not enough seeders"],
         )
+        # episode_ids passed to grab_best_season_pack is only [11] (Huntarr's missing
+        # list); mappedEpisodeInfo here carries the full pack (both 101 and 102) to
+        # prove episodeIds in the POST body comes from the release, not the arg.
         later_cutoff_only = _rejected_release(
             "later-cutoff-only", 1, ["Existing file meets cutoff: HDTV-720p"],
         )
@@ -677,6 +690,8 @@ class CutoffOverrideGrabTests(unittest.TestCase):
         self.assertEqual(result["guid"], "later-cutoff-only")
         post_kwargs = entered[9].call_args.kwargs
         self.assertTrue(post_kwargs["json"]["shouldOverride"])
+        self.assertEqual(post_kwargs["json"]["episodeIds"], [101, 102])
+        self.assertEqual(post_kwargs["json"]["seriesId"], 7)
 
     def test_enabled_override_preserves_download_client_id_alongside_should_override(self):
         cutoff_only = _rejected_release("cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
@@ -700,6 +715,8 @@ class CutoffOverrideGrabTests(unittest.TestCase):
         self.assertEqual(post_kwargs["json"], {
             "guid": "cutoff-only", "indexerId": 5,
             "downloadClientId": 18, "shouldOverride": True,
+            "seriesId": 7, "episodeIds": [101, 102],
+            "quality": cutoff_only["quality"], "languages": cutoff_only["languages"],
         })
 
     def test_enabled_override_no_qualifying_pack_still_no_grab(self):
@@ -743,6 +760,98 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             "failed", "sonarr", "main", cooldown_seconds=300,
             queue_submission=False,
         )
+
+    def _assert_override_fails_closed_no_post(self, cutoff_only):
+        """Shared assertion for the override-field fail-closed tests below: no POST is
+        ever sent, the grab reports no_grab (never a partial/malformed override), and
+        the queue reservation unwinds exactly like the no-acceptable-pack path."""
+        patches = self._dispatch_patches() + (
+            mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
+            mock.patch.object(sonarr_api.requests, "post"),
+        )
+        entered = [patch.start() for patch in patches]
+        self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
+
+        result = sonarr_api.grab_best_season_pack(
+            "http://sonarr", "secret", 10, 7, 2, [11], "main",
+            allow_cutoff_override=True,
+        )
+        self.assertIsNone(result)
+        entered[9].assert_not_called()
+        entered[3].assert_called_once_with(
+            "no_grab", "sonarr", "main", cooldown_seconds=300,
+            queue_submission=False,
+        )
+
+    def test_enabled_override_missing_mapped_episode_info_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            mappedEpisodeInfo=None,
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_empty_mapped_episode_info_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            mappedEpisodeInfo=[],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_non_integer_episode_id_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            mappedEpisodeInfo=[{"id": "101", "seasonNumber": 2, "episodeNumber": 1}],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_bool_episode_id_fails_closed(self):
+        # bool is an int subclass in Python - explicitly excluded so a stray
+        # True/False id can never be sent to Sonarr as an episode id.
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            mappedEpisodeInfo=[{"id": True, "seasonNumber": 2, "episodeNumber": 1}],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_malformed_episode_entry_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            mappedEpisodeInfo=["not-a-dict"],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_missing_quality_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            quality=None,
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_missing_languages_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            languages=None,
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_non_list_languages_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            languages={"id": 1, "name": "English"},
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_mapped_series_id_mismatch_fails_closed(self):
+        # Even though _acceptable_season_pack already enforces mappedSeriesId ==
+        # series_id before a release is ever "selected", _build_override_fields
+        # independently re-checks it and never broadens to a different series.
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            mappedSeriesId=7,
+        )
+        # Simulate a corrupted/inconsistent payload by calling the helper directly
+        # with a mismatched requested series id.
+        self.assertIsNone(sonarr_api._build_override_fields(cutoff_only, 999))
 
 
 class InteractiveDispatchAccountingTests(unittest.TestCase):

@@ -1251,6 +1251,69 @@ def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
     return bool(release.get("guid")) and release.get("indexerId") is not None
 
 
+def _build_override_fields(release: Dict[str, Any], series_id: int) -> Optional[Dict[str, Any]]:
+    """Build the exact extra fields Sonarr's ReleaseController requires when
+    ``shouldOverride`` is true, sourced only from the selected ReleaseResource.
+
+    Sonarr 4's ``DownloadRelease`` action (Sonarr.Api.V3.Indexers.ReleaseController)
+    enforces, when ``release.ShouldOverride == true``: non-null ``SeriesId``,
+    non-null and non-empty ``EpisodeIds``, non-null ``Quality``, and non-null
+    ``Languages``. It then clones the cached ``RemoteEpisode``, re-resolves
+    ``Series``/``Episodes`` from those exact fields, and overwrites
+    ``ParsedEpisodeInfo.Quality``/``Languages`` with them - so any field sourced
+    incorrectly (wrong series, partial episode list, fabricated quality/languages)
+    silently redirects or corrupts the grab rather than failing.
+
+    ``episodeIds`` is deliberately sourced from the release's own
+    ``mappedEpisodeInfo`` (``ReleaseEpisodeResource.Id`` per
+    Sonarr.Api.V3.Indexers.ReleaseResource) - the full pack's mapped episode
+    entries - not from Huntarr's missing-episode list, which is only a subset
+    when some episodes in the pack already exist. ``mappedSeriesId`` (already
+    required to equal ``series_id`` by ``_acceptable_season_pack``) is used
+    for the ``seriesId`` field for the same reason: it is Sonarr's own mapping
+    for this exact release, not merely the value Huntarr requested.
+
+    Returns None (fail closed, no POST) if any required field is absent from the
+    release payload or does not match Sonarr's proven shape: ``mappedSeriesId``
+    must equal ``series_id`` exactly; ``mappedEpisodeInfo`` must be a nonempty
+    list of dict entries each with an ``int`` (non-bool) ``id``; ``quality`` must
+    be a present, non-null value (opaque - copied verbatim, never inspected or
+    reconstructed); ``languages`` must be a list (copied verbatim, entries
+    opaque). Never invents or widens any of these values.
+    """
+    if release.get("mappedSeriesId") != series_id:
+        return None
+
+    episode_info = release.get("mappedEpisodeInfo")
+    if not isinstance(episode_info, list) or not episode_info:
+        return None
+    episode_ids: List[int] = []
+    for entry in episode_info:
+        if not isinstance(entry, dict):
+            return None
+        episode_id = entry.get("id")
+        if not isinstance(episode_id, int) or isinstance(episode_id, bool):
+            return None
+        episode_ids.append(episode_id)
+    if not episode_ids:
+        return None
+
+    if "quality" not in release or release.get("quality") is None:
+        return None
+    quality = release["quality"]
+
+    languages = release.get("languages")
+    if not isinstance(languages, list):
+        return None
+
+    return {
+        "seriesId": series_id,
+        "episodeIds": episode_ids,
+        "quality": quality,
+        "languages": languages,
+    }
+
+
 def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
                           series_id: int, season_number: int,
                           episode_ids: List[int],
@@ -1281,8 +1344,13 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
     or mixed rejection reason is never overridden. Sonarr ranking order is preserved:
     an earlier candidate with an unsafe rejection is skipped in favor of a later
     cutoff-only candidate. When a cutoff-only override is actually used to select the
-    grabbed release, the grab body sets ``shouldOverride: true`` so Sonarr replaces the
-    existing file; otherwise ``shouldOverride`` is omitted entirely.
+    grabbed release, the grab body sets ``shouldOverride: true`` plus the exact
+    ``seriesId``/``episodeIds``/``quality``/``languages`` fields Sonarr's
+    ``ReleaseController`` requires for that flag (see ``_build_override_fields``),
+    sourced only from the selected release itself; otherwise all four fields and
+    ``shouldOverride`` are omitted entirely, leaving the normal grab body unchanged. If
+    the selected release lacks a required field in a proven shape, the grab fails
+    closed (no POST, `no_grab` outcome) rather than sending a malformed override.
     """
     download_protocol = download_protocol if download_protocol in ("usenet", "torrent") else "sonarr_default"
     client_ok, resolved_client_id, client_error = _resolve_missing_pack_client(
@@ -1369,6 +1437,21 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
         if resolved_client_id is not None:
             grab_body["downloadClientId"] = resolved_client_id
         if cutoff_override_used:
+            override_fields = _build_override_fields(selected, series_id)
+            if override_fields is None:
+                finish_interactive_search(
+                    "no_grab", "sonarr", instance_name, cooldown_seconds=300,
+                    queue_submission=False,
+                )
+                sonarr_logger.error(
+                    "Cutoff-only override selected for series %s, season %s but the "
+                    "release payload is missing/malformed required Sonarr override "
+                    "fields (mappedSeriesId/mappedEpisodeInfo/quality/languages); "
+                    "failing closed with no grab: %s",
+                    series_id, season_number, selected.get("title", selected.get("guid")),
+                )
+                return None
+            grab_body.update(override_fields)
             grab_body["shouldOverride"] = True
         grab_response = requests.post(
             endpoint, headers=headers,
