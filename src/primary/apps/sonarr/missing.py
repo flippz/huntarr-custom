@@ -148,6 +148,8 @@ def process_missing_episodes(
     exempt_tags: list = None,
     instance_display_name: Optional[str] = None,
     search_order: str = "random",
+    missing_pack_download_protocol: str = "sonarr_default",
+    missing_pack_download_client_id: Optional[int] = None,
 ) -> bool:
     """
     Process missing episodes for Sonarr.
@@ -177,12 +179,14 @@ def process_missing_episodes(
         # Handle season pack searches (using SeasonSearch command)
         sonarr_logger.info("Season [Packs] mode selected - searching for complete season packs")
         return process_missing_seasons_packs_mode(
-            api_url, api_key, instance_name, api_timeout, monitored_only, 
+            api_url, api_key, instance_name, api_timeout, monitored_only,
             skip_future_episodes, hunt_missing_items, air_date_delay_days,
             command_wait_delay, command_wait_attempts, stop_check,
             tag_processed_items, tag_enable_missing, tag_enable_shows_missing, custom_tags, exempt_tags=exempt_tags,
             hunt_missing_mode=hunt_missing_mode, instance_display_name=display_name,
-            search_order=search_order
+            search_order=search_order,
+            missing_pack_download_protocol=missing_pack_download_protocol,
+            missing_pack_download_client_id=missing_pack_download_client_id,
         )
     elif hunt_missing_mode == "shows":
         # Handle show-based missing items (all episodes from a show)
@@ -228,6 +232,8 @@ def process_missing_seasons_packs_mode(
     hunt_missing_mode: str = "seasons_packs",
     instance_display_name: Optional[str] = None,
     search_order: str = "random",
+    missing_pack_download_protocol: str = "sonarr_default",
+    missing_pack_download_client_id: Optional[int] = None,
 ) -> bool:
     """
     Process missing seasons using Sonarr's season-level interactive search.
@@ -420,6 +426,8 @@ def process_missing_seasons_packs_mode(
         selected_pack = sonarr_api.grab_best_season_pack(
             api_url, api_key, api_timeout, series_id, season_number,
             season.get('episode_ids', []), instance_name=instance_name,
+            download_protocol=missing_pack_download_protocol,
+            download_client_id=missing_pack_download_client_id,
         )
         
         if selected_pack:

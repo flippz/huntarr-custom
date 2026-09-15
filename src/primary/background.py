@@ -831,6 +831,10 @@ def app_specific_loop(app_type: str) -> None:
                         })
                         exempt_tags = instance_details.get("exempt_tags") or []
                         search_order = instance_details.get("search_order", "random")
+                        missing_pack_download_protocol = instance_details.get(
+                            "missing_pack_download_protocol", "sonarr_default")
+                        missing_pack_download_client_id = instance_details.get(
+                            "missing_pack_download_client_id")
                         processed_missing = process_missing(
                             api_url=api_url,
                             api_key=api_key,
@@ -850,7 +854,9 @@ def app_specific_loop(app_type: str) -> None:
                             tag_enable_shows_missing=tag_enable_shows_missing,
                             custom_tags=custom_tags,
                             exempt_tags=exempt_tags,
-                            search_order=search_order
+                            search_order=search_order,
+                            missing_pack_download_protocol=missing_pack_download_protocol,
+                            missing_pack_download_client_id=missing_pack_download_client_id,
                         )
                     else:
                         # For other apps that still use the old signature

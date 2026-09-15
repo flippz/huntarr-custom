@@ -11,6 +11,7 @@ import traceback
 import socket
 from urllib.parse import urlparse
 from src.primary.apps.sonarr import missing, upgrade
+from src.primary.apps.sonarr import api as sonarr_api
 from src.primary.auth import get_app_url_and_key
 from src.primary.utils.database import get_database
 from src.primary import settings_manager
@@ -99,6 +100,32 @@ def sonarr_reset():
     except Exception as e:
         logger.error(f"Error resetting Sonarr state: {e}")
         return jsonify({"error": str(e)}), 500
+
+@sonarr_bp.route('/download-clients', methods=['POST'])
+def sonarr_download_clients():
+    """List Sonarr's configured download clients (id/name/protocol/enable only).
+
+    Used by the instance editor to populate the strict missing-season-pack
+    download-client dropdown. Never returns or logs the Sonarr API key.
+    """
+    data = request.get_json(silent=True) or {}
+    api_url = (data.get('api_url') or '').strip()
+    api_key = (data.get('api_key') or '').strip()
+    api_timeout = data.get('api_timeout', 30)
+
+    if not api_url or not api_key:
+        return jsonify({"success": False, "message": "API URL and API Key are required"}), 400
+
+    if not (api_url.startswith('http://') or api_url.startswith('https://')):
+        api_url = f"http://{api_url}"
+
+    try:
+        clients = sonarr_api.get_download_clients(api_url, api_key, api_timeout)
+        return jsonify({"success": True, "clients": clients})
+    except Exception as e:
+        sonarr_logger.error(f"Error listing Sonarr download clients: {e}")
+        return jsonify({"success": False, "message": "Failed to fetch download clients from Sonarr"}), 502
+
 
 @sonarr_bp.route('/test-connection', methods=['POST'])
 def test_connection():

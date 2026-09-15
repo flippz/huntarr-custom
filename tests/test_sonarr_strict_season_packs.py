@@ -355,6 +355,7 @@ class MissingSeasonPackIntegrationTests(unittest.TestCase):
         self.assertTrue(result)
         grab.assert_called_once_with(
             "http://sonarr", "secret", 10, 7, 2, [11], instance_name="main",
+            download_protocol="sonarr_default", download_client_id=None,
         )
         processed.assert_called_once_with("sonarr", "main", "7_2")
         tag.assert_called_once()

@@ -580,6 +580,88 @@ window.SettingsForms = {
         }
     },
 
+    // Show/hide the strict missing season-pack protocol/client routing fields;
+    // only relevant when Missing Search Mode is Season Packs.
+    toggleMissingPackRoutingVisibility: function() {
+        const modeEl = document.getElementById('editor-missing-mode');
+        const group = document.querySelector('.editor-missing-pack-routing-group');
+        if (modeEl && group) {
+            group.style.display = (modeEl.value === 'seasons_packs') ? 'block' : 'none';
+        }
+    },
+
+    // Enable/disable the client dropdown based on protocol, and (re)load the live
+    // client list from Sonarr when a specific protocol is selected.
+    onMissingPackProtocolChange: function(selectEl) {
+        const clientEl = document.getElementById('editor-missing-pack-client');
+        if (!clientEl) return;
+        const protocol = selectEl ? selectEl.value : 'sonarr_default';
+        if (protocol === 'sonarr_default') {
+            clientEl.disabled = true;
+            clientEl.innerHTML = '<option value="">Automatic (Sonarr chooses)</option>';
+            return;
+        }
+        clientEl.disabled = false;
+        this.loadMissingPackDownloadClients(protocol);
+    },
+
+    // Fetch Sonarr's configured download clients and populate the dropdown,
+    // filtered to enabled clients matching the selected protocol.
+    loadMissingPackDownloadClients: function(protocol) {
+        const clientEl = document.getElementById('editor-missing-pack-client');
+        const helpEl = document.getElementById('editor-missing-pack-client-help');
+        if (!clientEl) return;
+        const urlEl = document.getElementById('editor-url');
+        const keyEl = document.getElementById('editor-key');
+        const url = urlEl ? urlEl.value.trim() : '';
+        const apiKey = keyEl ? keyEl.value.trim() : '';
+        const selectedId = clientEl.getAttribute('data-selected-id') || '';
+
+        const renderOptions = (clients, note) => {
+            const compatible = (clients || []).filter(c => c.enable && c.protocol === protocol);
+            let html = '<option value="">Automatic (Sonarr chooses)</option>';
+            compatible.forEach(c => {
+                const selected = String(c.id) === String(selectedId) ? 'selected' : '';
+                const label = String(c.name || ('Client ' + c.id)).replace(/[&<>"']/g, (ch) => ({
+                    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+                })[ch]);
+                html += `<option value="${c.id}" ${selected}>${label}</option>`;
+            });
+            clientEl.innerHTML = html;
+            if (helpEl && note) {
+                helpEl.textContent = note;
+            }
+        };
+
+        if (!url || !apiKey) {
+            renderOptions([], 'Enter URL and API Key above, then reopen this dropdown to load live clients.');
+            return;
+        }
+
+        if (helpEl) {
+            helpEl.textContent = 'Loading download clients from Sonarr...';
+        }
+        HuntarrUtils.fetchWithTimeout('./api/sonarr/download-clients', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_url: url, api_key: apiKey })
+        }, 10000)
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    const compatibleCount = (data.clients || []).filter(c => c.enable && c.protocol === protocol).length;
+                    renderOptions(data.clients, compatibleCount > 0
+                        ? 'Automatic lets Sonarr pick among enabled clients for the selected protocol. A stale or disabled client fails the search closed at grab time (no fallback).'
+                        : `No enabled Sonarr download clients found for protocol "${protocol}". Automatic will be used unless you add/enable one in Sonarr.`);
+                } else {
+                    renderOptions([], data.message || 'Failed to load download clients from Sonarr.');
+                }
+            })
+            .catch(() => {
+                renderOptions([], 'Failed to load download clients from Sonarr (network error).');
+            });
+    },
+
     // Toggle form fields based on enabled status
     toggleFormFields: function() {
         const dropdown = document.getElementById('editor-enabled');
@@ -1297,6 +1379,14 @@ document.head.appendChild(styleEl);
                     this.toggleFormFields();
                     // Sync upgrade tag group and upgrade-items-tag section visibility (tags vs cutoff mode)
                     this.toggleUpgradeTagVisibility();
+                    // Sync strict missing season-pack protocol/client routing visibility and load live clients
+                    if (appType === 'sonarr') {
+                        this.toggleMissingPackRoutingVisibility();
+                        const protocolEl = document.getElementById('editor-missing-pack-protocol');
+                        if (protocolEl && protocolEl.value !== 'sonarr_default') {
+                            this.loadMissingPackDownloadClients(protocolEl.value);
+                        }
+                    }
                     // Start polling state status if state management is enabled
                     if (instance.state_management_mode !== 'disabled') {
                         this.startStateStatusPolling(appType, index);
@@ -1577,6 +1667,8 @@ document.head.appendChild(styleEl);
                 minimum_dispatch_interval_seconds: instance.minimum_dispatch_interval_seconds !== undefined ? instance.minimum_dispatch_interval_seconds : 15,
                 queue_redispatch_wait_seconds: instance.queue_redispatch_wait_seconds !== undefined ? instance.queue_redispatch_wait_seconds : 60,
                 force_season_replacement: instance.force_season_replacement === true,
+                missing_pack_download_protocol: instance.missing_pack_download_protocol || 'sonarr_default',
+                missing_pack_download_client_id: (instance.missing_pack_download_client_id !== undefined && instance.missing_pack_download_client_id !== null) ? instance.missing_pack_download_client_id : null,
                 webhook_enabled: instance.webhook_enabled === true,
                 webhook_secret: instance.webhook_secret || '',
                 shared_capacity_weight: instance.shared_capacity_weight !== undefined ? instance.shared_capacity_weight : 1,
@@ -1721,7 +1813,7 @@ document.head.appendChild(styleEl);
                     <div class="editor-field-group">
                         <div class="editor-setting-item">
                             <label>Missing Search Mode</label>
-                            <select id="editor-missing-mode">
+                            <select id="editor-missing-mode" onchange="window.SettingsForms.toggleMissingPackRoutingVisibility();">
                                 <option value="seasons_packs" ${safeInstance.hunt_missing_mode === 'seasons_packs' ? 'selected' : ''}>Season Packs</option>
                                 <option value="shows" ${safeInstance.hunt_missing_mode === 'shows' ? 'selected' : ''}>Shows</option>
                                 <option value="episodes" ${safeInstance.hunt_missing_mode === 'episodes' ? 'selected' : ''}>Episodes</option>
@@ -1729,7 +1821,26 @@ document.head.appendChild(styleEl);
                         </div>
                         <p class="editor-help-text">How to search for missing content</p>
                     </div>
-                    
+
+                    <div class="editor-field-group editor-missing-pack-routing-group" style="display: ${safeInstance.hunt_missing_mode === 'seasons_packs' ? 'block' : 'none'};">
+                        <div class="editor-setting-item">
+                            <label>Missing Season Pack Download Protocol</label>
+                            <select id="editor-missing-pack-protocol" onchange="window.SettingsForms.onMissingPackProtocolChange(this);">
+                                <option value="sonarr_default" ${(safeInstance.missing_pack_download_protocol || 'sonarr_default') === 'sonarr_default' ? 'selected' : ''}>Sonarr default</option>
+                                <option value="usenet" ${safeInstance.missing_pack_download_protocol === 'usenet' ? 'selected' : ''}>Usenet only</option>
+                                <option value="torrent" ${safeInstance.missing_pack_download_protocol === 'torrent' ? 'selected' : ''}>Torrent only</option>
+                            </select>
+                        </div>
+                        <p class="editor-help-text">Restricts strict missing season-pack search results to this protocol before grabbing. "Sonarr default" applies no protocol filter. If no acceptable pack matches, nothing is grabbed (no fallback to another protocol or to episodes).</p>
+                        <div class="editor-setting-item" style="margin-top: 8px;">
+                            <label>Missing Season Pack Download Client</label>
+                            <select id="editor-missing-pack-client" data-selected-id="${safeInstance.missing_pack_download_client_id !== null ? safeInstance.missing_pack_download_client_id : ''}" ${(safeInstance.missing_pack_download_protocol || 'sonarr_default') === 'sonarr_default' ? 'disabled' : ''}>
+                                <option value="">Automatic (Sonarr chooses)</option>
+                            </select>
+                        </div>
+                        <p class="editor-help-text" id="editor-missing-pack-client-help">Automatic lets Sonarr pick among enabled clients for the selected protocol. Loads live from Sonarr when URL/API Key are set; only enabled clients matching the chosen protocol are selectable. A stale or disabled client fails the search closed at grab time (no fallback).</p>
+                    </div>
+
                     <div class="editor-field-group">
                         <div class="editor-setting-item">
                             <label>Upgrade Mode</label>
@@ -2301,6 +2412,13 @@ document.head.appendChild(styleEl);
                 minimum_dispatch_interval_seconds: document.getElementById('editor-min-dispatch-interval') ? (parseInt(document.getElementById('editor-min-dispatch-interval').value, 10) || 15) : 15,
                 queue_redispatch_wait_seconds: document.getElementById('editor-redispatch-wait') ? Math.max(0, parseInt(document.getElementById('editor-redispatch-wait').value, 10) || 0) : 60,
                 force_season_replacement: !!(document.getElementById('editor-force-season-replacement') && document.getElementById('editor-force-season-replacement').checked),
+                missing_pack_download_protocol: document.getElementById('editor-missing-pack-protocol') ? (document.getElementById('editor-missing-pack-protocol').value || 'sonarr_default') : 'sonarr_default',
+                missing_pack_download_client_id: (function () {
+                    const el = document.getElementById('editor-missing-pack-client');
+                    if (!el || !el.value) return null;
+                    const v = parseInt(el.value, 10);
+                    return isNaN(v) ? null : v;
+                })(),
                 webhook_enabled: !!(document.getElementById('editor-webhook-enabled') && document.getElementById('editor-webhook-enabled').checked),
                 webhook_secret: document.getElementById('editor-webhook-secret') ? document.getElementById('editor-webhook-secret').value.trim() : '',
                 shared_capacity_weight: document.getElementById('editor-shared-capacity-weight') ? (parseInt(document.getElementById('editor-shared-capacity-weight').value, 10) || 1) : 1,

@@ -1045,8 +1045,102 @@ def search_season(api_url: str, api_key: str, api_timeout: int, series_id: int, 
         cancel_dispatch_slot()
 
 
+# Per-instance strict missing-season-pack protocol setting. "sonarr_default" leaves
+# protocol/client selection entirely to Sonarr (pre-existing, unchanged behavior).
+VALID_MISSING_PACK_PROTOCOLS = ("sonarr_default", "usenet", "torrent")
+
+# Sonarr's DownloadProtocol enum (NzbDrone.Core.Indexers.DownloadProtocol) serializes
+# as a camelCase string via the app's global StringEnumConverter, but is accepted here
+# case-insensitively with a numeric fallback (0=unknown, 1=usenet, 2=torrent) in case a
+# proxy or older Sonarr build ever emits the raw numeric enum value instead.
+_PROTOCOL_NUMERIC = {0: "unknown", 1: "usenet", 2: "torrent"}
+
+
+def normalize_release_protocol(value: Any) -> Optional[str]:
+    """Return 'usenet', 'torrent', 'unknown', or None for an unrecognized shape."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("usenet", "torrent", "unknown"):
+            return lowered
+        return None
+    if isinstance(value, int):
+        return _PROTOCOL_NUMERIC.get(value)
+    return None
+
+
+def get_download_clients(api_url: str, api_key: str, api_timeout: int) -> List[Dict[str, Any]]:
+    """Fetch Sonarr's configured download clients (id, name, protocol, enable).
+
+    Used by the settings UI to populate the per-instance client dropdown and at
+    grab time to validate a configured client id still exists/enabled/compatible.
+    Never exposes the Sonarr API key; callers pass credentials in, this only
+    returns provider metadata already scoped by Sonarr's own auth.
+    """
+    try:
+        endpoint = f"{api_url}/api/v3/downloadclient"
+        verify_ssl = get_ssl_verify_setting()
+        response = requests.get(
+            endpoint, headers={"X-Api-Key": api_key}, timeout=api_timeout, verify=verify_ssl,
+        )
+        response.raise_for_status()
+        clients = response.json()
+        if not isinstance(clients, list):
+            return []
+        result = []
+        for client in clients:
+            if not isinstance(client, dict):
+                continue
+            protocol = normalize_release_protocol(client.get("protocol"))
+            result.append({
+                "id": client.get("id"),
+                "name": client.get("name"),
+                "protocol": protocol,
+                "enable": client.get("enable") is True,
+            })
+        return result
+    except requests.exceptions.RequestException as e:
+        sonarr_logger.error(f"Error fetching Sonarr download clients: {e}")
+        return []
+    except (ValueError, TypeError) as e:
+        sonarr_logger.error(f"Invalid response fetching Sonarr download clients: {e}")
+        return []
+
+
+def _resolve_missing_pack_client(api_url: str, api_key: str, api_timeout: int,
+                                 download_protocol: str,
+                                 download_client_id: Optional[int]) -> "tuple[bool, Optional[int], Optional[str]]":
+    """Validate the configured protocol/client before any search is dispatched.
+
+    Returns (ok, resolved_client_id, error_reason). resolved_client_id is None for
+    Sonarr-automatic selection (either 'sonarr_default' protocol, or protocol set
+    with no specific client chosen). Fails closed (ok=False) on any stale, disabled,
+    or protocol-mismatched client rather than silently falling back.
+    """
+    if download_protocol not in ("usenet", "torrent"):
+        return True, None, None
+    if download_client_id is None:
+        return True, None, None
+    clients = get_download_clients(api_url, api_key, api_timeout)
+    if not clients:
+        return False, None, "no Sonarr download clients available to validate configured client"
+    match = next((c for c in clients if c.get("id") == download_client_id), None)
+    if match is None:
+        return False, None, f"configured download client id {download_client_id} no longer exists in Sonarr"
+    if not match.get("enable"):
+        return False, None, f"configured download client '{match.get('name')}' is disabled in Sonarr"
+    if match.get("protocol") != download_protocol:
+        return False, None, (
+            f"configured download client '{match.get('name')}' protocol "
+            f"'{match.get('protocol')}' does not match required '{download_protocol}'"
+        )
+    return True, download_client_id, None
+
+
 def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
-                            season_number: int) -> bool:
+                            season_number: int,
+                            download_protocol: str = "sonarr_default") -> bool:
     """Apply Sonarr's explicit season-pack, mapping, and decision fields strictly."""
     if not isinstance(release, dict) or release.get("fullSeason") is not True:
         return False
@@ -1060,21 +1154,46 @@ def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
         return False
     if release.get("rejections"):
         return False
+    if download_protocol in ("usenet", "torrent"):
+        release_protocol = normalize_release_protocol(release.get("protocol"))
+        if release_protocol != download_protocol:
+            return False
     return bool(release.get("guid")) and release.get("indexerId") is not None
 
 
 def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
                           series_id: int, season_number: int,
                           episode_ids: List[int],
-                          instance_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                          instance_name: Optional[str] = None,
+                          download_protocol: str = "sonarr_default",
+                          download_client_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """Run Sonarr's season interactive search and grab its best acceptable full pack.
 
     Sonarr 4 exposes season manual search as ``GET /api/v3/release`` with
-    ``seriesId`` and ``seasonNumber``. Results carry ``fullSeason`` and Sonarr's
-    mapped/decision fields, and are already prioritized via ``releaseWeight``.
-    The sanctioned grab is ``POST /api/v3/release`` with the cached result's
-    ``guid`` and ``indexerId``. This function never falls back to episode results.
+    ``seriesId`` and ``seasonNumber``. Results carry ``fullSeason``, Sonarr's
+    mapped/decision fields, and a ``protocol`` field, and are already prioritized
+    via ``releaseWeight``. The sanctioned grab is ``POST /api/v3/release`` with the
+    cached result's ``guid``/``indexerId`` and, when a specific client is configured,
+    ``downloadClientId``. This function never falls back to episode results.
+
+    ``download_protocol`` is one of 'sonarr_default', 'usenet', or 'torrent'.
+    ``download_client_id`` selects a specific enabled Sonarr download client
+    compatible with that protocol; None means Sonarr chooses automatically among
+    clients for the filtered protocol. A stale/disabled/mismatched client fails
+    closed before any search is dispatched (no cap/queue slot consumed) and never
+    falls back to a different client or protocol.
     """
+    download_protocol = download_protocol if download_protocol in ("usenet", "torrent") else "sonarr_default"
+    client_ok, resolved_client_id, client_error = _resolve_missing_pack_client(
+        api_url, api_key, api_timeout, download_protocol, download_client_id,
+    )
+    if not client_ok:
+        sonarr_logger.error(
+            "Strict season-pack search blocked for series %s, season %s: %s",
+            series_id, season_number, client_error,
+        )
+        return None
+
     try:
         from src.primary.stats_manager import check_hourly_cap_exceeded
         if check_hourly_cap_exceeded("sonarr", instance_name=instance_name):
@@ -1127,24 +1246,28 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
             ),
         )
         acceptable = [release for _, release in ranked
-                      if _acceptable_season_pack(release, series_id, season_number)]
+                      if _acceptable_season_pack(release, series_id, season_number, download_protocol)]
         if not acceptable:
-            reason = "no acceptable season pack"
+            reason = (f"no acceptable {download_protocol} season pack"
+                      if download_protocol in ("usenet", "torrent") else "no acceptable season pack")
             publish_noop(reason)
             finish_interactive_search(
                 "no_grab", "sonarr", instance_name, cooldown_seconds=300,
                 queue_submission=False,
             )
             sonarr_logger.info(
-                "Strict season-pack search found no acceptable pack for series %s, season %s",
-                series_id, season_number,
+                "Strict season-pack search found %s for series %s, season %s",
+                reason, series_id, season_number,
             )
             return None
 
         selected = acceptable[0]
+        grab_body = {"guid": selected["guid"], "indexerId": selected["indexerId"]}
+        if resolved_client_id is not None:
+            grab_body["downloadClientId"] = resolved_client_id
         grab_response = requests.post(
             endpoint, headers=headers,
-            json={"guid": selected["guid"], "indexerId": selected["indexerId"]},
+            json=grab_body,
             timeout=api_timeout, verify=verify_ssl,
         )
         grab_response.raise_for_status()

@@ -240,6 +240,19 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
         settings_data[qfield] = min(qmax, max(qmin, qvalue))
     if app_name == 'sonarr' and 'force_season_replacement' in settings_data:
         settings_data['force_season_replacement'] = settings_data.get('force_season_replacement') is True
+    if app_name == 'sonarr':
+        from src.primary.apps.sonarr.api import VALID_MISSING_PACK_PROTOCOLS
+        if settings_data.get('missing_pack_download_protocol') not in VALID_MISSING_PACK_PROTOCOLS:
+            settings_data['missing_pack_download_protocol'] = 'sonarr_default'
+        client_id = settings_data.get('missing_pack_download_client_id')
+        if client_id in ('', 'automatic', 'null'):
+            client_id = None
+        if client_id is not None:
+            try:
+                client_id = int(client_id)
+            except (TypeError, ValueError):
+                client_id = None
+        settings_data['missing_pack_download_client_id'] = client_id
     if app_name in ('sonarr', 'radarr'):
         settings_data['webhook_enabled'] = settings_data.get('webhook_enabled') is True
         settings_data['decypharr_capacity_enabled'] = settings_data.get('decypharr_capacity_enabled') is True
@@ -268,6 +281,18 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
                     instance[qfield] = min(qmax, max(qmin, qvalue))
                 if app_name == 'sonarr':
                     instance['force_season_replacement'] = instance.get('force_season_replacement') is True
+                    from src.primary.apps.sonarr.api import VALID_MISSING_PACK_PROTOCOLS
+                    if instance.get('missing_pack_download_protocol') not in VALID_MISSING_PACK_PROTOCOLS:
+                        instance['missing_pack_download_protocol'] = 'sonarr_default'
+                    inst_client_id = instance.get('missing_pack_download_client_id')
+                    if inst_client_id in ('', 'automatic', 'null'):
+                        inst_client_id = None
+                    if inst_client_id is not None:
+                        try:
+                            inst_client_id = int(inst_client_id)
+                        except (TypeError, ValueError):
+                            inst_client_id = None
+                    instance['missing_pack_download_client_id'] = inst_client_id
                 if app_name in ('sonarr', 'radarr'):
                     instance['webhook_enabled'] = instance.get('webhook_enabled') is True
                     instance['decypharr_capacity_enabled'] = instance.get('decypharr_capacity_enabled') is True

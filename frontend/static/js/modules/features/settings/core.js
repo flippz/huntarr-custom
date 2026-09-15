@@ -578,6 +578,88 @@ window.SettingsForms = {
         }
     },
 
+    // Show/hide the strict missing season-pack protocol/client routing fields;
+    // only relevant when Missing Search Mode is Season Packs.
+    toggleMissingPackRoutingVisibility: function() {
+        const modeEl = document.getElementById('editor-missing-mode');
+        const group = document.querySelector('.editor-missing-pack-routing-group');
+        if (modeEl && group) {
+            group.style.display = (modeEl.value === 'seasons_packs') ? 'block' : 'none';
+        }
+    },
+
+    // Enable/disable the client dropdown based on protocol, and (re)load the live
+    // client list from Sonarr when a specific protocol is selected.
+    onMissingPackProtocolChange: function(selectEl) {
+        const clientEl = document.getElementById('editor-missing-pack-client');
+        if (!clientEl) return;
+        const protocol = selectEl ? selectEl.value : 'sonarr_default';
+        if (protocol === 'sonarr_default') {
+            clientEl.disabled = true;
+            clientEl.innerHTML = '<option value="">Automatic (Sonarr chooses)</option>';
+            return;
+        }
+        clientEl.disabled = false;
+        this.loadMissingPackDownloadClients(protocol);
+    },
+
+    // Fetch Sonarr's configured download clients and populate the dropdown,
+    // filtered to enabled clients matching the selected protocol.
+    loadMissingPackDownloadClients: function(protocol) {
+        const clientEl = document.getElementById('editor-missing-pack-client');
+        const helpEl = document.getElementById('editor-missing-pack-client-help');
+        if (!clientEl) return;
+        const urlEl = document.getElementById('editor-url');
+        const keyEl = document.getElementById('editor-key');
+        const url = urlEl ? urlEl.value.trim() : '';
+        const apiKey = keyEl ? keyEl.value.trim() : '';
+        const selectedId = clientEl.getAttribute('data-selected-id') || '';
+
+        const renderOptions = (clients, note) => {
+            const compatible = (clients || []).filter(c => c.enable && c.protocol === protocol);
+            let html = '<option value="">Automatic (Sonarr chooses)</option>';
+            compatible.forEach(c => {
+                const selected = String(c.id) === String(selectedId) ? 'selected' : '';
+                const label = String(c.name || ('Client ' + c.id)).replace(/[&<>"']/g, (ch) => ({
+                    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+                })[ch]);
+                html += `<option value="${c.id}" ${selected}>${label}</option>`;
+            });
+            clientEl.innerHTML = html;
+            if (helpEl && note) {
+                helpEl.textContent = note;
+            }
+        };
+
+        if (!url || !apiKey) {
+            renderOptions([], 'Enter URL and API Key above, then reopen this dropdown to load live clients.');
+            return;
+        }
+
+        if (helpEl) {
+            helpEl.textContent = 'Loading download clients from Sonarr...';
+        }
+        HuntarrUtils.fetchWithTimeout('./api/sonarr/download-clients', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_url: url, api_key: apiKey })
+        }, 10000)
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    const compatibleCount = (data.clients || []).filter(c => c.enable && c.protocol === protocol).length;
+                    renderOptions(data.clients, compatibleCount > 0
+                        ? 'Automatic lets Sonarr pick among enabled clients for the selected protocol. A stale or disabled client fails the search closed at grab time (no fallback).'
+                        : `No enabled Sonarr download clients found for protocol "${protocol}". Automatic will be used unless you add/enable one in Sonarr.`);
+                } else {
+                    renderOptions([], data.message || 'Failed to load download clients from Sonarr.');
+                }
+            })
+            .catch(() => {
+                renderOptions([], 'Failed to load download clients from Sonarr (network error).');
+            });
+    },
+
     // Toggle form fields based on enabled status
     toggleFormFields: function() {
         const dropdown = document.getElementById('editor-enabled');

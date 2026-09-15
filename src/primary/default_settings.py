@@ -66,6 +66,10 @@ def get_default_instance_config(app_type: str) -> Dict[str, Any]:
             "upgrade_tag": "upgradinatorr",
             "skip_future_episodes": True,
             "force_season_replacement": False,
+            # Strict missing season-pack download routing (per-instance). "sonarr_default"
+            # leaves protocol/client selection entirely to Sonarr (unchanged behavior).
+            "missing_pack_download_protocol": "sonarr_default",
+            "missing_pack_download_client_id": None,
             "webhook_enabled": False,
             "webhook_secret": "",
             "shared_capacity_weight": 1,

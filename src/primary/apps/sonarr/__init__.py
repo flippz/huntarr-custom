@@ -99,6 +99,8 @@ def get_configured_instances(quiet=False):
                     "decypharr_max_active_jobs": instance.get("decypharr_max_active_jobs", 0),
                     "max_seed_queue_size": instance.get("max_seed_queue_size", -1),
                     "seed_check_torrent_client": instance.get("seed_check_torrent_client"),
+                    "missing_pack_download_protocol": instance.get("missing_pack_download_protocol", "sonarr_default"),
+                    "missing_pack_download_client_id": instance.get("missing_pack_download_client_id"),
                 }
                 instances.append(instance_data)
     
