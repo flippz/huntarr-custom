@@ -122,8 +122,11 @@ def sonarr_download_clients():
     try:
         clients = sonarr_api.get_download_clients(api_url, api_key, api_timeout)
         return jsonify({"success": True, "clients": clients})
-    except Exception as e:
+    except sonarr_api.SonarrDownloadClientsError as e:
         sonarr_logger.error(f"Error listing Sonarr download clients: {e}")
+        return jsonify({"success": False, "message": "Failed to fetch download clients from Sonarr"}), 502
+    except Exception as e:
+        sonarr_logger.error(f"Unexpected error listing Sonarr download clients: {e}")
         return jsonify({"success": False, "message": "Failed to fetch download clients from Sonarr"}), 502
 
 

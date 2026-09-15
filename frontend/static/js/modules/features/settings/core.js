@@ -589,22 +589,39 @@ window.SettingsForms = {
     },
 
     // Enable/disable the client dropdown based on protocol, and (re)load the live
-    // client list from Sonarr when a specific protocol is selected.
+    // client list from Sonarr when a specific protocol is selected. Switching
+    // protocol is a deliberate user action, so the previously configured client
+    // (which was only valid for the old protocol) is intentionally reset here -
+    // this is the one case where clearing the selection is correct, as opposed to
+    // an unrelated save or a failed/slow background fetch silently doing so.
     onMissingPackProtocolChange: function(selectEl) {
         const clientEl = document.getElementById('editor-missing-pack-client');
         if (!clientEl) return;
         const protocol = selectEl ? selectEl.value : 'sonarr_default';
         if (protocol === 'sonarr_default') {
             clientEl.disabled = true;
+            clientEl.setAttribute('data-selected-id', '');
             clientEl.innerHTML = '<option value="">Automatic (Sonarr chooses)</option>';
             return;
         }
         clientEl.disabled = false;
+        clientEl.setAttribute('data-selected-id', '');
         this.loadMissingPackDownloadClients(protocol);
     },
 
+    // Monotonic counter guarding against out-of-order responses: a rapid sequence
+    // of protocol changes can resolve out of order, and an older in-flight
+    // response must never overwrite options rendered by a newer request.
+    _missingPackClientRequestToken: 0,
+
     // Fetch Sonarr's configured download clients and populate the dropdown,
-    // filtered to enabled clients matching the selected protocol.
+    // filtered to enabled clients matching the selected protocol. The currently
+    // configured/selected client id (data-selected-id) is always preserved as an
+    // explicit option - even if it is stale, disabled, or protocol-mismatched -
+    // so a save never silently clears it; the user must actively pick a
+    // different option (including "Automatic") to change it. On any fetch
+    // failure the existing options/selection are left untouched (fail-closed:
+    // an unrelated save must not weaken or clear the configured client).
     loadMissingPackDownloadClients: function(protocol) {
         const clientEl = document.getElementById('editor-missing-pack-client');
         const helpEl = document.getElementById('editor-missing-pack-client-help');
@@ -615,27 +632,42 @@ window.SettingsForms = {
         const apiKey = keyEl ? keyEl.value.trim() : '';
         const selectedId = clientEl.getAttribute('data-selected-id') || '';
 
+        const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (ch) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        })[ch]);
+
+        // Renders the compatible-clients list plus, if the currently selected id
+        // isn't among them, a synthetic "Unavailable" option that stays selected
+        // so the value is preserved through save until the user changes it.
         const renderOptions = (clients, note) => {
             const compatible = (clients || []).filter(c => c.enable && c.protocol === protocol);
+            const stillCurrentEl = document.getElementById('editor-missing-pack-client');
+            if (!stillCurrentEl) return;
             let html = '<option value="">Automatic (Sonarr chooses)</option>';
+            let matchedSelected = false;
             compatible.forEach(c => {
-                const selected = String(c.id) === String(selectedId) ? 'selected' : '';
-                const label = String(c.name || ('Client ' + c.id)).replace(/[&<>"']/g, (ch) => ({
-                    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-                })[ch]);
-                html += `<option value="${c.id}" ${selected}>${label}</option>`;
+                const isSelected = selectedId !== '' && String(c.id) === String(selectedId);
+                if (isSelected) matchedSelected = true;
+                const label = escapeHtml(c.name || ('Client ' + c.id));
+                html += `<option value="${c.id}" ${isSelected ? 'selected' : ''}>${label}</option>`;
             });
-            clientEl.innerHTML = html;
+            if (selectedId !== '' && !matchedSelected) {
+                html += `<option value="${escapeHtml(selectedId)}" selected>Unavailable/stale (id ${escapeHtml(selectedId)}) - keep or change</option>`;
+            }
+            stillCurrentEl.innerHTML = html;
             if (helpEl && note) {
                 helpEl.textContent = note;
             }
         };
 
         if (!url || !apiKey) {
-            renderOptions([], 'Enter URL and API Key above, then reopen this dropdown to load live clients.');
+            if (helpEl) {
+                helpEl.textContent = 'Enter URL and API Key above, then reopen this dropdown to load live clients.';
+            }
             return;
         }
 
+        const requestToken = ++this._missingPackClientRequestToken;
         if (helpEl) {
             helpEl.textContent = 'Loading download clients from Sonarr...';
         }
@@ -644,19 +676,36 @@ window.SettingsForms = {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ api_url: url, api_key: apiKey })
         }, 10000)
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
+            .then(response => response.json().then(data => ({ ok: response.ok, data: data })))
+            .then(result => {
+                // Stale response guard: a newer protocol change or reload superseded
+                // this request, or the currently selected protocol no longer matches
+                // what this response was fetched for - discard rather than render.
+                if (requestToken !== this._missingPackClientRequestToken) return;
+                const protocolEl = document.getElementById('editor-missing-pack-protocol');
+                if (protocolEl && protocolEl.value !== protocol) return;
+
+                const data = result.data;
+                if (result.ok && data && data.success) {
                     const compatibleCount = (data.clients || []).filter(c => c.enable && c.protocol === protocol).length;
                     renderOptions(data.clients, compatibleCount > 0
                         ? 'Automatic lets Sonarr pick among enabled clients for the selected protocol. A stale or disabled client fails the search closed at grab time (no fallback).'
                         : `No enabled Sonarr download clients found for protocol "${protocol}". Automatic will be used unless you add/enable one in Sonarr.`);
                 } else {
-                    renderOptions([], data.message || 'Failed to load download clients from Sonarr.');
+                    // Upstream/backend failure (not a legitimate empty list): leave
+                    // existing options/selection untouched, surface the error only.
+                    if (helpEl) {
+                        helpEl.textContent = (data && data.message)
+                            ? `Could not verify download clients from Sonarr: ${data.message}. Your configured selection was not changed.`
+                            : 'Could not verify download clients from Sonarr. Your configured selection was not changed.';
+                    }
                 }
             })
             .catch(() => {
-                renderOptions([], 'Failed to load download clients from Sonarr (network error).');
+                if (requestToken !== this._missingPackClientRequestToken) return;
+                if (helpEl) {
+                    helpEl.textContent = 'Failed to load download clients from Sonarr (network error). Your configured selection was not changed.';
+                }
             });
     },
 

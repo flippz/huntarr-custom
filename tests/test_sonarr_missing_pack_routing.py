@@ -190,16 +190,30 @@ class GetDownloadClientsTests(unittest.TestCase):
         self.assertNotIn("apiKey", result[0])
         self.assertNotIn("api_key", result[0])
 
-    def test_network_error_returns_empty_list_not_exception(self):
-        with mock.patch.object(sonarr_api.requests, "get",
-                               side_effect=sonarr_api.requests.exceptions.ConnectionError("down")):
+    def test_true_empty_client_list_returns_empty_list_not_error(self):
+        """Sonarr legitimately having zero download clients configured is not a failure."""
+        with mock.patch.object(sonarr_api.requests, "get", return_value=_Response([])):
             result = sonarr_api.get_download_clients("http://sonarr", "key", 10)
         self.assertEqual(result, [])
 
-    def test_non_list_response_returns_empty_list(self):
+    def test_network_error_raises_distinct_from_empty_list(self):
+        """An upstream fetch failure must be distinguishable from a true empty list (P2 fix)."""
+        with mock.patch.object(sonarr_api.requests, "get",
+                               side_effect=sonarr_api.requests.exceptions.ConnectionError("down")):
+            with self.assertRaises(sonarr_api.SonarrDownloadClientsError):
+                sonarr_api.get_download_clients("http://sonarr", "key", 10)
+
+    def test_http_error_status_raises(self):
+        error = sonarr_api.requests.exceptions.HTTPError("500 server error")
+        with mock.patch.object(sonarr_api.requests, "get",
+                               return_value=_Response({}, status=500, error=error)):
+            with self.assertRaises(sonarr_api.SonarrDownloadClientsError):
+                sonarr_api.get_download_clients("http://sonarr", "key", 10)
+
+    def test_non_list_response_raises(self):
         with mock.patch.object(sonarr_api.requests, "get", return_value=_Response({"not": "a list"})):
-            result = sonarr_api.get_download_clients("http://sonarr", "key", 10)
-        self.assertEqual(result, [])
+            with self.assertRaises(sonarr_api.SonarrDownloadClientsError):
+                sonarr_api.get_download_clients("http://sonarr", "key", 10)
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +263,32 @@ class DownloadClientsRouteTests(unittest.TestCase):
                                     json={"api_url": "http://sonarr", "api_key": "secret"})
         self.assertEqual(resp.status_code, 502)
         self.assertNotIn("boom", str(resp.get_json()))
+
+    def test_sonarr_download_clients_error_returns_502_with_failure_status(self):
+        """P2 fix: a real upstream fetch failure must be distinguishable from an
+        empty client list - success:false + 502, never success:true + []."""
+        from src.primary.apps.sonarr import api as real_sonarr_api
+        with mock.patch(
+                "src.primary.apps.sonarr_routes.sonarr_api.get_download_clients",
+                side_effect=real_sonarr_api.SonarrDownloadClientsError("Sonarr unreachable")):
+            resp = self.client.post("/api/sonarr/download-clients",
+                                    json={"api_url": "http://sonarr", "api_key": "secret"})
+        self.assertEqual(resp.status_code, 502)
+        body = resp.get_json()
+        self.assertFalse(body["success"])
+        self.assertNotIn("clients", body)
+
+    def test_true_empty_client_list_returns_200_success_with_empty_array(self):
+        """Distinguish "Sonarr has zero clients" (200/success) from an error (502)."""
+        with mock.patch(
+                "src.primary.apps.sonarr_routes.sonarr_api.get_download_clients",
+                return_value=[]):
+            resp = self.client.post("/api/sonarr/download-clients",
+                                    json={"api_url": "http://sonarr", "api_key": "secret"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["clients"], [])
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +548,27 @@ class ExactClientIdPassthroughTests(unittest.TestCase):
         )
         self.assertIsNone(result)
         entered[9].assert_not_called()
+
+    def test_download_clients_fetch_error_fails_closed_same_as_empty_list(self):
+        """P2 fix: get_download_clients now raises on fetch failure instead of
+        returning []; grab-time validation must still fail closed identically."""
+        patches = self._dispatch_patches() + (
+            mock.patch.object(sonarr_api.requests, "get"),
+            mock.patch.object(sonarr_api.requests, "post"),
+            mock.patch.object(sonarr_api, "get_download_clients",
+                              side_effect=sonarr_api.SonarrDownloadClientsError("Sonarr unreachable")),
+        )
+        entered = [p.start() for p in patches]
+        self.addCleanup(lambda: [p.stop() for p in reversed(patches)])
+
+        result = sonarr_api.grab_best_season_pack(
+            "http://sonarr", "secret", 10, 7, 2, [11], "main",
+            download_protocol="usenet", download_client_id=42,
+        )
+        self.assertIsNone(result)
+        entered[8].assert_not_called()  # GET /release never dispatched
+        entered[9].assert_not_called()
+        entered[0].assert_not_called()  # claim_search never reached: no cap/queue slot consumed
 
 
 # ---------------------------------------------------------------------------

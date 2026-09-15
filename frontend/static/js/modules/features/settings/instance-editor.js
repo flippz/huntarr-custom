@@ -696,8 +696,9 @@
                         <p class="editor-help-text">Restricts strict missing season-pack search results to this protocol before grabbing. "Sonarr default" applies no protocol filter. If no acceptable pack matches, nothing is grabbed (no fallback to another protocol or to episodes).</p>
                         <div class="editor-setting-item" style="margin-top: 8px;">
                             <label>Missing Season Pack Download Client</label>
-                            <select id="editor-missing-pack-client" data-selected-id="${safeInstance.missing_pack_download_client_id !== null ? safeInstance.missing_pack_download_client_id : ''}" ${(safeInstance.missing_pack_download_protocol || 'sonarr_default') === 'sonarr_default' ? 'disabled' : ''}>
+                            <select id="editor-missing-pack-client" data-selected-id="${safeInstance.missing_pack_download_client_id !== null ? safeInstance.missing_pack_download_client_id : ''}" ${(safeInstance.missing_pack_download_protocol || 'sonarr_default') === 'sonarr_default' ? 'disabled' : ''} onchange="this.setAttribute('data-selected-id', this.value);">
                                 <option value="">Automatic (Sonarr chooses)</option>
+                                ${safeInstance.missing_pack_download_client_id !== null ? `<option value="${safeInstance.missing_pack_download_client_id}" selected>Configured client (id ${safeInstance.missing_pack_download_client_id}) - loading...</option>` : ''}
                             </select>
                         </div>
                         <p class="editor-help-text" id="editor-missing-pack-client-help">Automatic lets Sonarr pick among enabled clients for the selected protocol. Loads live from Sonarr when URL/API Key are set; only enabled clients matching the chosen protocol are selectable. A stale or disabled client fails the search closed at grab time (no fallback).</p>

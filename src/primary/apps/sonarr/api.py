@@ -1070,6 +1070,15 @@ def normalize_release_protocol(value: Any) -> Optional[str]:
     return None
 
 
+class SonarrDownloadClientsError(Exception):
+    """Raised when Sonarr's download-client list could not be fetched/parsed.
+
+    Distinct from a successful fetch that legitimately returns zero clients, so
+    callers (the settings-UI route, and grab-time validation) can tell "Sonarr is
+    unreachable/erroring" apart from "Sonarr has no download clients configured".
+    """
+
+
 def get_download_clients(api_url: str, api_key: str, api_timeout: int) -> List[Dict[str, Any]]:
     """Fetch Sonarr's configured download clients (id, name, protocol, enable).
 
@@ -1077,6 +1086,10 @@ def get_download_clients(api_url: str, api_key: str, api_timeout: int) -> List[D
     grab time to validate a configured client id still exists/enabled/compatible.
     Never exposes the Sonarr API key; callers pass credentials in, this only
     returns provider metadata already scoped by Sonarr's own auth.
+
+    Raises SonarrDownloadClientsError on any fetch/parse failure rather than
+    returning an empty list, so an upstream error is never confused with Sonarr
+    legitimately having zero download clients configured.
     """
     try:
         endpoint = f"{api_url}/api/v3/downloadclient"
@@ -1087,7 +1100,7 @@ def get_download_clients(api_url: str, api_key: str, api_timeout: int) -> List[D
         response.raise_for_status()
         clients = response.json()
         if not isinstance(clients, list):
-            return []
+            raise SonarrDownloadClientsError("Sonarr download-client list returned a non-list response")
         result = []
         for client in clients:
             if not isinstance(client, dict):
@@ -1102,10 +1115,10 @@ def get_download_clients(api_url: str, api_key: str, api_timeout: int) -> List[D
         return result
     except requests.exceptions.RequestException as e:
         sonarr_logger.error(f"Error fetching Sonarr download clients: {e}")
-        return []
+        raise SonarrDownloadClientsError(str(e)) from e
     except (ValueError, TypeError) as e:
         sonarr_logger.error(f"Invalid response fetching Sonarr download clients: {e}")
-        return []
+        raise SonarrDownloadClientsError(str(e)) from e
 
 
 def _resolve_missing_pack_client(api_url: str, api_key: str, api_timeout: int,
@@ -1122,7 +1135,10 @@ def _resolve_missing_pack_client(api_url: str, api_key: str, api_timeout: int,
         return True, None, None
     if download_client_id is None:
         return True, None, None
-    clients = get_download_clients(api_url, api_key, api_timeout)
+    try:
+        clients = get_download_clients(api_url, api_key, api_timeout)
+    except SonarrDownloadClientsError as exc:
+        return False, None, f"could not fetch Sonarr download clients to validate configured client: {exc}"
     if not clients:
         return False, None, "no Sonarr download clients available to validate configured client"
     match = next((c for c in clients if c.get("id") == download_client_id), None)
