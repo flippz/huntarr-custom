@@ -49,6 +49,183 @@ def _release(guid, weight, **changes):
     return release
 
 
+def _rejected_release(guid, weight, rejections, **changes):
+    """A release Sonarr rejected (approved=False) with the given rejections list."""
+    return _release(
+        guid, weight, approved=False, rejected=True,
+        rejections=rejections, **changes,
+    )
+
+
+class CutoffOnlyRejectionMatchingTests(unittest.TestCase):
+    """Unit coverage for the narrow allowlist matcher itself (_cutoff_only_rejections)."""
+
+    def test_single_exact_cutoff_message_matches(self):
+        release = _rejected_release("r1", 0, ["Existing file meets cutoff: WEB DL-1080p"])
+        self.assertTrue(sonarr_api._cutoff_only_rejections(release))
+
+    def test_multiple_cutoff_only_reasons_match(self):
+        # A season pack maps multiple episode files; Sonarr emits one rejection per
+        # file that already meets cutoff, so several instances of the same-shaped
+        # message must still be treated as cutoff-only.
+        release = _rejected_release("r1", 0, [
+            "Existing file meets cutoff: WEB DL-1080p",
+            "Existing file meets cutoff: HDTV-720p",
+        ])
+        self.assertTrue(sonarr_api._cutoff_only_rejections(release))
+
+    def test_mixed_cutoff_and_other_reason_fails_closed(self):
+        release = _rejected_release("r1", 0, [
+            "Existing file meets cutoff: WEB DL-1080p",
+            "Not enough seeders",
+        ])
+        self.assertFalse(sonarr_api._cutoff_only_rejections(release))
+
+    def test_similar_but_distinct_reasons_do_not_match(self):
+        # These are real, distinct Sonarr UpgradeDiskSpecification rejection texts that
+        # must never be treated as the narrow cutoff-only condition.
+        distinct_reasons = [
+            "Existing file on disk is of equal or higher preference: WEBDL-1080p",
+            "Existing file on disk is of equal or higher revision: v2",
+            "Existing file on disk meets quality cutoff: WEB DL-1080p",
+            "Existing file on disk meets Custom Format cutoff: 100",
+            "Existing file on disk has a equal or higher Custom Format score: 50",
+            "Existing file on disk has Custom Format score within Custom Format score increment: 10",
+            "Existing file on disk and Quality Profile 'HD' does not allow upgrades",
+        ]
+        for reason in distinct_reasons:
+            with self.subTest(reason=reason):
+                release = _rejected_release("r1", 0, [reason])
+                self.assertFalse(sonarr_api._cutoff_only_rejections(release))
+
+    def test_empty_rejections_fails_closed(self):
+        release = _rejected_release("r1", 0, [])
+        self.assertFalse(sonarr_api._cutoff_only_rejections(release))
+
+    def test_unknown_or_malformed_rejection_entries_fail_closed(self):
+        malformed_cases = [
+            ["Existing file meets cutoff: WEB DL-1080p", None],
+            ["Existing file meets cutoff: WEB DL-1080p", ""],
+            ["Existing file meets cutoff: WEB DL-1080p", 42],
+            ["Existing file meets cutoff: WEB DL-1080p", ["nested", "list"]],
+            [{"unexpectedKey": "Existing file meets cutoff: WEB DL-1080p"}],
+            [{"reason": 123}],
+        ]
+        for rejections in malformed_cases:
+            with self.subTest(rejections=rejections):
+                release = _rejected_release("r1", 0, rejections)
+                self.assertFalse(sonarr_api._cutoff_only_rejections(release))
+
+    def test_object_shaped_rejection_with_proven_reason_key_matches(self):
+        # Defensive support only: Sonarr's ReleaseResource always emits plain strings
+        # today, but a dict with a string `reason` key is accepted as a proven shape.
+        release = _rejected_release("r1", 0, [
+            {"reason": "Existing file meets cutoff: WEB DL-1080p"},
+        ])
+        self.assertTrue(sonarr_api._cutoff_only_rejections(release))
+
+    def test_non_list_rejections_fails_closed(self):
+        release = _rejected_release("r1", 0, [])
+        release["rejections"] = "Existing file meets cutoff: WEB DL-1080p"
+        self.assertFalse(sonarr_api._cutoff_only_rejections(release))
+
+
+class AcceptableSeasonPackOverrideTests(unittest.TestCase):
+    """Coverage for _acceptable_season_pack's allow_cutoff_override behavior."""
+
+    def test_disabled_override_rejects_cutoff_only_release_unchanged(self):
+        release = _rejected_release("r1", 0, ["Existing file meets cutoff: WEB DL-1080p"])
+        self.assertFalse(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "sonarr_default", allow_cutoff_override=False,
+        ))
+
+    def test_enabled_override_accepts_sole_cutoff_reason(self):
+        release = _rejected_release("r1", 0, ["Existing file meets cutoff: WEB DL-1080p"])
+        self.assertTrue(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "sonarr_default", allow_cutoff_override=True,
+        ))
+
+    def test_enabled_override_accepts_multiple_cutoff_only_reasons(self):
+        release = _rejected_release("r1", 0, [
+            "Existing file meets cutoff: WEB DL-1080p",
+            "Existing file meets cutoff: HDTV-720p",
+        ])
+        self.assertTrue(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "sonarr_default", allow_cutoff_override=True,
+        ))
+
+    def test_enabled_override_never_accepts_mixed_reason(self):
+        release = _rejected_release("r1", 0, [
+            "Existing file meets cutoff: WEB DL-1080p",
+            "Quality for existing file is of equal or higher preference",
+        ])
+        self.assertFalse(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "sonarr_default", allow_cutoff_override=True,
+        ))
+
+    def test_enabled_override_never_accepts_unknown_reason(self):
+        release = _rejected_release("r1", 0, ["Some new Sonarr rejection text"])
+        self.assertFalse(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "sonarr_default", allow_cutoff_override=True,
+        ))
+
+    def test_enabled_override_never_accepts_empty_rejections_with_approved_false(self):
+        # approved=False with no rejections at all is malformed/unexplained - fail closed.
+        release = _rejected_release("r1", 0, [])
+        self.assertFalse(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "sonarr_default", allow_cutoff_override=True,
+        ))
+
+    def test_enabled_override_never_accepts_temporarily_rejected(self):
+        release = _rejected_release(
+            "r1", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            temporarilyRejected=True,
+        )
+        self.assertFalse(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "sonarr_default", allow_cutoff_override=True,
+        ))
+
+    def test_enabled_override_still_enforces_full_season_mapping_and_download_allowed(self):
+        base_rejections = ["Existing file meets cutoff: WEB DL-1080p"]
+        wrong_season = _rejected_release("r1", 0, base_rejections, mappedSeasonNumber=3)
+        wrong_series = _rejected_release("r2", 0, base_rejections, mappedSeriesId=8)
+        not_full_season = _rejected_release("r3", 0, base_rejections, fullSeason=False)
+        no_download_allowed = _rejected_release("r4", 0, base_rejections, downloadAllowed=False)
+        for release in (wrong_season, wrong_series, not_full_season, no_download_allowed):
+            with self.subTest(guid=release["guid"]):
+                self.assertFalse(sonarr_api._acceptable_season_pack(
+                    release, 7, 2, "sonarr_default", allow_cutoff_override=True,
+                ))
+
+    def test_enabled_override_still_enforces_protocol_filter(self):
+        release = _rejected_release(
+            "r1", 0, ["Existing file meets cutoff: WEB DL-1080p"], protocol="torrent",
+        )
+        self.assertFalse(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "usenet", allow_cutoff_override=True,
+        ))
+
+    def test_approved_normal_candidate_unaffected_by_override_flag(self):
+        # A normal approved=True, rejections=[] release must remain acceptable
+        # identically regardless of the override flag - no behavior change for the
+        # already-passing path.
+        release = _release("r1", 0)
+        self.assertTrue(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "sonarr_default", allow_cutoff_override=False,
+        ))
+        self.assertTrue(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "sonarr_default", allow_cutoff_override=True,
+        ))
+
+    def test_approved_true_with_stray_rejections_is_rejected_defensively(self):
+        # Sonarr should never emit approved=True together with populated rejections,
+        # but if it did, treat it as unapproved rather than trusting the approved flag.
+        release = _release("r1", 0, rejections=["Existing file meets cutoff: WEB DL-1080p"])
+        self.assertFalse(sonarr_api._acceptable_season_pack(
+            release, 7, 2, "sonarr_default", allow_cutoff_override=True,
+        ))
+
+
 class StrictSeasonPackApiTests(unittest.TestCase):
     def tearDown(self):
         queue_dispatch.clear_dispatch()
@@ -251,6 +428,172 @@ class StrictSeasonPackApiTests(unittest.TestCase):
         post.assert_not_called()
 
 
+class CutoffOverrideGrabTests(unittest.TestCase):
+    """End-to-end grab_best_season_pack coverage for the cutoff-only override path."""
+
+    def tearDown(self):
+        queue_dispatch.clear_dispatch()
+
+    def _dispatch_patches(self, claim=True, acquire=True):
+        return (
+            mock.patch.object(queue_dispatch, "claim_search", return_value=claim),
+            mock.patch.object(queue_dispatch, "acquire_dispatch_slot", return_value=acquire),
+            mock.patch.object(queue_dispatch, "begin_search_submission", return_value=True),
+            mock.patch.object(queue_dispatch, "finish_interactive_search", return_value=True),
+            mock.patch.object(queue_dispatch, "finish_search_claim", return_value=True),
+            mock.patch.object(queue_dispatch, "cancel_dispatch_slot"),
+            mock.patch.object(queue_dispatch, "publish_noop"),
+            mock.patch("src.primary.stats_manager.check_hourly_cap_exceeded", return_value=False),
+        )
+
+    def test_disabled_by_default_omits_should_override_and_rejects_cutoff_only_pack(self):
+        cutoff_only = _rejected_release("cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"])
+        patches = self._dispatch_patches() + (
+            mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
+            mock.patch.object(sonarr_api.requests, "post", return_value=_Response({})),
+        )
+        entered = [patch.start() for patch in patches]
+        self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
+
+        result = sonarr_api.grab_best_season_pack(
+            "http://sonarr", "secret", 10, 7, 2, [11], "main",
+        )
+        self.assertIsNone(result)
+        entered[9].assert_not_called()
+
+    def test_enabled_override_grabs_cutoff_only_pack_with_should_override_true(self):
+        cutoff_only = _rejected_release("cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"])
+        patches = self._dispatch_patches() + (
+            mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
+            mock.patch.object(sonarr_api.requests, "post", return_value=_Response({})),
+        )
+        entered = [patch.start() for patch in patches]
+        self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
+
+        result = sonarr_api.grab_best_season_pack(
+            "http://sonarr", "secret", 10, 7, 2, [11], "main",
+            allow_cutoff_override=True,
+        )
+        self.assertEqual(result["guid"], "cutoff-only")
+        post_kwargs = entered[9].call_args.kwargs
+        self.assertEqual(post_kwargs["json"], {
+            "guid": "cutoff-only", "indexerId": 5, "shouldOverride": True,
+        })
+
+    def test_enabled_override_normal_approved_candidate_omits_should_override(self):
+        # An approved, non-rejected candidate must never carry shouldOverride even
+        # when the setting is enabled - the override only applies when it was actually
+        # needed to qualify the selected release.
+        normal = _release("normal", 0)
+        patches = self._dispatch_patches() + (
+            mock.patch.object(sonarr_api.requests, "get", return_value=_Response([normal])),
+            mock.patch.object(sonarr_api.requests, "post", return_value=_Response({})),
+        )
+        entered = [patch.start() for patch in patches]
+        self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
+
+        result = sonarr_api.grab_best_season_pack(
+            "http://sonarr", "secret", 10, 7, 2, [11], "main",
+            allow_cutoff_override=True,
+        )
+        self.assertEqual(result["guid"], "normal")
+        post_kwargs = entered[9].call_args.kwargs
+        self.assertNotIn("shouldOverride", post_kwargs["json"])
+
+    def test_enabled_override_skips_earlier_mixed_rejection_selects_later_cutoff_only(self):
+        # Sonarr ranking order must be preserved: an earlier-ranked candidate with an
+        # unsafe/mixed rejection is skipped, and a later-ranked cutoff-only candidate
+        # is selected instead - never the reverse, and never the unsafe one.
+        earlier_mixed = _rejected_release(
+            "earlier-mixed", 0,
+            ["Existing file meets cutoff: WEB DL-1080p", "Not enough seeders"],
+        )
+        later_cutoff_only = _rejected_release(
+            "later-cutoff-only", 1, ["Existing file meets cutoff: HDTV-720p"],
+        )
+        patches = self._dispatch_patches() + (
+            mock.patch.object(sonarr_api.requests, "get",
+                              return_value=_Response([earlier_mixed, later_cutoff_only])),
+            mock.patch.object(sonarr_api.requests, "post", return_value=_Response({})),
+        )
+        entered = [patch.start() for patch in patches]
+        self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
+
+        result = sonarr_api.grab_best_season_pack(
+            "http://sonarr", "secret", 10, 7, 2, [11], "main",
+            allow_cutoff_override=True,
+        )
+        self.assertEqual(result["guid"], "later-cutoff-only")
+        post_kwargs = entered[9].call_args.kwargs
+        self.assertTrue(post_kwargs["json"]["shouldOverride"])
+
+    def test_enabled_override_preserves_download_client_id_alongside_should_override(self):
+        cutoff_only = _rejected_release("cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+                                         protocol="usenet")
+        clients = [{"id": 18, "name": "Decypharr Usenet", "protocol": "usenet", "enable": True}]
+        patches = self._dispatch_patches() + (
+            mock.patch.object(sonarr_api, "get_download_clients", return_value=clients),
+            mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
+            mock.patch.object(sonarr_api.requests, "post", return_value=_Response({})),
+        )
+        entered = [patch.start() for patch in patches]
+        self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
+
+        result = sonarr_api.grab_best_season_pack(
+            "http://sonarr", "secret", 10, 7, 2, [11], "main",
+            download_protocol="usenet", download_client_id=18,
+            allow_cutoff_override=True,
+        )
+        self.assertEqual(result["guid"], "cutoff-only")
+        post_kwargs = entered[10].call_args.kwargs
+        self.assertEqual(post_kwargs["json"], {
+            "guid": "cutoff-only", "indexerId": 5,
+            "downloadClientId": 18, "shouldOverride": True,
+        })
+
+    def test_enabled_override_no_qualifying_pack_still_no_grab(self):
+        mixed = _rejected_release("mixed", 0, ["Not enough seeders"])
+        unknown = _rejected_release("unknown", 1, ["Some brand new rejection text"])
+        patches = self._dispatch_patches() + (
+            mock.patch.object(sonarr_api.requests, "get", return_value=_Response([mixed, unknown])),
+            mock.patch.object(sonarr_api.requests, "post"),
+        )
+        entered = [patch.start() for patch in patches]
+        self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
+
+        result = sonarr_api.grab_best_season_pack(
+            "http://sonarr", "secret", 10, 7, 2, [11], "main",
+            allow_cutoff_override=True,
+        )
+        self.assertIsNone(result)
+        entered[9].assert_not_called()
+        entered[3].assert_called_once_with(
+            "no_grab", "sonarr", "main", cooldown_seconds=300,
+            queue_submission=False,
+        )
+
+    def test_enabled_override_post_failure_unwinds_queue_reservation(self):
+        cutoff_only = _rejected_release("cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"])
+        error = sonarr_api.requests.exceptions.HTTPError("grab failed")
+        patches = self._dispatch_patches() + (
+            mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
+            mock.patch.object(sonarr_api.requests, "post",
+                              return_value=_Response({}, status=500, error=error)),
+        )
+        entered = [patch.start() for patch in patches]
+        self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
+
+        result = sonarr_api.grab_best_season_pack(
+            "http://sonarr", "secret", 10, 7, 2, [11], "main",
+            allow_cutoff_override=True,
+        )
+        self.assertIsNone(result)
+        entered[3].assert_called_once_with(
+            "failed", "sonarr", "main", cooldown_seconds=300,
+            queue_submission=False,
+        )
+
+
 class InteractiveDispatchAccountingTests(unittest.TestCase):
     def setUp(self):
         self.context = queue_dispatch.DispatchContext(
@@ -327,7 +670,7 @@ class MissingSeasonPackIntegrationTests(unittest.TestCase):
         "series": {"title": "Show"},
     }
 
-    def _run(self, grab_result):
+    def _run(self, grab_result, **kwargs):
         with mock.patch.object(
                 sonarr_api, "get_missing_episodes_random_page",
                 return_value=[self.episode]), \
@@ -345,6 +688,7 @@ class MissingSeasonPackIntegrationTests(unittest.TestCase):
             result = sonarr_missing.process_missing_seasons_packs_mode(
                 "http://sonarr", "secret", "main", 10, True, True,
                 1, 0, 1, 2, lambda: False,
+                **kwargs,
             )
         return result, grab, processed, tag, history, stats, automatic, episodes
 
@@ -356,6 +700,7 @@ class MissingSeasonPackIntegrationTests(unittest.TestCase):
         grab.assert_called_once_with(
             "http://sonarr", "secret", 10, 7, 2, [11], instance_name="main",
             download_protocol="sonarr_default", download_client_id=None,
+            allow_cutoff_override=False,
         )
         processed.assert_called_once_with("sonarr", "main", "7_2")
         tag.assert_called_once()
@@ -363,6 +708,19 @@ class MissingSeasonPackIntegrationTests(unittest.TestCase):
         stats.assert_called_once_with("sonarr", "hunted", 1, "main")
         automatic.assert_not_called()
         episodes.assert_not_called()
+
+    def test_missing_pack_allow_cutoff_override_defaults_false_and_forwards_when_set(self):
+        result, grab, _processed, _tag, _history, _stats, _automatic, _episodes = self._run(
+            _release("pack", 0)
+        )
+        self.assertTrue(result)
+        self.assertFalse(grab.call_args.kwargs["allow_cutoff_override"])
+
+        result, grab, _processed, _tag, _history, _stats, _automatic, _episodes = self._run(
+            _release("pack", 0), missing_pack_allow_cutoff_override=True,
+        )
+        self.assertTrue(result)
+        self.assertTrue(grab.call_args.kwargs["allow_cutoff_override"])
 
     def test_no_pack_is_not_processed_or_tagged_and_never_falls_back(self):
         result, grab, processed, tag, history, stats, automatic, episodes = self._run(None)

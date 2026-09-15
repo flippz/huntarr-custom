@@ -150,6 +150,7 @@ def process_missing_episodes(
     search_order: str = "random",
     missing_pack_download_protocol: str = "sonarr_default",
     missing_pack_download_client_id: Optional[int] = None,
+    missing_pack_allow_cutoff_override: bool = False,
 ) -> bool:
     """
     Process missing episodes for Sonarr.
@@ -187,6 +188,7 @@ def process_missing_episodes(
             search_order=search_order,
             missing_pack_download_protocol=missing_pack_download_protocol,
             missing_pack_download_client_id=missing_pack_download_client_id,
+            missing_pack_allow_cutoff_override=missing_pack_allow_cutoff_override,
         )
     elif hunt_missing_mode == "shows":
         # Handle show-based missing items (all episodes from a show)
@@ -234,6 +236,7 @@ def process_missing_seasons_packs_mode(
     search_order: str = "random",
     missing_pack_download_protocol: str = "sonarr_default",
     missing_pack_download_client_id: Optional[int] = None,
+    missing_pack_allow_cutoff_override: bool = False,
 ) -> bool:
     """
     Process missing seasons using Sonarr's season-level interactive search.
@@ -428,6 +431,7 @@ def process_missing_seasons_packs_mode(
             season.get('episode_ids', []), instance_name=instance_name,
             download_protocol=missing_pack_download_protocol,
             download_client_id=missing_pack_download_client_id,
+            allow_cutoff_override=missing_pack_allow_cutoff_override,
         )
         
         if selected_pack:

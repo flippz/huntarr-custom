@@ -4,6 +4,7 @@ Sonarr-specific API functions
 Handles all communication with the Sonarr API
 """
 
+import re
 import requests
 import json
 import sys
@@ -1154,21 +1155,84 @@ def _resolve_missing_pack_client(api_url: str, api_key: str, api_timeout: int,
     return True, download_client_id, None
 
 
+# Sonarr's ReleaseResource always serializes `Rejections` as `IEnumerable<string>`
+# (see Sonarr.Api.V3.Indexers.ReleaseResource). The single, exact rejection text this
+# override is allowed to see through is emitted by UpgradeDiskSpecification.IsSatisfiedBy
+# as `DownloadSpecDecision.Reject(DownloadRejectionReason.DiskCutoffMet,
+# "Existing file meets cutoff: {0}", qualityCutoff)` - one instance per existing episode
+# file in the pack that already meets its quality cutoff. Sibling "existing file" rejects
+# ("...is of equal or higher preference", "...meets quality cutoff" (disk, not cutoff),
+# "...meets Custom Format cutoff", "...has a equal or higher Custom Format score",
+# "...does not allow upgrades") use different, deliberately non-matching text.
+_CUTOFF_ONLY_REJECTION_RE = re.compile(r"^Existing file meets cutoff:.*$")
+
+
+def _rejection_text(entry: Any) -> Optional[str]:
+    """Extract rejection text from a proven Sonarr shape only; else None (fail closed).
+
+    Sonarr's release API only ever emits plain strings for `rejections`. A dict shape
+    is accepted defensively (e.g. a `reason`/`message` key) in case a future Sonarr
+    version wraps rejections in an object, but only when it holds a plain string in one
+    of those keys - anything else (nested objects, lists, numbers) is not a proven shape
+    and returns None so the caller fails closed.
+    """
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        for key in ("reason", "message"):
+            value = entry.get(key)
+            if isinstance(value, str):
+                return value
+    return None
+
+
+def _cutoff_only_rejections(release: Dict[str, Any]) -> bool:
+    """True only if every rejection entry is present, string-shaped, and matches the
+    narrow 'Existing file meets cutoff: ...' text. Empty, malformed, or unrecognized
+    entries fail closed (return False), as does a release with no rejections at all
+    (callers only reach here when `approved` is False and rejections must explain why).
+    """
+    rejections = release.get("rejections")
+    if not isinstance(rejections, list) or not rejections:
+        return False
+    for entry in rejections:
+        text = _rejection_text(entry)
+        if not text or not _CUTOFF_ONLY_REJECTION_RE.match(text.strip()):
+            return False
+    return True
+
+
 def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
                             season_number: int,
-                            download_protocol: str = "sonarr_default") -> bool:
-    """Apply Sonarr's explicit season-pack, mapping, and decision fields strictly."""
+                            download_protocol: str = "sonarr_default",
+                            allow_cutoff_override: bool = False) -> bool:
+    """Apply Sonarr's explicit season-pack, mapping, and decision fields strictly.
+
+    When `allow_cutoff_override` is True, a release that fails only Sonarr's
+    approved/rejected checks may still qualify if every rejection Sonarr reported is
+    exclusively the narrow 'Existing file meets cutoff' condition (see
+    `_cutoff_only_rejections`). All other requirements (fullSeason, exact
+    series/season mapping, downloadAllowed, protocol, guid/indexerId) are unchanged
+    and still strictly enforced either way.
+    """
     if not isinstance(release, dict) or release.get("fullSeason") is not True:
         return False
     if release.get("mappedSeriesId") != series_id:
         return False
     if release.get("mappedSeasonNumber") != season_number:
         return False
-    if release.get("approved") is not True or release.get("downloadAllowed") is not True:
+    if release.get("downloadAllowed") is not True:
         return False
-    if release.get("rejected") is True or release.get("temporarilyRejected") is True:
-        return False
-    if release.get("rejections"):
+    if release.get("approved") is not True:
+        if not allow_cutoff_override:
+            return False
+        if release.get("temporarilyRejected") is True:
+            return False
+        if not _cutoff_only_rejections(release):
+            return False
+    elif release.get("rejected") is True or release.get("temporarilyRejected") is True or release.get("rejections"):
+        # Sonarr should not mark approved=True with a hard/temporary reject or any
+        # rejections present, but treat that combination as unapproved defensively.
         return False
     if download_protocol in ("usenet", "torrent"):
         release_protocol = normalize_release_protocol(release.get("protocol"))
@@ -1182,7 +1246,8 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
                           episode_ids: List[int],
                           instance_name: Optional[str] = None,
                           download_protocol: str = "sonarr_default",
-                          download_client_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+                          download_client_id: Optional[int] = None,
+                          allow_cutoff_override: bool = False) -> Optional[Dict[str, Any]]:
     """Run Sonarr's season interactive search and grab its best acceptable full pack.
 
     Sonarr 4 exposes season manual search as ``GET /api/v3/release`` with
@@ -1198,6 +1263,16 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
     clients for the filtered protocol. A stale/disabled/mismatched client fails
     closed before any search is dispatched (no cap/queue slot consumed) and never
     falls back to a different client or protocol.
+
+    ``allow_cutoff_override`` (default False, preserves prior strict behavior) lets a
+    release that otherwise passes every other check qualify despite Sonarr's
+    ``approved=False`` when every rejection Sonarr reported is exclusively the narrow
+    "Existing file meets cutoff" condition (see ``_cutoff_only_rejections``). Any other
+    or mixed rejection reason is never overridden. Sonarr ranking order is preserved:
+    an earlier candidate with an unsafe rejection is skipped in favor of a later
+    cutoff-only candidate. When a cutoff-only override is actually used to select the
+    grabbed release, the grab body sets ``shouldOverride: true`` so Sonarr replaces the
+    existing file; otherwise ``shouldOverride`` is omitted entirely.
     """
     download_protocol = download_protocol if download_protocol in ("usenet", "torrent") else "sonarr_default"
     client_ok, resolved_client_id, client_error = _resolve_missing_pack_client(
@@ -1262,7 +1337,8 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
             ),
         )
         acceptable = [release for _, release in ranked
-                      if _acceptable_season_pack(release, series_id, season_number, download_protocol)]
+                      if _acceptable_season_pack(release, series_id, season_number,
+                                                  download_protocol, allow_cutoff_override)]
         if not acceptable:
             reason = (f"no acceptable {download_protocol} season pack"
                       if download_protocol in ("usenet", "torrent") else "no acceptable season pack")
@@ -1278,9 +1354,12 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
             return None
 
         selected = acceptable[0]
+        cutoff_override_used = allow_cutoff_override and selected.get("approved") is not True
         grab_body = {"guid": selected["guid"], "indexerId": selected["indexerId"]}
         if resolved_client_id is not None:
             grab_body["downloadClientId"] = resolved_client_id
+        if cutoff_override_used:
+            grab_body["shouldOverride"] = True
         grab_response = requests.post(
             endpoint, headers=headers,
             json=grab_body,
@@ -1290,6 +1369,11 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
         finish_interactive_search(
             "grabbed", "sonarr", instance_name, queue_submission=True,
         )
+        if cutoff_override_used:
+            sonarr_logger.info(
+                "Cutoff-only override used for strict season pack: series %s, season %s, release: %s",
+                series_id, season_number, selected.get("title", selected["guid"]),
+            )
         sonarr_logger.info(
             "Grabbed Sonarr-ranked strict season pack for series %s, season %s: %s",
             series_id, season_number, selected.get("title", selected["guid"]),

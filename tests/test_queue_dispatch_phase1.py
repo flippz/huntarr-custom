@@ -89,10 +89,36 @@ class DefaultsAndPlumbingTests(unittest.TestCase):
         self.assertEqual(sonarr["minimum_dispatch_interval_seconds"], 15)
         self.assertEqual(sonarr["queue_redispatch_wait_seconds"], 60)
         self.assertFalse(sonarr["force_season_replacement"])
+        self.assertFalse(sonarr["missing_pack_allow_cutoff_override"])
         self.assertFalse(sonarr["webhook_enabled"])
         self.assertEqual(sonarr["webhook_secret"], "")
         self.assertFalse(sonarr["decypharr_capacity_enabled"])
         self.assertEqual(sonarr["shared_capacity_weight"], 1)
+
+    def test_missing_pack_allow_cutoff_override_migrates_false_for_existing_instance(self):
+        # Existing installs load an instance dict that predates this setting entirely
+        # (no key present at all) - it must default to False, not KeyError or None.
+        class FakeDB:
+            saved = None
+
+            def migrate_instance_identifier(self, *args):
+                return True
+
+            def get_app_config(self, _app):
+                return {}
+
+            def save_app_config(self, _app, data):
+                self.saved = data
+
+        db = FakeDB()
+        payload = {"instances": [{
+            "instance_id": "sonarr-legacy", "enabled": True,
+        }]}
+        with mock.patch.object(settings_manager, "get_database", return_value=db):
+            self.assertTrue(settings_manager.save_settings("sonarr", payload))
+        saved = db.saved["instances"][0]
+        self.assertIn("missing_pack_allow_cutoff_override", saved)
+        self.assertFalse(saved["missing_pack_allow_cutoff_override"])
 
     def test_settings_validation_clamps_queue_controls_and_force_boolean(self):
         class FakeDB:
@@ -120,6 +146,7 @@ class DefaultsAndPlumbingTests(unittest.TestCase):
             "webhook_enabled": True,
             "webhook_secret": "short",
             "force_season_replacement": "true",
+            "missing_pack_allow_cutoff_override": "true",
         }]}
         with mock.patch.object(settings_manager, "get_database", return_value=db):
             self.assertTrue(settings_manager.save_settings("sonarr", payload))
@@ -134,6 +161,32 @@ class DefaultsAndPlumbingTests(unittest.TestCase):
         self.assertTrue(saved["webhook_enabled"])
         self.assertGreaterEqual(len(saved["webhook_secret"]), 24)
         self.assertFalse(saved["force_season_replacement"])
+        # Non-boolean truthy string input must normalize to the strict `is True` check,
+        # i.e. only the Python bool True round-trips; a string "true" becomes False.
+        self.assertFalse(saved["missing_pack_allow_cutoff_override"])
+
+    def test_missing_pack_allow_cutoff_override_true_is_preserved(self):
+        class FakeDB:
+            saved = None
+
+            def migrate_instance_identifier(self, *args):
+                return True
+
+            def get_app_config(self, _app):
+                return {}
+
+            def save_app_config(self, _app, data):
+                self.saved = data
+
+        db = FakeDB()
+        payload = {"instances": [{
+            "instance_id": "sonarr-test2", "enabled": True,
+            "missing_pack_allow_cutoff_override": True,
+        }]}
+        with mock.patch.object(settings_manager, "get_database", return_value=db):
+            self.assertTrue(settings_manager.save_settings("sonarr", payload))
+        saved = db.saved["instances"][0]
+        self.assertTrue(saved["missing_pack_allow_cutoff_override"])
 
     def test_force_option_is_forwarded_only_to_season_upgrade_mode(self):
         with mock.patch.object(sonarr_upgrade, "process_upgrade_seasons_mode", return_value=True) as process, \

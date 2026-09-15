@@ -101,6 +101,7 @@ def get_configured_instances(quiet=False):
                     "seed_check_torrent_client": instance.get("seed_check_torrent_client"),
                     "missing_pack_download_protocol": instance.get("missing_pack_download_protocol", "sonarr_default"),
                     "missing_pack_download_client_id": instance.get("missing_pack_download_client_id"),
+                    "missing_pack_allow_cutoff_override": instance.get("missing_pack_allow_cutoff_override", False),
                 }
                 instances.append(instance_data)
     

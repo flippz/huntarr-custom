@@ -640,6 +640,7 @@ class MissingModeProtocolIntegrationTests(unittest.TestCase):
         grab.assert_called_once_with(
             "http://sonarr", "secret", 10, 7, 2, [11], instance_name="main",
             download_protocol="usenet", download_client_id=42,
+            allow_cutoff_override=False,
         )
         # No grab -> season is never marked processed, never locked, never logged.
         processed.assert_not_called()
