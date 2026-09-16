@@ -1358,7 +1358,7 @@ def _build_override_fields(release: Dict[str, Any], series_id: int,
         if not _is_strict_int(entry_season_number) or entry_season_number != season_number:
             return None
         episode_ids.append(episode_id)
-    if not episode_ids:
+    if not episode_ids or len(episode_ids) != len(set(episode_ids)):
         return None
 
     quality = release.get("quality")
@@ -1385,7 +1385,10 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
                           instance_name: Optional[str] = None,
                           download_protocol: str = "sonarr_default",
                           download_client_id: Optional[int] = None,
-                          allow_cutoff_override: bool = False) -> Optional[Dict[str, Any]]:
+                          allow_cutoff_override: bool = False,
+                          recovery_wait_delay: int = 1,
+                          recovery_wait_attempts: int = 600,
+                          stop_check: Callable[[], bool] = lambda: False) -> Optional[Dict[str, Any]]:
     """Run Sonarr's season interactive search and grab its best acceptable full pack.
 
     Sonarr 4 exposes season manual search as ``GET /api/v3/release`` with
@@ -1416,6 +1419,11 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
     ``shouldOverride`` are omitted entirely, leaving the normal grab body unchanged. If
     the selected release lacks a required field in a proven shape, the grab fails
     closed (no POST, `no_grab` outcome) rather than sending a malformed override.
+    Before an override POST, Huntarr additionally proves the release maps exactly to
+    Sonarr's complete target-season inventory, journals and atomically stages every
+    existing target-season file, then waits for a complete replacement mapping. A
+    partial/failed/interrupted import is quarantined and the originals are restored;
+    approved releases never enter this transaction and retain their prior flow.
     """
     download_protocol = download_protocol if download_protocol in ("usenet", "torrent") else "sonarr_default"
     client_ok, resolved_client_id, client_error = _resolve_missing_pack_client(
@@ -1452,6 +1460,8 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
         return None
 
     search_accepted = False
+    recovery_id = None
+    recovery_started_at = None
     try:
         if not begin_search_submission():
             return None
@@ -1516,17 +1526,89 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
                     series_id, season_number, selected.get("title", selected.get("guid")),
                 )
                 return None
+            if not instance_name or recovery_wait_attempts <= 0:
+                finish_interactive_search(
+                    "no_grab", "sonarr", instance_name, cooldown_seconds=300,
+                    queue_submission=False,
+                )
+                sonarr_logger.error(
+                    "Cutoff-only override blocked for series %s, season %s: durable "
+                    "instance recovery and import waiting are required",
+                    series_id, season_number,
+                )
+                return None
+            from src.primary.apps.sonarr.season_recovery import (
+                mark_search_started, prepare_exact_season, utc_now_iso,
+            )
+            recovery_id = prepare_exact_season(
+                api_url, api_key, api_timeout, instance_name, series_id,
+                season_number, expected_episode_ids=override_fields["episodeIds"],
+                expected_release_title=selected.get("title"),
+                recovery_timeout_seconds=(
+                    max(1, int(recovery_wait_delay or 1))
+                    * max(1, int(recovery_wait_attempts or 1))
+                ),
+            )
+            if not recovery_id:
+                finish_interactive_search(
+                    "no_grab", "sonarr", instance_name, cooldown_seconds=300,
+                    queue_submission=False,
+                )
+                sonarr_logger.error(
+                    "Cutoff-only override blocked for series %s, season %s: exact-season "
+                    "backup/journal preflight failed",
+                    series_id, season_number,
+                )
+                return None
+            recovery_started_at = utc_now_iso()
+            if not mark_search_started(instance_name, recovery_id, recovery_started_at):
+                from src.primary.apps.sonarr.season_recovery import recover_pending
+                recover_pending(api_url, api_key, api_timeout, instance_name)
+                finish_interactive_search(
+                    "no_grab", "sonarr", instance_name, cooldown_seconds=300,
+                    queue_submission=False,
+                )
+                sonarr_logger.error(
+                    "Cutoff-only override blocked for series %s, season %s: recovery journal could not be armed",
+                    series_id, season_number,
+                )
+                return None
             grab_body.update(override_fields)
             grab_body["shouldOverride"] = True
-        grab_response = requests.post(
-            endpoint, headers=headers,
-            json=grab_body,
-            timeout=api_timeout, verify=verify_ssl,
-        )
-        grab_response.raise_for_status()
+        try:
+            grab_response = requests.post(
+                endpoint, headers=headers,
+                json=grab_body,
+                timeout=api_timeout, verify=verify_ssl,
+            )
+            grab_response.raise_for_status()
+        except Exception:
+            if recovery_id:
+                from src.primary.apps.sonarr.season_recovery import finish_operation
+                finish_operation(
+                    api_url, api_key, api_timeout, instance_name, recovery_id,
+                    recovery_started_at, False, recovery_wait_delay,
+                    recovery_wait_attempts, stop_check,
+                )
+                recovery_id = None
+            raise
         finish_interactive_search(
             "grabbed", "sonarr", instance_name, queue_submission=True,
         )
+        if recovery_id:
+            from src.primary.apps.sonarr.season_recovery import finish_operation
+            recovery_outcome = finish_operation(
+                api_url, api_key, api_timeout, instance_name, recovery_id,
+                recovery_started_at, True, recovery_wait_delay,
+                recovery_wait_attempts, stop_check,
+            )
+            recovery_id = None
+            if recovery_outcome != "imported":
+                sonarr_logger.error(
+                    "Cutoff-only override did not commit for series %s, season %s; recovery outcome: %s",
+                    series_id, season_number, recovery_outcome,
+                )
+                return None
         if cutoff_override_used:
             sonarr_logger.info(
                 "Cutoff-only override used for strict season pack: series %s, season %s, release: %s",

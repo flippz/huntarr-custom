@@ -591,6 +591,25 @@ class StrictSeasonPackApiTests(unittest.TestCase):
 class CutoffOverrideGrabTests(unittest.TestCase):
     """End-to-end grab_best_season_pack coverage for the cutoff-only override path."""
 
+    def setUp(self):
+        # API-unit coverage isolates the durable filesystem transaction; its full
+        # validation/rollback behavior is covered in test_sonarr_season_recovery.
+        patches = (
+            mock.patch("src.primary.apps.sonarr.season_recovery.prepare_exact_season",
+                       return_value="journal"),
+            mock.patch("src.primary.apps.sonarr.season_recovery.mark_search_started",
+                       return_value=True),
+            mock.patch("src.primary.apps.sonarr.season_recovery.utc_now_iso",
+                       return_value="2026-09-16T06:00:00Z"),
+            mock.patch("src.primary.apps.sonarr.season_recovery.finish_operation",
+                       return_value="imported"),
+        )
+        started = []
+        for patcher in patches:
+            started.append(patcher.start())
+            self.addCleanup(patcher.stop)
+        self.prepare_recovery, self.mark_recovery, _, self.finish_recovery = started
+
     def tearDown(self):
         queue_dispatch.clear_dispatch()
 
@@ -641,6 +660,16 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             "seriesId": 7, "episodeIds": [101, 102],
             "quality": cutoff_only["quality"], "languages": cutoff_only["languages"],
         })
+        self.prepare_recovery.assert_called_once_with(
+            "http://sonarr", "secret", 10, "main", 7, 2,
+            expected_episode_ids=[101, 102],
+            expected_release_title="Show.S02.cutoff-only",
+            recovery_timeout_seconds=600,
+        )
+        self.mark_recovery.assert_called_once_with(
+            "main", "journal", "2026-09-16T06:00:00Z",
+        )
+        self.finish_recovery.assert_called_once()
 
     def test_enabled_override_normal_approved_candidate_omits_should_override(self):
         # An approved, non-rejected candidate must never carry shouldOverride even
@@ -663,6 +692,26 @@ class CutoffOverrideGrabTests(unittest.TestCase):
         self.assertEqual(post_kwargs["json"], {"guid": "normal", "indexerId": 5})
         for key in ("shouldOverride", "seriesId", "episodeIds", "quality", "languages"):
             self.assertNotIn(key, post_kwargs["json"])
+
+    def test_enabled_override_is_not_returned_successful_until_atomic_commit(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+        )
+        self.finish_recovery.return_value = "restored"
+        patches = self._dispatch_patches() + (
+            mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
+            mock.patch.object(sonarr_api.requests, "post", return_value=_Response({})),
+        )
+        entered = [patch.start() for patch in patches]
+        self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
+
+        result = sonarr_api.grab_best_season_pack(
+            "http://sonarr", "secret", 10, 7, 2, [11], "main",
+            allow_cutoff_override=True,
+        )
+        self.assertIsNone(result)
+        entered[9].assert_called_once()
+        self.finish_recovery.assert_called_once()
 
     def test_enabled_override_skips_earlier_mixed_rejection_selects_later_cutoff_only(self):
         # Sonarr ranking order must be preserved: an earlier-ranked candidate with an
@@ -813,6 +862,16 @@ class CutoffOverrideGrabTests(unittest.TestCase):
         cutoff_only = _rejected_release(
             "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
             mappedEpisodeInfo=[{"id": True, "seasonNumber": 2, "episodeNumber": 1}],
+        )
+        self._assert_override_fails_closed_no_post(cutoff_only)
+
+    def test_enabled_override_duplicate_episode_id_fails_closed(self):
+        cutoff_only = _rejected_release(
+            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
+            mappedEpisodeInfo=[
+                {"id": 101, "seasonNumber": 2, "episodeNumber": 1},
+                {"id": 101, "seasonNumber": 2, "episodeNumber": 2},
+            ],
         )
         self._assert_override_fails_closed_no_post(cutoff_only)
 

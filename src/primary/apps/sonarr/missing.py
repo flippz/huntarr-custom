@@ -426,12 +426,23 @@ def process_missing_seasons_packs_mode(
 
         # Dispatch permission and lifecycle claims are acquired inside this helper
         # before Sonarr is allowed to perform the synchronous indexer search.
+        grab_kwargs = {
+            "instance_name": instance_name,
+            "download_protocol": missing_pack_download_protocol,
+            "download_client_id": missing_pack_download_client_id,
+            "allow_cutoff_override": missing_pack_allow_cutoff_override,
+        }
+        # Preserve the normal Sonarr-approved call shape and lifecycle exactly;
+        # recovery waiting is activated only for the opt-in destructive override.
+        if missing_pack_allow_cutoff_override:
+            grab_kwargs.update({
+                "recovery_wait_delay": command_wait_delay,
+                "recovery_wait_attempts": command_wait_attempts,
+                "stop_check": stop_check,
+            })
         selected_pack = sonarr_api.grab_best_season_pack(
             api_url, api_key, api_timeout, series_id, season_number,
-            season.get('episode_ids', []), instance_name=instance_name,
-            download_protocol=missing_pack_download_protocol,
-            download_client_id=missing_pack_download_client_id,
-            allow_cutoff_override=missing_pack_allow_cutoff_override,
+            season.get('episode_ids', []), **grab_kwargs,
         )
         
         if selected_pack:
