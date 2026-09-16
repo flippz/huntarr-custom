@@ -354,8 +354,15 @@ def recover_pending(api_url: str, api_key: str, api_timeout: int,
         # update. Recover the download id from timestamped history when possible.
         if entry.get("search_started_at") and not entry.get("download_id"):
             grab = _find_grab(api_url, api_key, api_timeout, entry)
-            if grab and grab.get("downloadId"):
-                entry["download_id"] = grab["downloadId"]
+            queued_download_id = None
+            if not grab:
+                queued_download_id = _find_queued_download(
+                    api_url, api_key, api_timeout, entry
+                )
+            if (grab and grab.get("downloadId")) or queued_download_id:
+                entry["download_id"] = (
+                    grab.get("downloadId") if grab else queued_download_id
+                )
                 entry["state"] = "waiting_import"
                 _save(entry)
             else:
@@ -368,7 +375,7 @@ def recover_pending(api_url: str, api_key: str, api_timeout: int,
                     before_deadline = False
                 if before_deadline:
                     logger.warning(
-                        "Exact-season operation %s has no unambiguous grab correlation yet; leaving journal armed",
+                        "Exact-season operation %s has no unambiguous grab correlation yet; leaving journal armed until its deadline",
                         entry["id"],
                     )
                     ok = False
@@ -649,7 +656,9 @@ def finish_operation(api_url: str, api_key: str, api_timeout: int,
     download_id = None
     for attempt in range(attempts):
         grab = _find_grab(api_url, api_key, api_timeout, entry)
-        download_id = grab.get("downloadId") if grab else None
+        download_id = grab.get("downloadId") if grab else _find_queued_download(
+            api_url, api_key, api_timeout, entry
+        )
         if download_id:
             break
         if stop_check():
@@ -657,6 +666,11 @@ def finish_operation(api_url: str, api_key: str, api_timeout: int,
         if attempt + 1 < attempts:
             time.sleep(delay)
     if not download_id:
+        if entry.get("expected_release_title"):
+            entry["state"] = "awaiting_correlation"
+            entry["error"] = "override accepted but no unambiguous download correlation is available"
+            _save(entry)
+            return "failed"
         return "restored" if _rollback(api_url, api_key, api_timeout, entry, "no verified grab") else "failed"
 
     entry["download_id"] = download_id

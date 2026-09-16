@@ -1513,7 +1513,9 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
             grab_body["downloadClientId"] = resolved_client_id
         if cutoff_override_used:
             override_fields = _build_override_fields(selected, series_id, season_number)
-            if override_fields is None:
+            release_title = selected.get("title")
+            if (override_fields is None or not isinstance(release_title, str)
+                    or not release_title):
                 finish_interactive_search(
                     "no_grab", "sonarr", instance_name, cooldown_seconds=300,
                     queue_submission=False,
@@ -1521,7 +1523,7 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
                 sonarr_logger.error(
                     "Cutoff-only override selected for series %s, season %s but the "
                     "release payload is missing/malformed required Sonarr override "
-                    "fields (mappedSeriesId/mappedEpisodeInfo/quality/languages); "
+                    "fields (title/mappedSeriesId/mappedEpisodeInfo/quality/languages); "
                     "failing closed with no grab: %s",
                     series_id, season_number, selected.get("title", selected.get("guid")),
                 )
@@ -1543,7 +1545,7 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
             recovery_id = prepare_exact_season(
                 api_url, api_key, api_timeout, instance_name, series_id,
                 season_number, expected_episode_ids=override_fields["episodeIds"],
-                expected_release_title=selected.get("title"),
+                expected_release_title=release_title,
                 recovery_timeout_seconds=(
                     max(1, int(recovery_wait_delay or 1))
                     * max(1, int(recovery_wait_attempts or 1))

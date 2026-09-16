@@ -283,6 +283,54 @@ class SeasonRecoveryTests(unittest.TestCase):
                 "http://sonarr", "key", 10, entry,
             ))
 
+    def test_uncorrelated_override_rolls_back_after_deadline(self):
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request):
+            journal_id = season_recovery.prepare_exact_season(
+                "http://sonarr", "key", 10, "instance", 7, 1,
+                expected_episode_ids=[11],
+                expected_release_title="Show.S01.Pack",
+                recovery_timeout_seconds=1,
+            )
+            self.assertTrue(season_recovery.mark_search_started(
+                "instance", journal_id, "2026-09-12T10:00:00Z",
+            ))
+            entry = season_recovery._entry_by_id("instance", journal_id)
+            entry["deadline_at"] = "2026-09-12T10:00:01Z"
+            season_recovery._save(entry)
+            self.assertTrue(season_recovery.recover_pending(
+                "http://sonarr", "key", 10, "instance",
+            ))
+        self.assertTrue(self.link.is_symlink())
+        with self.db.get_connection() as conn:
+            state = conn.execute(
+                "SELECT state FROM sonarr_season_recovery_journal WHERE id=?", (journal_id,)
+            ).fetchone()[0]
+        self.assertEqual(state, "completed")
+
+    def test_quarantine_move_intent_recovers_after_rename_crash_window(self):
+        replacement = self.media / "Show.S01E01.new.mkv"
+        replacement.write_bytes(b"new")
+        backup = Path(self.tmp.name) / "recovery" / "failed-replacement" / replacement.name
+        backup.parent.mkdir(parents=True)
+        os.replace(replacement, backup)  # crash after rename, before any later save
+        self.episodes[0]["episodeFileId"] = 303
+        self.files.append({"id": 303, "path": str(replacement)})
+        entry = {
+            "series_id": 7, "season_number": 1,
+            "files": [{"episode_file_id": 101}],
+            "recovery_root": str(Path(self.tmp.name) / "recovery"),
+            "replacement_files": [{
+                "episode_file_id": 303, "path": str(replacement),
+                "backup_path": str(backup),
+            }],
+        }
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request):
+            self.assertIsNone(season_recovery._quarantine_replacements(
+                "http://sonarr", "key", 10, entry,
+            ))
+        self.assertFalse(os.path.lexists(replacement))
+        self.assertEqual(backup.read_bytes(), b"new")
+
     def test_verified_import_preserves_old_symlink_in_recovery_area(self):
         def request(*args, **kwargs):
             endpoint = args[3]
