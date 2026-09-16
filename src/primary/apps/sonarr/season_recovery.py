@@ -400,16 +400,16 @@ def _before_deadline(entry: Dict, fallback_seconds: int = 600) -> bool:
         started = datetime.datetime.fromisoformat(
             str(entry["search_started_at"]).replace("Z", "+00:00")
         )
-        fallback_deadline = started + datetime.timedelta(
-            seconds=max(1, int(fallback_seconds))
-        )
         if entry.get("deadline_at"):
-            persisted = datetime.datetime.fromisoformat(
+            # The durable transaction deadline is authoritative. A restart or
+            # later configuration change must never shorten its settle window.
+            deadline = datetime.datetime.fromisoformat(
                 str(entry["deadline_at"]).replace("Z", "+00:00")
             )
-            deadline = min(persisted, fallback_deadline)
         else:
-            deadline = fallback_deadline
+            deadline = started + datetime.timedelta(
+                seconds=max(1, int(fallback_seconds))
+            )
         return datetime.datetime.now(datetime.timezone.utc) < deadline
     except (TypeError, ValueError):
         return False

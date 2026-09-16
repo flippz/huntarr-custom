@@ -1,5 +1,6 @@
 """Safety and restart tests for guarded Sonarr exact-season replacement."""
 
+import datetime
 import os
 import sqlite3
 import sys
@@ -261,10 +262,21 @@ class SeasonRecoveryTests(unittest.TestCase):
             self.assertEqual(outcome, "failed")
             self.assertFalse(os.path.lexists(self.link))
             active[0] = False
+            entry = season_recovery._entry_by_id("instance", journal_id)
+            entry["deadline_at"] = "2026-09-12T10:00:01Z"
+            season_recovery._save(entry)
             self.assertTrue(season_recovery.recover_pending(
                 "http://sonarr", "key", 10, "instance", recovery_timeout_seconds=1,
             ))
         self.assertTrue(self.link.is_symlink())
+
+    def test_persisted_deadline_is_not_shortened_by_recovery_fallback(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        entry = {
+            "search_started_at": (now - datetime.timedelta(seconds=30)).isoformat(),
+            "deadline_at": (now + datetime.timedelta(seconds=300)).isoformat(),
+        }
+        self.assertTrue(season_recovery._before_deadline(entry, fallback_seconds=1))
 
     def test_queue_disappearance_before_deadline_keeps_originals_staged(self):
         started = season_recovery.utc_now_iso()
