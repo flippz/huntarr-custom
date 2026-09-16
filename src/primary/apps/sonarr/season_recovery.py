@@ -97,6 +97,18 @@ def _import_succeeded(api_url: str, api_key: str, api_timeout: int,
                for record in records)
 
 
+def _same_file_identity(first: str, second: str) -> bool:
+    """Return whether two paths are the same retained file or symlink payload."""
+    if not first or not second or not os.path.lexists(first) or not os.path.lexists(second):
+        return False
+    try:
+        if os.path.islink(first) and os.path.islink(second):
+            return os.readlink(first) == os.readlink(second)
+        return os.path.samestat(os.lstat(first), os.lstat(second))
+    except OSError:
+        return False
+
+
 def _restore_files(entry: Dict) -> Optional[str]:
     """Restore each staged path while retaining the recovery copy.
 
@@ -110,11 +122,8 @@ def _restore_files(entry: Dict) -> Optional[str]:
         backup = item["backup_path"]
         if os.path.lexists(backup):
             if os.path.lexists(original):
-                try:
-                    if os.path.samestat(os.lstat(original), os.lstat(backup)):
-                        continue
-                except OSError:
-                    pass
+                if _same_file_identity(original, backup):
+                    continue
                 conflicts.append(original)
                 continue
             os.makedirs(os.path.dirname(original), exist_ok=True)
@@ -235,6 +244,27 @@ def _validate_replacement(api_url: str, api_key: str, api_timeout: int,
     return True, ""
 
 
+def _restored_originals_registered(api_url: str, api_key: str, api_timeout: int,
+                                   entry: Dict) -> Tuple[bool, str]:
+    """Prove every retained original is back on disk and registered in Sonarr."""
+    _episodes, episode_files, _series = _inventory(
+        api_url, api_key, api_timeout, entry["series_id"]
+    )
+    if not isinstance(episode_files, list):
+        return False, "restored episode-file inventory is unavailable"
+    registered_paths = {
+        os.path.normpath(item.get("path")) for item in episode_files
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    for item in entry.get("files", []):
+        path = item.get("path")
+        backup = item.get("backup_path")
+        if (not isinstance(path, str) or not _same_file_identity(path, backup)
+                or os.path.normpath(path) not in registered_paths):
+            return False, f"restored original is not registered in Sonarr: {path}"
+    return True, ""
+
+
 def _quarantine_replacements(api_url: str, api_key: str, api_timeout: int,
                              entry: Dict) -> Optional[str]:
     """Preserve partial/new target-season files before restoring originals."""
@@ -265,12 +295,20 @@ def _quarantine_replacements(api_url: str, api_key: str, api_timeout: int,
 
     # Reconcile previously journaled move intents first. The intent is persisted
     # before os.replace, making a crash on either side of the rename recoverable.
+    original_backups = {
+        item.get("path"): item.get("backup_path") for item in entry.get("files", [])
+    }
     for intent in entry.get("replacement_files", []):
         path = intent.get("path")
         backup_path = intent.get("backup_path")
         source_exists = bool(path) and os.path.lexists(path)
         backup_exists = bool(backup_path) and os.path.lexists(backup_path)
         if source_exists and backup_exists:
+            # A prior recovery pass may already have restored the retained original
+            # after quarantining a same-path replacement. Treat that durable state as
+            # reconciled rather than repeatedly quarantining the restored original.
+            if _same_file_identity(path, original_backups.get(path)):
+                continue
             return f"replacement quarantine conflict at {path}"
         if source_exists:
             try:
@@ -370,8 +408,16 @@ def _rollback(api_url: str, api_key: str, api_timeout: int, entry: Dict,
     error = _quarantine_replacements(api_url, api_key, api_timeout, entry)
     if not error:
         error = _restore_files(entry)
-    if not error and not _rescan_series(api_url, api_key, api_timeout, entry["series_id"]):
-        error = "files restored but Sonarr did not accept RescanSeries"
+    if not error:
+        rescan_ok = _rescan_series(api_url, api_key, api_timeout, entry["series_id"])
+        registered, registration_error = _restored_originals_registered(
+            api_url, api_key, api_timeout, entry
+        )
+        if not registered:
+            error = (
+                registration_error if rescan_ok
+                else f"Sonarr RescanSeries failed and {registration_error}"
+            )
     entry["state"] = "completed" if not error else "recovery_failed"
     entry["error"] = error
     _save(entry)

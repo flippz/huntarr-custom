@@ -182,6 +182,115 @@ class SeasonRecoveryTests(unittest.TestCase):
             ))
         self.assertTrue(self.link.is_symlink())
 
+    def test_failed_series_rescan_is_success_when_originals_are_registered(self):
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request), \
+             mock.patch.object(season_recovery, "_rescan_series", return_value=False):
+            journal_id = season_recovery.prepare_exact_season(
+                "http://sonarr", "key", 10, "instance", 7, 1
+            )
+            outcome = season_recovery.finish_operation(
+                "http://sonarr", "key", 10, "instance", journal_id,
+                "2026-09-12T10:00:00Z", True, 1, 1, lambda: False,
+            )
+        self.assertEqual(outcome, "restored")
+        self.assertTrue(self.link.is_symlink())
+        with self.db.get_connection() as conn:
+            state = conn.execute(
+                "SELECT state FROM sonarr_season_recovery_journal WHERE id=?", (journal_id,)
+            ).fetchone()[0]
+        self.assertEqual(state, "completed")
+
+    def test_repeated_recovery_accepts_restored_original_with_quarantine_copy(self):
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request):
+            journal_id = season_recovery.prepare_exact_season(
+                "http://sonarr", "key", 10, "instance", 7, 1
+            )
+            entry = season_recovery._entry_by_id("instance", journal_id)
+            self.assertIsNone(season_recovery._restore_files(entry))
+            failed_copy = os.path.join(
+                entry["recovery_root"], "failed-replacement", "Season 01", self.link.name
+            )
+            os.makedirs(os.path.dirname(failed_copy), exist_ok=True)
+            os.link(self.link, failed_copy, follow_symlinks=False)
+            entry["replacement_files"] = [{
+                "episode_file_id": 303,
+                "path": str(self.link),
+                "backup_path": failed_copy,
+            }]
+            entry["state"] = "recovery_failed"
+            season_recovery._save(entry)
+            self.assertTrue(season_recovery.recover_pending(
+                "http://sonarr", "key", 10, "instance"
+            ))
+        self.assertTrue(self.link.is_symlink())
+        self.assertTrue(os.path.lexists(failed_copy))
+        with self.db.get_connection() as conn:
+            state = conn.execute(
+                "SELECT state FROM sonarr_season_recovery_journal WHERE id=?", (journal_id,)
+            ).fetchone()[0]
+        self.assertEqual(state, "completed")
+
+    def test_restored_original_validation_rejects_missing_wrong_or_unregistered(self):
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request):
+            journal_id = season_recovery.prepare_exact_season(
+                "http://sonarr", "key", 10, "instance", 7, 1
+            )
+            entry = season_recovery._entry_by_id("instance", journal_id)
+            self.assertIsNone(season_recovery._restore_files(entry))
+            registered, _ = season_recovery._restored_originals_registered(
+                "http://sonarr", "key", 10, entry
+            )
+            self.assertTrue(registered)
+
+            self.link.unlink()
+            registered, _ = season_recovery._restored_originals_registered(
+                "http://sonarr", "key", 10, entry
+            )
+            self.assertFalse(registered)
+
+            wrong_target = self.target.parent / "wrong.mkv"
+            wrong_target.write_bytes(b"wrong")
+            self.link.symlink_to(wrong_target)
+            registered, _ = season_recovery._restored_originals_registered(
+                "http://sonarr", "key", 10, entry
+            )
+            self.assertFalse(registered)
+
+            self.link.unlink()
+            os.link(entry["files"][0]["backup_path"], self.link, follow_symlinks=False)
+            with mock.patch.object(
+                season_recovery.sonarr_api, "arr_request",
+                side_effect=lambda *args, **kwargs: []
+                if args[3].startswith("episodefile?") else self._request(*args, **kwargs),
+            ):
+                registered, _ = season_recovery._restored_originals_registered(
+                    "http://sonarr", "key", 10, entry
+                )
+            self.assertFalse(registered)
+
+    def test_repeated_recovery_preserves_different_quarantine_copy(self):
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request):
+            journal_id = season_recovery.prepare_exact_season(
+                "http://sonarr", "key", 10, "instance", 7, 1
+            )
+            entry = season_recovery._entry_by_id("instance", journal_id)
+            self.assertIsNone(season_recovery._restore_files(entry))
+            failed_copy = os.path.join(
+                entry["recovery_root"], "failed-replacement", "Season 01", self.link.name
+            )
+            os.makedirs(os.path.dirname(failed_copy), exist_ok=True)
+            os.symlink(str(self.target.parent / "replacement.mkv"), failed_copy)
+            entry["replacement_files"] = [{
+                "episode_file_id": 303,
+                "path": str(self.link),
+                "backup_path": failed_copy,
+            }]
+            self.assertIsNone(season_recovery._quarantine_replacements(
+                "http://sonarr", "key", 10, entry
+            ))
+        self.assertEqual(os.readlink(self.link), str(self.target))
+        self.assertEqual(os.readlink(failed_copy), str(self.target.parent / "replacement.mkv"))
+
     def test_import_timeout_restores_old_symlink_and_rescans(self):
         def request(*args, **kwargs):
             endpoint = args[3]
