@@ -4,7 +4,6 @@ Sonarr-specific API functions
 Handles all communication with the Sonarr API
 """
 
-import copy
 import re
 import requests
 import json
@@ -1207,17 +1206,15 @@ def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
                             allow_cutoff_override: bool = False) -> bool:
     """Apply Sonarr's explicit season-pack, mapping, and decision fields strictly.
 
-    When `allow_cutoff_override` is True, a release may still qualify despite failing
-    Sonarr's approval check, but only in the exact, unambiguous decision state:
-    `approved is False`, `rejected is True`, `temporarilyRejected is False` (each
-    compared with `is`, not truthiness - a missing/None/other-typed field never
-    qualifies), and a nonempty `rejections` list where every entry is exclusively the
-    narrow 'Existing file meets cutoff: <quality>' text (see `_cutoff_only_rejections`).
-    Any other or malformed decision-state combination fails closed exactly like the
-    disabled path. All other requirements (fullSeason, exact series/season mapping,
-    downloadAllowed, protocol, guid/indexerId) are unchanged and still strictly
-    enforced either way.
+    ``allow_cutoff_override`` remains in the signature for configuration/API
+    compatibility, but deliberately does not relax Sonarr's decision. Live Sonarr 4
+    behavior proved that ``shouldOverride`` only overrides the grab decision: Completed
+    Download Handling independently re-applies per-file quality/custom-format gates and
+    can import only part of a season. A successful POST is therefore not evidence of a
+    safe or complete replacement. Until an atomic, journaled exact-season workflow can
+    prove the final file-to-episode mapping, every rejected release fails closed.
     """
+    del allow_cutoff_override  # legacy option is intentionally safety-disabled
     if not isinstance(release, dict) or release.get("fullSeason") is not True:
         return False
     if release.get("mappedSeriesId") != series_id:
@@ -1227,21 +1224,8 @@ def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
     if release.get("downloadAllowed") is not True:
         return False
     if release.get("approved") is not True:
-        # Only a release in Sonarr's exact, unambiguous "hard rejected, not temporary"
-        # decision state is even considered for override: approved must be literally
-        # False (not None/missing/any other falsy value), rejected must be literally
-        # True, and temporarilyRejected must be literally False (not None/missing/True).
-        # Any deviation - a malformed/partial decision payload - fails closed exactly
-        # like the disabled path, never falling through to the override check.
-        if (
-            not allow_cutoff_override
-            or release.get("approved") is not False
-            or release.get("rejected") is not True
-            or release.get("temporarilyRejected") is not False
-            or not _cutoff_only_rejections(release)
-        ):
-            return False
-    elif release.get("rejected") is True or release.get("temporarilyRejected") is True or release.get("rejections"):
+        return False
+    if release.get("rejected") is True or release.get("temporarilyRejected") is True or release.get("rejections"):
         # Sonarr should not mark approved=True with a hard/temporary reject or any
         # rejections present, but treat that combination as unapproved defensively.
         return False
@@ -1250,133 +1234,6 @@ def _acceptable_season_pack(release: Dict[str, Any], series_id: int,
         if release_protocol != download_protocol:
             return False
     return bool(release.get("guid")) and release.get("indexerId") is not None
-
-
-def _is_strict_int(value: Any) -> bool:
-    """True only for a plain ``int``; ``bool`` is an ``int`` subclass in Python and
-    is explicitly excluded so a stray True/False can never pass as a Sonarr id."""
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _valid_quality_model_shape(quality: Any) -> bool:
-    """True only for a dict matching Sonarr's ``QualityModel`` JSON shape exactly
-    (NzbDrone.Core.Qualities.QualityModel/Quality/Revision): a nonempty dict with a
-    nested ``quality`` dict carrying an int (non-bool) ``id`` and a non-empty ``name``
-    string, and a nested ``revision`` dict carrying int (non-bool) ``version``/``real``
-    and a ``bool`` ``isRepack``. Sonarr always serializes both nested objects, never a
-    scalar/None/missing sub-object, so anything else is not a proven live shape and
-    fails closed rather than being coerced or partially trusted.
-    """
-    if not isinstance(quality, dict) or not quality:
-        return False
-    inner_quality = quality.get("quality")
-    if not isinstance(inner_quality, dict):
-        return False
-    if not _is_strict_int(inner_quality.get("id")):
-        return False
-    if not isinstance(inner_quality.get("name"), str) or not inner_quality.get("name"):
-        return False
-    revision = quality.get("revision")
-    if not isinstance(revision, dict):
-        return False
-    if not _is_strict_int(revision.get("version")):
-        return False
-    if not _is_strict_int(revision.get("real")):
-        return False
-    if not isinstance(revision.get("isRepack"), bool):
-        return False
-    return True
-
-
-def _valid_language_entry_shape(entry: Any) -> bool:
-    """True only for a dict matching Sonarr's ``Language`` JSON shape exactly
-    (NzbDrone.Core.Languages.Language): an int (non-bool) ``id`` (which may
-    legitimately be 0 "Unknown" or -2 "Original" - no positivity constraint) and a
-    non-empty string ``name``. A bare scalar/bool/string entry is not a proven Sonarr
-    shape and fails closed.
-    """
-    if not isinstance(entry, dict):
-        return False
-    if not _is_strict_int(entry.get("id")):
-        return False
-    return isinstance(entry.get("name"), str) and bool(entry.get("name"))
-
-
-def _build_override_fields(release: Dict[str, Any], series_id: int,
-                           season_number: int) -> Optional[Dict[str, Any]]:
-    """Build the exact extra fields Sonarr's ReleaseController requires when
-    ``shouldOverride`` is true, sourced only from the selected ReleaseResource.
-
-    Sonarr 4's ``DownloadRelease`` action (Sonarr.Api.V3.Indexers.ReleaseController)
-    enforces, when ``release.ShouldOverride == true``: non-null ``SeriesId``,
-    non-null and non-empty ``EpisodeIds``, non-null ``Quality``, and non-null
-    ``Languages``. It then clones the cached ``RemoteEpisode``, re-resolves
-    ``Series``/``Episodes`` from those exact fields, and overwrites
-    ``ParsedEpisodeInfo.Quality``/``Languages`` with them - so any field sourced
-    incorrectly (wrong series, partial/cross-season episode list, fabricated
-    quality/languages) silently redirects or corrupts the grab rather than failing.
-
-    ``episodeIds`` is deliberately sourced from the release's own
-    ``mappedEpisodeInfo`` (``ReleaseEpisodeResource`` per
-    Sonarr.Api.V3.Indexers.ReleaseResource, carrying ``id``/``seasonNumber``/
-    ``episodeNumber``) - the full pack's mapped episode entries - not from Huntarr's
-    missing-episode list, which is only a subset when some episodes in the pack
-    already exist. Every entry's ``seasonNumber`` must equal the exact requested
-    ``season_number``: Sonarr never returns cross-season entries for a season search,
-    so any mismatch means the payload is not the proven shape and the override must
-    never broaden onto another season's episodes. ``mappedSeriesId`` (already required
-    to equal ``series_id`` by ``_acceptable_season_pack``) is independently re-checked
-    here for the ``seriesId`` field for the same reason: it is Sonarr's own mapping
-    for this exact release, not merely the value Huntarr requested.
-
-    Returns None (fail closed, no POST) if any required field is absent from the
-    release payload or does not match Sonarr's proven shape: ``mappedSeriesId`` must
-    be an int (non-bool) equal to ``series_id`` exactly; ``mappedEpisodeInfo`` must be
-    a nonempty list of dict entries each with an int (non-bool) ``id`` and an int
-    (non-bool) ``seasonNumber`` equal to ``season_number`` exactly; ``quality`` must
-    match Sonarr's ``QualityModel`` shape (see ``_valid_quality_model_shape``);
-    ``languages`` must be a list of entries each matching Sonarr's ``Language`` shape
-    (see ``_valid_language_entry_shape``). ``quality`` and ``languages`` are deep-copied
-    before being returned so a caller mutating the payload can never alter the
-    selected release dict. Never invents or widens any of these values.
-    """
-    mapped_series_id = release.get("mappedSeriesId")
-    if not _is_strict_int(mapped_series_id) or mapped_series_id != series_id:
-        return None
-
-    episode_info = release.get("mappedEpisodeInfo")
-    if not isinstance(episode_info, list) or not episode_info:
-        return None
-    episode_ids: List[int] = []
-    for entry in episode_info:
-        if not isinstance(entry, dict):
-            return None
-        episode_id = entry.get("id")
-        if not _is_strict_int(episode_id):
-            return None
-        entry_season_number = entry.get("seasonNumber")
-        if not _is_strict_int(entry_season_number) or entry_season_number != season_number:
-            return None
-        episode_ids.append(episode_id)
-    if not episode_ids:
-        return None
-
-    quality = release.get("quality")
-    if not _valid_quality_model_shape(quality):
-        return None
-
-    languages = release.get("languages")
-    if not isinstance(languages, list) or not all(
-        _valid_language_entry_shape(entry) for entry in languages
-    ):
-        return None
-
-    return {
-        "seriesId": series_id,
-        "episodeIds": episode_ids,
-        "quality": copy.deepcopy(quality),
-        "languages": copy.deepcopy(languages),
-    }
 
 
 def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
@@ -1402,20 +1259,11 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
     closed before any search is dispatched (no cap/queue slot consumed) and never
     falls back to a different client or protocol.
 
-    ``allow_cutoff_override`` (default False, preserves prior strict behavior) lets a
-    release that otherwise passes every other check qualify despite Sonarr's
-    ``approved=False`` when every rejection Sonarr reported is exclusively the narrow
-    "Existing file meets cutoff" condition (see ``_cutoff_only_rejections``). Any other
-    or mixed rejection reason is never overridden. Sonarr ranking order is preserved:
-    an earlier candidate with an unsafe rejection is skipped in favor of a later
-    cutoff-only candidate. When a cutoff-only override is actually used to select the
-    grabbed release, the grab body sets ``shouldOverride: true`` plus the exact
-    ``seriesId``/``episodeIds``/``quality``/``languages`` fields Sonarr's
-    ``ReleaseController`` requires for that flag (see ``_build_override_fields``),
-    sourced only from the selected release itself; otherwise all four fields and
-    ``shouldOverride`` are omitted entirely, leaving the normal grab body unchanged. If
-    the selected release lacks a required field in a proven shape, the grab fails
-    closed (no POST, `no_grab` outcome) rather than sending a malformed override.
+    ``allow_cutoff_override`` is retained only for backward-compatible callers. It is
+    fail-safe disabled: Huntarr never sends ``shouldOverride`` because Sonarr can accept
+    that POST and later import only a subset of the pack. Normal Sonarr-approved packs
+    continue through the unchanged route; rejected packs produce ``no_grab`` and consume
+    no download-queue slot.
     """
     download_protocol = download_protocol if download_protocol in ("usenet", "torrent") else "sonarr_default"
     client_ok, resolved_client_id, client_error = _resolve_missing_pack_client(
@@ -1483,8 +1331,28 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
                       if _acceptable_season_pack(release, series_id, season_number,
                                                   download_protocol, allow_cutoff_override)]
         if not acceptable:
-            reason = (f"no acceptable {download_protocol} season pack"
-                      if download_protocol in ("usenet", "torrent") else "no acceptable season pack")
+            cutoff_override_blocked = allow_cutoff_override and any(
+                isinstance(release, dict)
+                and release.get("fullSeason") is True
+                and release.get("mappedSeriesId") == series_id
+                and release.get("mappedSeasonNumber") == season_number
+                and release.get("approved") is False
+                and release.get("rejected") is True
+                and release.get("temporarilyRejected") is False
+                and release.get("downloadAllowed") is True
+                and _cutoff_only_rejections(release)
+                for _, release in ranked
+            )
+            if cutoff_override_blocked:
+                reason = "unsafe cutoff override blocked before grab"
+                sonarr_logger.warning(
+                    "Strict season-pack cutoff override blocked for series %s, season %s: "
+                    "Sonarr grab acceptance cannot guarantee an atomic complete import",
+                    series_id, season_number,
+                )
+            else:
+                reason = (f"no acceptable {download_protocol} season pack"
+                          if download_protocol in ("usenet", "torrent") else "no acceptable season pack")
             publish_noop(reason)
             finish_interactive_search(
                 "no_grab", "sonarr", instance_name, cooldown_seconds=300,
@@ -1497,27 +1365,9 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
             return None
 
         selected = acceptable[0]
-        cutoff_override_used = allow_cutoff_override and selected.get("approved") is not True
         grab_body = {"guid": selected["guid"], "indexerId": selected["indexerId"]}
         if resolved_client_id is not None:
             grab_body["downloadClientId"] = resolved_client_id
-        if cutoff_override_used:
-            override_fields = _build_override_fields(selected, series_id, season_number)
-            if override_fields is None:
-                finish_interactive_search(
-                    "no_grab", "sonarr", instance_name, cooldown_seconds=300,
-                    queue_submission=False,
-                )
-                sonarr_logger.error(
-                    "Cutoff-only override selected for series %s, season %s but the "
-                    "release payload is missing/malformed required Sonarr override "
-                    "fields (mappedSeriesId/mappedEpisodeInfo/quality/languages); "
-                    "failing closed with no grab: %s",
-                    series_id, season_number, selected.get("title", selected.get("guid")),
-                )
-                return None
-            grab_body.update(override_fields)
-            grab_body["shouldOverride"] = True
         grab_response = requests.post(
             endpoint, headers=headers,
             json=grab_body,
@@ -1527,11 +1377,6 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
         finish_interactive_search(
             "grabbed", "sonarr", instance_name, queue_submission=True,
         )
-        if cutoff_override_used:
-            sonarr_logger.info(
-                "Cutoff-only override used for strict season pack: series %s, season %s, release: %s",
-                series_id, season_number, selected.get("title", selected["guid"]),
-            )
         sonarr_logger.info(
             "Grabbed Sonarr-ranked strict season pack for series %s, season %s: %s",
             series_id, season_number, selected.get("title", selected["guid"]),

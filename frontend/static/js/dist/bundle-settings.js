@@ -1719,7 +1719,8 @@ document.head.appendChild(styleEl);
                 force_season_replacement: instance.force_season_replacement === true,
                 missing_pack_download_protocol: instance.missing_pack_download_protocol || 'sonarr_default',
                 missing_pack_download_client_id: (instance.missing_pack_download_client_id !== undefined && instance.missing_pack_download_client_id !== null) ? instance.missing_pack_download_client_id : null,
-                missing_pack_allow_cutoff_override: instance.missing_pack_allow_cutoff_override === true,
+                // Retained in payloads for backward compatibility, but safety-disabled.
+                missing_pack_allow_cutoff_override: false,
                 webhook_enabled: instance.webhook_enabled === true,
                 webhook_secret: instance.webhook_secret || '',
                 shared_capacity_weight: instance.shared_capacity_weight !== undefined ? instance.shared_capacity_weight : 1,
@@ -1892,13 +1893,13 @@ document.head.appendChild(styleEl);
                         </div>
                         <p class="editor-help-text" id="editor-missing-pack-client-help">Automatic lets Sonarr pick among enabled clients for the selected protocol. Loads live from Sonarr when URL/API Key are set; only enabled clients matching the chosen protocol are selectable. A stale or disabled client fails the search closed at grab time (no fallback).</p>
                         <div class="editor-setting-item flex-row" style="margin-top: 8px;">
-                            <label>Allow season packs to replace existing episodes at cutoff</label>
+                            <label>Replace existing cutoff episodes (safety-disabled)</label>
                             <label class="toggle-switch">
-                                <input type="checkbox" id="editor-missing-pack-allow-cutoff-override" ${safeInstance.missing_pack_allow_cutoff_override ? 'checked' : ''}>
+                                <input type="checkbox" id="editor-missing-pack-allow-cutoff-override" disabled>
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
-                        <p class="editor-help-text" style="color:#f59e0b;">OFF by default. Missing season-pack search only. If Sonarr rejects an otherwise-qualifying full-season pack solely with "Existing file meets cutoff", Huntarr grabs it anyway with Sonarr's override flag. Existing episode files that already meet cutoff may be replaced. Any other or mixed rejection reason (quality, custom format, language, age, blocklist, indexer, seeders, etc.) is never overridden.</p>
+                        <p class="editor-help-text" style="color:#f59e0b;">Disabled because Sonarr can accept an override grab and later import only part of the season when Completed Download Handling rejects lower custom-format scores or ambiguous episode mappings. Huntarr now fails closed before download; normal Sonarr-approved season packs are unchanged.</p>
                     </div>
 
                     <div class="editor-field-group">
@@ -2479,7 +2480,7 @@ document.head.appendChild(styleEl);
                     const v = parseInt(el.value, 10);
                     return isNaN(v) ? null : v;
                 })(),
-                missing_pack_allow_cutoff_override: !!(document.getElementById('editor-missing-pack-allow-cutoff-override') && document.getElementById('editor-missing-pack-allow-cutoff-override').checked),
+                missing_pack_allow_cutoff_override: false,
                 webhook_enabled: !!(document.getElementById('editor-webhook-enabled') && document.getElementById('editor-webhook-enabled').checked),
                 webhook_secret: document.getElementById('editor-webhook-secret') ? document.getElementById('editor-webhook-secret').value.trim() : '',
                 shared_capacity_weight: document.getElementById('editor-shared-capacity-weight') ? (parseInt(document.getElementById('editor-shared-capacity-weight').value, 10) || 1) : 1,

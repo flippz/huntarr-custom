@@ -70,11 +70,8 @@ def get_default_instance_config(app_type: str) -> Dict[str, Any]:
             # leaves protocol/client selection entirely to Sonarr (unchanged behavior).
             "missing_pack_download_protocol": "sonarr_default",
             "missing_pack_download_client_id": None,
-            # Cutoff-only override (per-instance). OFF by default: preserves strict
-            # Sonarr rejection behavior. When enabled, a strict missing season-pack
-            # candidate that Sonarr rejects solely for "Existing file meets cutoff"
-            # may still be grabbed with shouldOverride=true, replacing qualifying
-            # existing episode files. Never overrides any other/mixed rejection reason.
+            # Legacy compatibility key. Always safety-disabled: Sonarr can accept a
+            # shouldOverride grab and still partially block the pack during import.
             "missing_pack_allow_cutoff_override": False,
             "webhook_enabled": False,
             "webhook_secret": "",

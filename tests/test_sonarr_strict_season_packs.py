@@ -253,18 +253,18 @@ class AcceptableSeasonPackOverrideTests(unittest.TestCase):
             release, 7, 2, "sonarr_default", allow_cutoff_override=False,
         ))
 
-    def test_enabled_override_accepts_sole_cutoff_reason(self):
+    def test_legacy_enabled_override_still_rejects_sole_cutoff_reason(self):
         release = _rejected_release("r1", 0, ["Existing file meets cutoff: WEB DL-1080p"])
-        self.assertTrue(sonarr_api._acceptable_season_pack(
+        self.assertFalse(sonarr_api._acceptable_season_pack(
             release, 7, 2, "sonarr_default", allow_cutoff_override=True,
         ))
 
-    def test_enabled_override_accepts_multiple_cutoff_only_reasons(self):
+    def test_legacy_enabled_override_still_rejects_multiple_cutoff_reasons(self):
         release = _rejected_release("r1", 0, [
             "Existing file meets cutoff: WEB DL-1080p",
             "Existing file meets cutoff: HDTV-720p",
         ])
-        self.assertTrue(sonarr_api._acceptable_season_pack(
+        self.assertFalse(sonarr_api._acceptable_season_pack(
             release, 7, 2, "sonarr_default", allow_cutoff_override=True,
         ))
 
@@ -331,17 +331,17 @@ class AcceptableSeasonPackOverrideTests(unittest.TestCase):
                     release, 7, 2, "sonarr_default", allow_cutoff_override=True,
                 ))
 
-    def test_enabled_override_exact_valid_decision_state_is_accepted(self):
-        # The positive control for the matrix above: approved is False, rejected is
-        # True, temporarilyRejected is False, exactly (all _rejected_release
-        # defaults) - this must still qualify.
+    def test_legacy_enabled_override_exact_valid_decision_state_is_still_rejected(self):
+        # Even the old narrowly allowed decision state is unsafe: Sonarr can accept
+        # the grab and independently reject only some files during completed-download
+        # import, so the compatibility flag must not relax approval.
         release = _rejected_release(
             "r1", 0, ["Existing file meets cutoff: WEB DL-1080p"],
         )
         self.assertIs(release["approved"], False)
         self.assertIs(release["rejected"], True)
         self.assertIs(release["temporarilyRejected"], False)
-        self.assertTrue(sonarr_api._acceptable_season_pack(
+        self.assertFalse(sonarr_api._acceptable_season_pack(
             release, 7, 2, "sonarr_default", allow_cutoff_override=True,
         ))
 
@@ -621,11 +621,11 @@ class CutoffOverrideGrabTests(unittest.TestCase):
         self.assertIsNone(result)
         entered[9].assert_not_called()
 
-    def test_enabled_override_grabs_cutoff_only_pack_with_should_override_true(self):
+    def test_legacy_enabled_override_blocks_cutoff_only_pack_without_post(self):
         cutoff_only = _rejected_release("cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"])
         patches = self._dispatch_patches() + (
             mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
-            mock.patch.object(sonarr_api.requests, "post", return_value=_Response({})),
+            mock.patch.object(sonarr_api.requests, "post"),
         )
         entered = [patch.start() for patch in patches]
         self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
@@ -634,13 +634,13 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             "http://sonarr", "secret", 10, 7, 2, [11], "main",
             allow_cutoff_override=True,
         )
-        self.assertEqual(result["guid"], "cutoff-only")
-        post_kwargs = entered[9].call_args.kwargs
-        self.assertEqual(post_kwargs["json"], {
-            "guid": "cutoff-only", "indexerId": 5, "shouldOverride": True,
-            "seriesId": 7, "episodeIds": [101, 102],
-            "quality": cutoff_only["quality"], "languages": cutoff_only["languages"],
-        })
+        self.assertIsNone(result)
+        entered[9].assert_not_called()
+        entered[6].assert_called_once_with("unsafe cutoff override blocked before grab")
+        entered[3].assert_called_once_with(
+            "no_grab", "sonarr", "main", cooldown_seconds=300,
+            queue_submission=False,
+        )
 
     def test_enabled_override_normal_approved_candidate_omits_should_override(self):
         # An approved, non-rejected candidate must never carry shouldOverride even
@@ -664,24 +664,18 @@ class CutoffOverrideGrabTests(unittest.TestCase):
         for key in ("shouldOverride", "seriesId", "episodeIds", "quality", "languages"):
             self.assertNotIn(key, post_kwargs["json"])
 
-    def test_enabled_override_skips_earlier_mixed_rejection_selects_later_cutoff_only(self):
-        # Sonarr ranking order must be preserved: an earlier-ranked candidate with an
-        # unsafe/mixed rejection is skipped, and a later-ranked cutoff-only candidate
-        # is selected instead - never the reverse, and never the unsafe one.
+    def test_legacy_override_does_not_select_later_cutoff_only_candidate(self):
         earlier_mixed = _rejected_release(
             "earlier-mixed", 0,
             ["Existing file meets cutoff: WEB DL-1080p", "Not enough seeders"],
         )
-        # episode_ids passed to grab_best_season_pack is only [11] (Huntarr's missing
-        # list); mappedEpisodeInfo here carries the full pack (both 101 and 102) to
-        # prove episodeIds in the POST body comes from the release, not the arg.
         later_cutoff_only = _rejected_release(
             "later-cutoff-only", 1, ["Existing file meets cutoff: HDTV-720p"],
         )
         patches = self._dispatch_patches() + (
             mock.patch.object(sonarr_api.requests, "get",
                               return_value=_Response([earlier_mixed, later_cutoff_only])),
-            mock.patch.object(sonarr_api.requests, "post", return_value=_Response({})),
+            mock.patch.object(sonarr_api.requests, "post"),
         )
         entered = [patch.start() for patch in patches]
         self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
@@ -690,20 +684,17 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             "http://sonarr", "secret", 10, 7, 2, [11], "main",
             allow_cutoff_override=True,
         )
-        self.assertEqual(result["guid"], "later-cutoff-only")
-        post_kwargs = entered[9].call_args.kwargs
-        self.assertTrue(post_kwargs["json"]["shouldOverride"])
-        self.assertEqual(post_kwargs["json"]["episodeIds"], [101, 102])
-        self.assertEqual(post_kwargs["json"]["seriesId"], 7)
+        self.assertIsNone(result)
+        entered[9].assert_not_called()
 
-    def test_enabled_override_preserves_download_client_id_alongside_should_override(self):
+    def test_legacy_override_preserves_client_validation_but_never_posts(self):
         cutoff_only = _rejected_release("cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
                                          protocol="usenet")
         clients = [{"id": 18, "name": "Decypharr Usenet", "protocol": "usenet", "enable": True}]
         patches = self._dispatch_patches() + (
             mock.patch.object(sonarr_api, "get_download_clients", return_value=clients),
             mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
-            mock.patch.object(sonarr_api.requests, "post", return_value=_Response({})),
+            mock.patch.object(sonarr_api.requests, "post"),
         )
         entered = [patch.start() for patch in patches]
         self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
@@ -713,14 +704,9 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             download_protocol="usenet", download_client_id=18,
             allow_cutoff_override=True,
         )
-        self.assertEqual(result["guid"], "cutoff-only")
-        post_kwargs = entered[10].call_args.kwargs
-        self.assertEqual(post_kwargs["json"], {
-            "guid": "cutoff-only", "indexerId": 5,
-            "downloadClientId": 18, "shouldOverride": True,
-            "seriesId": 7, "episodeIds": [101, 102],
-            "quality": cutoff_only["quality"], "languages": cutoff_only["languages"],
-        })
+        self.assertIsNone(result)
+        entered[8].assert_called_once()
+        entered[10].assert_not_called()
 
     def test_enabled_override_no_qualifying_pack_still_no_grab(self):
         mixed = _rejected_release("mixed", 0, ["Not enough seeders"])
@@ -743,13 +729,11 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             queue_submission=False,
         )
 
-    def test_enabled_override_post_failure_unwinds_queue_reservation(self):
+    def test_legacy_override_never_reaches_post_failure_path(self):
         cutoff_only = _rejected_release("cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"])
-        error = sonarr_api.requests.exceptions.HTTPError("grab failed")
         patches = self._dispatch_patches() + (
             mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
-            mock.patch.object(sonarr_api.requests, "post",
-                              return_value=_Response({}, status=500, error=error)),
+            mock.patch.object(sonarr_api.requests, "post"),
         )
         entered = [patch.start() for patch in patches]
         self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
@@ -759,8 +743,9 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             allow_cutoff_override=True,
         )
         self.assertIsNone(result)
+        entered[9].assert_not_called()
         entered[3].assert_called_once_with(
-            "failed", "sonarr", "main", cooldown_seconds=300,
+            "no_grab", "sonarr", "main", cooldown_seconds=300,
             queue_submission=False,
         )
 
@@ -843,28 +828,6 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             languages={"id": 1, "name": "English"},
         )
         self._assert_override_fails_closed_no_post(cutoff_only)
-
-    def test_enabled_override_mapped_series_id_mismatch_fails_closed(self):
-        # Even though _acceptable_season_pack already enforces mappedSeriesId ==
-        # series_id before a release is ever "selected", _build_override_fields
-        # independently re-checks it and never broadens to a different series.
-        cutoff_only = _rejected_release(
-            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
-            mappedSeriesId=7,
-        )
-        # Simulate a corrupted/inconsistent payload by calling the helper directly
-        # with a mismatched requested series id.
-        self.assertIsNone(sonarr_api._build_override_fields(cutoff_only, 999, 2))
-
-    def test_enabled_override_bool_mapped_series_id_fails_closed(self):
-        # bool is an int subclass in Python - a stray True/False mappedSeriesId that
-        # happens to equal series_id via Python's bool==int comparison must never
-        # pass; only a genuine int is a proven Sonarr shape.
-        cutoff_only = _rejected_release(
-            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
-            mappedSeriesId=True,
-        )
-        self.assertIsNone(sonarr_api._build_override_fields(cutoff_only, 1, 2))
 
     def test_enabled_override_cross_season_episode_entry_fails_closed(self):
         # mappedEpisodeInfo containing an entry from a different season must never
@@ -978,60 +941,6 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             languages=[{"id": 1, "name": "English"}, "French"],
         )
         self._assert_override_fails_closed_no_post(cutoff_only)
-
-    def test_enabled_override_accepts_proven_valid_quality_and_language_shapes(self):
-        # Real Sonarr shapes, including a legitimately non-positive language id
-        # (Original == -2, Unknown == 0 per NzbDrone.Core.Languages.Language) and a
-        # multi-entry language list, must be accepted and passed through untouched.
-        cutoff_only = _rejected_release(
-            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
-            quality={
-                "quality": {"id": 7, "name": "Bluray-1080p", "source": "bluray", "resolution": 1080},
-                "revision": {"version": 2, "real": 1, "isRepack": True},
-            },
-            languages=[{"id": -2, "name": "Original"}, {"id": 1, "name": "English"}],
-        )
-        patches = self._dispatch_patches() + (
-            mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
-            mock.patch.object(sonarr_api.requests, "post", return_value=_Response({})),
-        )
-        entered = [patch.start() for patch in patches]
-        self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
-
-        result = sonarr_api.grab_best_season_pack(
-            "http://sonarr", "secret", 10, 7, 2, [11], "main",
-            allow_cutoff_override=True,
-        )
-        self.assertEqual(result["guid"], "cutoff-only")
-        post_kwargs = entered[9].call_args.kwargs
-        self.assertEqual(post_kwargs["json"]["quality"], cutoff_only["quality"])
-        self.assertEqual(post_kwargs["json"]["languages"], cutoff_only["languages"])
-
-    def test_override_fields_deep_copies_quality_and_languages(self):
-        # P2: the returned quality/languages must be independent copies - mutating
-        # the POST payload (as callers commonly do) must never alter the selected
-        # release dict that Huntarr continues to hold/log/tag from.
-        cutoff_only = _rejected_release(
-            "cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"],
-        )
-        fields = sonarr_api._build_override_fields(cutoff_only, 7, 2)
-        self.assertIsNotNone(fields)
-        self.assertIsNot(fields["quality"], cutoff_only["quality"])
-        self.assertIsNot(fields["quality"]["quality"], cutoff_only["quality"]["quality"])
-        self.assertIsNot(fields["quality"]["revision"], cutoff_only["quality"]["revision"])
-        self.assertIsNot(fields["languages"], cutoff_only["languages"])
-        self.assertIsNot(fields["languages"][0], cutoff_only["languages"][0])
-
-        fields["quality"]["quality"]["name"] = "Tampered"
-        fields["quality"]["revision"]["version"] = 999
-        fields["languages"][0]["name"] = "Tampered"
-        fields["languages"].append({"id": 99, "name": "Injected"})
-
-        self.assertEqual(cutoff_only["quality"]["quality"]["name"], "HDTV-720p")
-        self.assertEqual(cutoff_only["quality"]["revision"]["version"], 1)
-        self.assertEqual(cutoff_only["languages"][0]["name"], "English")
-        self.assertEqual(len(cutoff_only["languages"]), 1)
-
 
 class InteractiveDispatchAccountingTests(unittest.TestCase):
     def setUp(self):
