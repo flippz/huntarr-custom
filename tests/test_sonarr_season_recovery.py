@@ -286,18 +286,62 @@ class SeasonRecoveryTests(unittest.TestCase):
             season_recovery._entry_by_id("instance", journal_id)["state"], "searching",
         )
 
-    def test_queue_only_exact_title_correlation(self):
+    def test_queue_only_exact_title_correlation_deduplicates_episode_rows(self):
         entry = {
             "series_id": 7, "season_number": 1,
             "expected_release_title": "Show.S01.Pack",
         }
         queue = {"records": [{
             "title": "Show.S01.Pack", "seriesId": 7, "downloadId": "queued",
+            "episode": {"seasonNumber": 1},
+        }, {
+            "title": "Show.S01.Pack", "seriesId": 7, "downloadId": "queued",
+            "episode": {"seasonNumber": 1},
         }]}
         with mock.patch.object(season_recovery.sonarr_api, "arr_request", return_value=queue):
             self.assertEqual(season_recovery._find_queued_download(
                 "http://sonarr", "key", 10, entry,
             ), "queued")
+        queue["records"][1]["episode"]["seasonNumber"] = 2
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", return_value=queue):
+            self.assertIsNone(season_recovery._find_queued_download(
+                "http://sonarr", "key", 10, entry,
+            ))
+
+    def test_one_poll_attempt_cannot_rollback_before_settle_deadline(self):
+        started = season_recovery.utc_now_iso()
+
+        def request(*args, **kwargs):
+            endpoint = args[3]
+            if endpoint.startswith("history?"):
+                return {"records": [{
+                    "eventType": "grabbed", "date": started,
+                    "downloadId": "settling", "sourceTitle": "Show.S01.Pack",
+                    "episode": {"seasonNumber": 1},
+                }]}
+            if endpoint.startswith("queue?"):
+                return {"records": []}
+            return self._request(*args, **kwargs)
+
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=request), \
+             mock.patch.object(season_recovery.sonarr_api, "get_history_for_download", return_value=[]):
+            journal_id = season_recovery.prepare_exact_season(
+                "http://sonarr", "key", 10, "instance", 7, 1,
+                expected_episode_ids=[11], expected_release_title="Show.S01.Pack",
+                recovery_timeout_seconds=600,
+            )
+            self.assertTrue(season_recovery.mark_search_started(
+                "instance", journal_id, started,
+            ))
+            outcome = season_recovery.finish_operation(
+                "http://sonarr", "key", 10, "instance", journal_id,
+                started, True, 1, 1, lambda: False,
+            )
+        self.assertEqual(outcome, "failed")
+        self.assertFalse(os.path.lexists(self.link))
+        entry = season_recovery._entry_by_id("instance", journal_id)
+        self.assertEqual(entry["state"], "waiting_import")
+        self.assertIn("deadline has not elapsed", entry["error"])
 
     def test_grab_correlation_allows_episode_rows_for_one_download(self):
         entry = {

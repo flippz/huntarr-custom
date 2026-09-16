@@ -36,6 +36,7 @@ def _save(entry: Dict) -> None:
         "series_path": entry.get("series_path"),
         "recovery_root": entry.get("recovery_root"),
         "expected_release_title": entry.get("expected_release_title"),
+        "recovery_timeout_seconds": entry.get("recovery_timeout_seconds"),
         "deadline_at": entry.get("deadline_at"),
         "search_started_at": entry.get("search_started_at"),
         "download_id": entry.get("download_id"),
@@ -79,6 +80,7 @@ def _pending(instance_name: str) -> List[Dict]:
             "series_path": payload.get("series_path"),
             "recovery_root": payload.get("recovery_root"),
             "expected_release_title": payload.get("expected_release_title"),
+            "recovery_timeout_seconds": payload.get("recovery_timeout_seconds"),
             "deadline_at": payload.get("deadline_at"),
             "search_started_at": payload.get("search_started_at"),
             "download_id": payload.get("download_id"),
@@ -567,6 +569,7 @@ def prepare_exact_season(api_url: str, api_key: str, api_timeout: int,
         "series_path": series_path,
         "recovery_root": recovery_root,
         "expected_release_title": expected_release_title,
+        "recovery_timeout_seconds": max(1, int(recovery_timeout_seconds)),
         "deadline_at": (
             datetime.datetime.now(datetime.timezone.utc)
             + datetime.timedelta(seconds=max(1, int(recovery_timeout_seconds)))
@@ -619,6 +622,12 @@ def mark_search_started(instance_name: str, journal_id: Optional[str],
     if not entry:
         return False
     entry["search_started_at"] = search_started_at
+    entry["deadline_at"] = (
+        datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(seconds=max(
+            1, int(entry.get("recovery_timeout_seconds") or 600)
+        ))
+    ).isoformat().replace("+00:00", "Z")
     entry["state"] = "searching"
     _save(entry)
     return True
@@ -685,16 +694,25 @@ def _find_queued_download(api_url: str, api_key: str, api_timeout: int,
     )
     if not isinstance(response, dict):
         return None
-    matches = []
+    matches = set()
     for item in response.get("records", []):
         title = item.get("title") or item.get("sourceTitle")
         series_id = item.get("seriesId") or (item.get("series") or {}).get("id")
         if title != expected_title or series_id != entry["series_id"]:
             continue
+        seasons = set()
+        episode = item.get("episode") or {}
+        if episode.get("seasonNumber") is not None:
+            seasons.add(episode.get("seasonNumber"))
+        for queued_episode in item.get("episodes") or []:
+            if isinstance(queued_episode, dict) and queued_episode.get("seasonNumber") is not None:
+                seasons.add(queued_episode.get("seasonNumber"))
+        if seasons and seasons != {entry["season_number"]}:
+            return None
         download_id = item.get("downloadId")
         if download_id:
-            matches.append(str(download_id))
-    return matches[0] if len(matches) == 1 else None
+            matches.add(str(download_id))
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 def finish_operation(api_url: str, api_key: str, api_timeout: int,
@@ -773,9 +791,12 @@ def finish_operation(api_url: str, api_key: str, api_timeout: int,
             elif remaining > 0:
                 time.sleep(min(delay, remaining))
 
-    if not download_id and entry.get("expected_release_title"):
-        entry["state"] = "awaiting_correlation"
-        entry["error"] = "override accepted but no unambiguous download correlation is available"
+    remaining = _deadline_remaining(entry)
+    if entry.get("expected_release_title") and remaining is not None and remaining > 0:
+        entry["state"] = "waiting_import" if download_id else "awaiting_correlation"
+        entry["error"] = (
+            f"settle deadline has not elapsed ({remaining:.1f}s remain); recovery stays armed"
+        )
         _save(entry)
         return "failed"
     return ("restored" if _rollback(
