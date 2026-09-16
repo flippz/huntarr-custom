@@ -155,6 +155,16 @@ window.HuntarrSwaparrActivity = {
         return '';
     },
 
+    escapeHtml: function (value) {
+        return String(value == null ? '' : value).replace(/[&<>"']/g, char => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;'
+        })[char]);
+    },
+
     renderQueue: function (data) {
         const tbody = document.querySelector('#swaparr-activity-queue-table tbody');
         if (!tbody) return;
@@ -173,17 +183,18 @@ window.HuntarrSwaparrActivity = {
                 : (status.label || 'Unknown');
 
             const torrent = item.torrent_status;
-            const torrentHtml = torrent ? (torrent.state || '-') : '-';
-            const nameHtml = item.episode_count > 1
-                ? `${item.name} <span class="swaparr-activity-badge">${item.episode_count} episodes</span>`
-                : item.name;
+            const torrentText = torrent ? (torrent.state || '-') : '-';
+            const nameText = item.name || '-';
+            const nameHtml = `<div class="swaparr-activity-name-cell"><span class="swaparr-activity-truncate" title="${this.escapeHtml(nameText)}">${this.escapeHtml(nameText)}</span>${item.episode_count > 1
+                ? `<span class="swaparr-activity-badge">${item.episode_count} episodes</span>`
+                : ''}</div>`;
 
             return `<tr>
-                <td>${nameHtml}</td>
+                <td class="swaparr-activity-name-column">${nameHtml}</td>
                 <td>${this.formatBytes(item.size)}</td>
                 <td>${statusHtml}${status.detail ? `<div class="swaparr-activity-empty" style="text-align:left;padding:2px 0;">${status.detail}</div>` : ''}</td>
                 <td>${item.strikes}/${item.max_strikes}</td>
-                <td>${torrentHtml}</td>
+                <td><span class="swaparr-activity-truncate" title="${this.escapeHtml(torrentText)}">${this.escapeHtml(torrentText)}</span></td>
             </tr>`;
         }).join('');
     },
@@ -207,11 +218,11 @@ window.HuntarrSwaparrActivity = {
             const badgeClass = entry.event_type === 'removed' ? 'removed' : (entry.event_type === 'failed' ? 'failed' : 'completed');
             const label = entry.event_type === 'removed' ? 'Removed' : (entry.event_type === 'failed' ? 'Failed' : 'Completed');
             const reasonHtml = entry.reason
-                ? `<span class="swaparr-activity-reason-link" data-incident-idx="${idx}">${entry.reason}</span>`
+                ? `<span class="swaparr-activity-reason-link swaparr-activity-truncate" title="${this.escapeHtml(entry.reason)}" data-incident-idx="${idx}">${this.escapeHtml(entry.reason)}</span>`
                 : '-';
             return `<tr>
                 <td>${entry.occurred_at}</td>
-                <td>${entry.item_name}</td>
+                <td><span class="swaparr-activity-truncate" title="${this.escapeHtml(entry.item_name || '-')}">${this.escapeHtml(entry.item_name || '-')}</span></td>
                 <td><span class="swaparr-activity-badge ${badgeClass}">${label}</span></td>
                 <td>${reasonHtml}</td>
             </tr>`;
