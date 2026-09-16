@@ -792,13 +792,14 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             queue_submission=False,
         )
 
-    def test_enabled_override_post_failure_unwinds_queue_reservation(self):
+    def test_enabled_override_post_failure_keeps_recovery_armed(self):
         cutoff_only = _rejected_release("cutoff-only", 0, ["Existing file meets cutoff: WEB DL-1080p"])
-        error = sonarr_api.requests.exceptions.HTTPError("grab failed")
+        error = sonarr_api.requests.exceptions.Timeout("client timed out after Sonarr may have accepted")
         patches = self._dispatch_patches() + (
             mock.patch.object(sonarr_api.requests, "get", return_value=_Response([cutoff_only])),
-            mock.patch.object(sonarr_api.requests, "post",
-                              return_value=_Response({}, status=500, error=error)),
+            mock.patch.object(sonarr_api.requests, "post", side_effect=error),
+            mock.patch("src.primary.apps.sonarr.season_recovery.mark_submission_indeterminate",
+                       return_value=True),
         )
         entered = [patch.start() for patch in patches]
         self.addCleanup(lambda: [patch.stop() for patch in reversed(patches)])
@@ -808,6 +809,8 @@ class CutoffOverrideGrabTests(unittest.TestCase):
             allow_cutoff_override=True,
         )
         self.assertIsNone(result)
+        entered[10].assert_called_once_with("main", "journal", str(error))
+        self.finish_recovery.assert_not_called()
         entered[3].assert_called_once_with(
             "failed", "sonarr", "main", cooldown_seconds=300,
             queue_submission=False,

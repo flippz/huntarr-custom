@@ -104,7 +104,8 @@ class SeasonRecoveryTests(unittest.TestCase):
         self.assertEqual(outcome, "restored")
         self.assertTrue(self.link.is_symlink())
         self.assertEqual(self.link.resolve(), self.target.resolve())
-        self.assertFalse(os.path.lexists(backup))
+        self.assertTrue(os.path.lexists(backup))
+        self.assertTrue(os.path.samestat(os.lstat(self.link), os.lstat(backup)))
         with self.db.get_connection() as conn:
             state = conn.execute("SELECT state FROM sonarr_season_recovery_journal").fetchone()[0]
         self.assertEqual(state, "completed")
@@ -265,6 +266,61 @@ class SeasonRecoveryTests(unittest.TestCase):
             ))
         self.assertTrue(self.link.is_symlink())
 
+    def test_queue_disappearance_before_deadline_keeps_originals_staged(self):
+        started = season_recovery.utc_now_iso()
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request), \
+             mock.patch.object(season_recovery.sonarr_api, "get_history_for_download", return_value=[]):
+            journal_id = season_recovery.prepare_exact_season(
+                "http://sonarr", "key", 10, "instance", 7, 1,
+                expected_episode_ids=[11], expected_release_title="Show.S01.Pack",
+                recovery_timeout_seconds=600,
+            )
+            self.assertTrue(season_recovery.mark_search_started(
+                "instance", journal_id, started,
+            ))
+            self.assertFalse(season_recovery.recover_pending(
+                "http://sonarr", "key", 10, "instance", recovery_timeout_seconds=600,
+            ))
+        self.assertFalse(os.path.lexists(self.link))
+        self.assertEqual(
+            season_recovery._entry_by_id("instance", journal_id)["state"], "searching",
+        )
+
+    def test_queue_only_exact_title_correlation(self):
+        entry = {
+            "series_id": 7, "season_number": 1,
+            "expected_release_title": "Show.S01.Pack",
+        }
+        queue = {"records": [{
+            "title": "Show.S01.Pack", "seriesId": 7, "downloadId": "queued",
+        }]}
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", return_value=queue):
+            self.assertEqual(season_recovery._find_queued_download(
+                "http://sonarr", "key", 10, entry,
+            ), "queued")
+
+    def test_grab_correlation_allows_episode_rows_for_one_download(self):
+        entry = {
+            "series_id": 7, "season_number": 1,
+            "search_started_at": "2026-09-12T10:00:00Z",
+            "expected_release_title": "Show.S01.Pack",
+        }
+        records = [{
+            "eventType": "grabbed", "date": "2026-09-12T10:00:01Z",
+            "downloadId": "same", "sourceTitle": "Show.S01.Pack",
+            "episode": {"seasonNumber": 1},
+        }, {
+            "eventType": "grabbed", "date": "2026-09-12T10:00:01Z",
+            "downloadId": "same", "sourceTitle": "Show.S01.Pack",
+            "episode": {"seasonNumber": 1},
+        }]
+        with mock.patch.object(
+            season_recovery.sonarr_api, "arr_request", return_value={"records": records}
+        ):
+            self.assertEqual(season_recovery._find_grab(
+                "http://sonarr", "key", 10, entry,
+            )["downloadId"], "same")
+
     def test_grab_correlation_fails_closed_on_same_release_ambiguity(self):
         entry = {
             "series_id": 7, "season_number": 1,
@@ -330,6 +386,32 @@ class SeasonRecoveryTests(unittest.TestCase):
             ))
         self.assertFalse(os.path.lexists(replacement))
         self.assertEqual(backup.read_bytes(), b"new")
+
+    def test_override_validation_requires_file_ids_from_correlated_import(self):
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request):
+            journal_id = season_recovery.prepare_exact_season(
+                "http://sonarr", "key", 10, "instance", 7, 1,
+                expected_episode_ids=[11], expected_release_title="Show.S01.Pack",
+            )
+            self.link.write_bytes(b"replacement")
+            self.episodes[0]["episodeFileId"] = 303
+            self.files.append({"id": 303, "path": str(self.link)})
+            entry = season_recovery._entry_by_id("instance", journal_id)
+            entry["download_id"] = "expected-download"
+            good = [{
+                "eventType": "downloadFolderImported", "downloadId": "expected-download",
+                "episodeId": 11, "data": {"fileId": "303"},
+            }]
+            bad = [{
+                "eventType": "downloadFolderImported", "downloadId": "other-download",
+                "episodeId": 11, "data": {"fileId": "303"},
+            }]
+            self.assertTrue(season_recovery._validate_replacement(
+                "http://sonarr", "key", 10, entry, good,
+            )[0])
+            self.assertFalse(season_recovery._validate_replacement(
+                "http://sonarr", "key", 10, entry, bad,
+            )[0])
 
     def test_verified_import_preserves_old_symlink_in_recovery_area(self):
         def request(*args, **kwargs):

@@ -96,17 +96,30 @@ def _import_succeeded(api_url: str, api_key: str, api_timeout: int,
 
 
 def _restore_files(entry: Dict) -> Optional[str]:
-    """Restore each staged path idempotently, preserving both sides on conflict."""
+    """Restore each staged path while retaining the recovery copy.
+
+    Staging already proved both paths are on one filesystem, so a hard link restores
+    regular files and symlinks without copying media or consuming the only backup.
+    Keeping that backup protects against a late Sonarr import after an ambiguous POST.
+    """
     conflicts = []
     for item in entry["files"]:
         original = item["path"]
         backup = item["backup_path"]
         if os.path.lexists(backup):
             if os.path.lexists(original):
+                try:
+                    if os.path.samestat(os.lstat(original), os.lstat(backup)):
+                        continue
+                except OSError:
+                    pass
                 conflicts.append(original)
                 continue
             os.makedirs(os.path.dirname(original), exist_ok=True)
-            os.replace(backup, original)
+            try:
+                os.link(backup, original, follow_symlinks=False)
+            except OSError as exc:
+                conflicts.append(f"{original} ({exc})")
         elif not os.path.lexists(original):
             conflicts.append(original)
     if conflicts:
@@ -142,8 +155,9 @@ def _inside_series(path: str, series_path: str) -> bool:
 
 
 def _validate_replacement(api_url: str, api_key: str, api_timeout: int,
-                          entry: Dict) -> Tuple[bool, str]:
-    """Prove every exact-season episode maps to a real, non-original file."""
+                          entry: Dict, history_records: Optional[List[Dict]] = None
+                          ) -> Tuple[bool, str]:
+    """Prove every exact-season episode maps to this transaction's imported file."""
     episodes, episode_files, series = _inventory(
         api_url, api_key, api_timeout, entry["series_id"]
     )
@@ -169,12 +183,36 @@ def _validate_replacement(api_url: str, api_key: str, api_timeout: int,
                   if isinstance(item, dict) and isinstance(item.get("id"), int)
                   and not isinstance(item.get("id"), bool)}
     original_ids = {item["episode_file_id"] for item in entry.get("files", [])}
+    imported_file_by_episode = {}
+    if entry.get("expected_release_title"):
+        if not isinstance(history_records, list) or not entry.get("download_id"):
+            return False, "correlated import history is unavailable"
+        for record in history_records:
+            if (str(record.get("eventType", "")).lower() != "downloadfolderimported"
+                    or str(record.get("downloadId")) != str(entry["download_id"])):
+                continue
+            episode_id = record.get("episodeId")
+            file_id = (record.get("data") or {}).get("fileId")
+            try:
+                episode_id = int(episode_id)
+                file_id = int(file_id)
+            except (TypeError, ValueError):
+                continue
+            previous = imported_file_by_episode.setdefault(episode_id, file_id)
+            if previous != file_id:
+                return False, f"episode {episode_id} has ambiguous imported file provenance"
+        if set(imported_file_by_episode) != set(expected_ids):
+            return False, "correlated download has not imported every exact-season episode"
+
     target_file_ids = []
     for episode in target:
         file_id = episode.get("episodeFileId")
         if (not isinstance(file_id, int) or isinstance(file_id, bool) or file_id <= 0
                 or file_id in original_ids or file_id not in file_by_id):
             return False, f"episode {episode.get('id')} lacks a verified replacement file"
+        if (imported_file_by_episode
+                and imported_file_by_episode.get(episode.get("id")) != file_id):
+            return False, f"episode {episode.get('id')} is not mapped to its correlated imported file"
         target_file_ids.append(file_id)
 
     foreign_file_ids = {
@@ -343,6 +381,28 @@ def _rollback(api_url: str, api_key: str, api_timeout: int, entry: Dict,
     return True
 
 
+def _before_deadline(entry: Dict, fallback_seconds: int = 600) -> bool:
+    if not entry.get("search_started_at"):
+        return False
+    try:
+        started = datetime.datetime.fromisoformat(
+            str(entry["search_started_at"]).replace("Z", "+00:00")
+        )
+        fallback_deadline = started + datetime.timedelta(
+            seconds=max(1, int(fallback_seconds))
+        )
+        if entry.get("deadline_at"):
+            persisted = datetime.datetime.fromisoformat(
+                str(entry["deadline_at"]).replace("Z", "+00:00")
+            )
+            deadline = min(persisted, fallback_deadline)
+        else:
+            deadline = fallback_deadline
+        return datetime.datetime.now(datetime.timezone.utc) < deadline
+    except (TypeError, ValueError):
+        return False
+
+
 def recover_pending(api_url: str, api_key: str, api_timeout: int,
                     instance_name: str, recovery_timeout_seconds: int = 600) -> bool:
     """Resolve unfinished journals on startup/cycle entry; safe to call repeatedly."""
@@ -350,80 +410,53 @@ def recover_pending(api_url: str, api_key: str, api_timeout: int,
     for entry in _pending(instance_name):
         logger.warning("Recovering interrupted exact-season operation %s (series=%s season=%s)",
                        entry["id"], entry["series_id"], entry["season_number"])
-        # A crash can happen after submission/import but before the terminal journal
-        # update. Recover the download id from timestamped history when possible.
+        # A crash or client timeout can happen after Sonarr accepted the POST. Use
+        # exact-title history and queue correlation, and never restore while the
+        # transaction is still inside its durable settle window.
         if entry.get("search_started_at") and not entry.get("download_id"):
             grab = _find_grab(api_url, api_key, api_timeout, entry)
-            queued_download_id = None
-            if not grab:
-                queued_download_id = _find_queued_download(
-                    api_url, api_key, api_timeout, entry
-                )
-            if (grab and grab.get("downloadId")) or queued_download_id:
-                entry["download_id"] = (
-                    grab.get("downloadId") if grab else queued_download_id
-                )
-                entry["state"] = "waiting_import"
-                _save(entry)
-            else:
-                try:
-                    deadline = datetime.datetime.fromisoformat(
-                        str(entry.get("deadline_at", "")).replace("Z", "+00:00")
-                    )
-                    before_deadline = datetime.datetime.now(datetime.timezone.utc) < deadline
-                except (TypeError, ValueError):
-                    before_deadline = False
-                if before_deadline:
-                    logger.warning(
-                        "Exact-season operation %s has no unambiguous grab correlation yet; leaving journal armed until its deadline",
-                        entry["id"],
-                    )
-                    ok = False
-                    continue
-        if _import_succeeded(api_url, api_key, api_timeout, entry.get("download_id")):
-            valid, validation_error = _validate_replacement(
+            queued_download_id = None if grab else _find_queued_download(
                 api_url, api_key, api_timeout, entry
             )
-            if valid:
-                entry["state"] = "imported"
-                entry["error"] = None
+            if (grab and grab.get("downloadId")) or queued_download_id:
+                entry["download_id"] = grab.get("downloadId") if grab else queued_download_id
+                entry["state"] = "waiting_import"
                 _save(entry)
-                logger.info("Recovered operation %s as a validated complete import; originals remain preserved at %s",
-                            entry["id"], entry["files"][0]["recovery_root"] if entry["files"] else "journal")
-                continue
-            if not _rollback(
-                    api_url, api_key, api_timeout, entry,
-                    f"import event failed exact-season validation: {validation_error}"):
-                ok = False
-            continue
+
+        records = []
         if entry.get("download_id"):
-            queue_response = sonarr_api.arr_request(
-                api_url, api_key, api_timeout,
-                "queue?page=1&pageSize=1000", count_api=False,
+            records = sonarr_api.get_history_for_download(
+                api_url, api_key, api_timeout, entry["download_id"]
             )
-            queue = queue_response.get("records", []) if isinstance(queue_response, dict) else []
-            still_active = any(str(item.get("downloadId")) == str(entry["download_id"])
-                               for item in queue)
-            timed_out = True
-            try:
-                if entry.get("deadline_at"):
-                    deadline = datetime.datetime.fromisoformat(
-                        str(entry["deadline_at"]).replace("Z", "+00:00")
-                    )
-                    timed_out = datetime.datetime.now(datetime.timezone.utc) >= deadline
-                else:
-                    started = datetime.datetime.fromisoformat(
-                        str(entry.get("search_started_at", "")).replace("Z", "+00:00")
-                    )
-                    timed_out = ((datetime.datetime.now(datetime.timezone.utc) - started).total_seconds()
-                                 >= max(1, int(recovery_timeout_seconds)))
-            except (TypeError, ValueError):
-                pass
-            if still_active and not timed_out:
-                logger.warning("Exact-season operation %s is still downloading/importing; leaving journal armed",
-                               entry["id"])
-                ok = False
+            event_types = {str(item.get("eventType", "")).lower() for item in records}
+            if "downloadfailed" in event_types:
+                if not _rollback(api_url, api_key, api_timeout, entry, "download failed"):
+                    ok = False
                 continue
+            if "downloadfolderimported" in event_types:
+                valid, validation_error = _validate_replacement(
+                    api_url, api_key, api_timeout, entry, records
+                )
+                if valid:
+                    entry["state"] = "imported"
+                    entry["error"] = None
+                    _save(entry)
+                    logger.info(
+                        "Recovered operation %s as a validated complete import; originals remain preserved at %s",
+                        entry["id"],
+                        entry["files"][0]["recovery_root"] if entry["files"] else "journal",
+                    )
+                    continue
+                entry["error"] = f"incomplete correlated import: {validation_error}"
+                _save(entry)
+
+        if _before_deadline(entry, recovery_timeout_seconds):
+            logger.warning(
+                "Exact-season operation %s remains armed while correlation/import settles",
+                entry["id"],
+            )
+            ok = False
+            continue
         if not _rollback(api_url, api_key, api_timeout, entry, "interrupted operation"):
             ok = False
     return ok
@@ -581,6 +614,20 @@ def mark_search_started(instance_name: str, journal_id: Optional[str],
     return True
 
 
+def mark_submission_indeterminate(instance_name: str, journal_id: Optional[str],
+                                  error: str) -> bool:
+    """Keep staged originals armed when Sonarr may have accepted a timed-out POST."""
+    if not journal_id or journal_id == "no-files":
+        return False
+    entry = _entry_by_id(instance_name, journal_id)
+    if not entry:
+        return False
+    entry["state"] = "awaiting_correlation"
+    entry["error"] = str(error)
+    _save(entry)
+    return True
+
+
 def _find_grab(api_url: str, api_key: str, api_timeout: int, entry: Dict) -> Optional[Dict]:
     response = sonarr_api.arr_request(
         api_url, api_key, api_timeout,
@@ -605,8 +652,16 @@ def _find_grab(api_url: str, api_key: str, api_timeout: int, entry: Dict) -> Opt
             if source_title != expected_title:
                 continue
         matches.append(record)
-    # Never bind destructive recovery to an ambiguous concurrent season grab.
-    return matches[0] if len(matches) == 1 else None
+    if not matches:
+        return None
+    if not expected_title:
+        # Preserve the legacy command-search behavior for the existing optional
+        # upgrade path; the new override path always has an exact release title.
+        return matches[0]
+    download_ids = {str(item.get("downloadId")) for item in matches if item.get("downloadId")}
+    if len(download_ids) != 1:
+        return None
+    return next(item for item in matches if str(item.get("downloadId")) in download_ids)
 
 
 def _find_queued_download(api_url: str, api_key: str, api_timeout: int,
@@ -637,7 +692,7 @@ def finish_operation(api_url: str, api_key: str, api_timeout: int,
                      search_started_at: str, command_completed: bool,
                      wait_delay: int, wait_attempts: int,
                      stop_check: Callable[[], bool]) -> str:
-    """Wait for a verified import or roll back. Returns imported/restored/failed/no-files."""
+    """Wait within one budget for correlation plus a provenance-verified import."""
     if journal_id == "no-files":
         return "no-files"
     if not journal_id:
@@ -653,50 +708,60 @@ def finish_operation(api_url: str, api_key: str, api_timeout: int,
 
     delay = max(1, int(wait_delay or 1))
     attempts = max(1, int(wait_attempts or 1))
-    download_id = None
+    download_id = entry.get("download_id")
+    validation_error = "no complete correlated import"
     for attempt in range(attempts):
-        grab = _find_grab(api_url, api_key, api_timeout, entry)
-        download_id = grab.get("downloadId") if grab else _find_queued_download(
-            api_url, api_key, api_timeout, entry
-        )
-        if download_id:
-            break
-        if stop_check():
-            return "restored" if _rollback(api_url, api_key, api_timeout, entry, "stop requested") else "failed"
-        if attempt + 1 < attempts:
-            time.sleep(delay)
-    if not download_id:
-        if entry.get("expected_release_title"):
-            entry["state"] = "awaiting_correlation"
-            entry["error"] = "override accepted but no unambiguous download correlation is available"
-            _save(entry)
-            return "failed"
-        return "restored" if _rollback(api_url, api_key, api_timeout, entry, "no verified grab") else "failed"
-
-    entry["download_id"] = download_id
-    entry["state"] = "waiting_import"
-    _save(entry)
-    for _ in range(attempts):
-        records = sonarr_api.get_history_for_download(api_url, api_key, api_timeout, download_id)
-        event_types = {str(record.get("eventType", "")).lower() for record in records}
-        if "downloadfolderimported" in event_types:
-            valid, validation_error = _validate_replacement(
+        if not download_id:
+            grab = _find_grab(api_url, api_key, api_timeout, entry)
+            download_id = grab.get("downloadId") if grab else _find_queued_download(
                 api_url, api_key, api_timeout, entry
             )
-            if valid:
-                entry["state"] = "imported"
-                entry["error"] = None
+            if download_id:
+                entry["download_id"] = download_id
+                entry["state"] = "waiting_import"
                 _save(entry)
-                logger.warning("Exact-season import validated; original files are preserved at %s",
-                               entry["files"][0]["recovery_root"] if entry["files"] else "journal")
-                return "imported"
-            return ("restored" if _rollback(
-                api_url, api_key, api_timeout, entry,
-                f"partial/invalid import: {validation_error}",
-            ) else "failed")
-        if "downloadfailed" in event_types:
-            return "restored" if _rollback(api_url, api_key, api_timeout, entry, "download/import failed") else "failed"
+        if download_id:
+            records = sonarr_api.get_history_for_download(
+                api_url, api_key, api_timeout, download_id
+            )
+            event_types = {str(record.get("eventType", "")).lower() for record in records}
+            if "downloadfailed" in event_types:
+                return ("restored" if _rollback(
+                    api_url, api_key, api_timeout, entry, "download/import failed"
+                ) else "failed")
+            if "downloadfolderimported" in event_types:
+                valid, validation_error = _validate_replacement(
+                    api_url, api_key, api_timeout, entry, records
+                )
+                if valid:
+                    entry["state"] = "imported"
+                    entry["error"] = None
+                    _save(entry)
+                    logger.warning(
+                        "Exact-season import validated; original files are preserved at %s",
+                        entry["files"][0]["recovery_root"] if entry["files"] else "journal",
+                    )
+                    return "imported"
+                entry["error"] = f"incomplete correlated import: {validation_error}"
+                _save(entry)
         if stop_check():
-            return "restored" if _rollback(api_url, api_key, api_timeout, entry, "stop requested") else "failed"
-        time.sleep(delay)
-    return "restored" if _rollback(api_url, api_key, api_timeout, entry, "import wait timeout") else "failed"
+            if entry.get("expected_release_title"):
+                entry["state"] = "awaiting_correlation"
+                entry["error"] = "stop requested after override submission; recovery remains armed"
+                _save(entry)
+                return "failed"
+            return ("restored" if _rollback(
+                api_url, api_key, api_timeout, entry, "stop requested"
+            ) else "failed")
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+
+    if not download_id and entry.get("expected_release_title"):
+        entry["state"] = "awaiting_correlation"
+        entry["error"] = "override accepted but no unambiguous download correlation is available"
+        _save(entry)
+        return "failed"
+    return ("restored" if _rollback(
+        api_url, api_key, api_timeout, entry,
+        f"import wait timeout: {validation_error}",
+    ) else "failed")

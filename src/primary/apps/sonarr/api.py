@@ -1584,14 +1584,14 @@ def grab_best_season_pack(api_url: str, api_key: str, api_timeout: int,
                 timeout=api_timeout, verify=verify_ssl,
             )
             grab_response.raise_for_status()
-        except Exception:
+        except Exception as exc:
             if recovery_id:
-                from src.primary.apps.sonarr.season_recovery import finish_operation
-                finish_operation(
-                    api_url, api_key, api_timeout, instance_name, recovery_id,
-                    recovery_started_at, False, recovery_wait_delay,
-                    recovery_wait_attempts, stop_check,
-                )
+                # The POST may have reached Sonarr even when the client saw a
+                # timeout/connection error. Never restore originals in this
+                # indeterminate window; the durable journal will correlate the exact
+                # release via history/queue or restore after its deadline.
+                from src.primary.apps.sonarr.season_recovery import mark_submission_indeterminate
+                mark_submission_indeterminate(instance_name, recovery_id, str(exc))
                 recovery_id = None
             raise
         finish_interactive_search(
