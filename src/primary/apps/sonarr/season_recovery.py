@@ -381,6 +381,16 @@ def _rollback(api_url: str, api_key: str, api_timeout: int, entry: Dict,
     return True
 
 
+def _deadline_remaining(entry: Dict) -> Optional[float]:
+    try:
+        deadline = datetime.datetime.fromisoformat(
+            str(entry.get("deadline_at", "")).replace("Z", "+00:00")
+        )
+        return (deadline - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
 def _before_deadline(entry: Dict, fallback_seconds: int = 600) -> bool:
     if not entry.get("search_started_at"):
         return False
@@ -711,6 +721,9 @@ def finish_operation(api_url: str, api_key: str, api_timeout: int,
     download_id = entry.get("download_id")
     validation_error = "no complete correlated import"
     for attempt in range(attempts):
+        remaining = _deadline_remaining(entry)
+        if remaining is not None and remaining <= 0:
+            break
         if not download_id:
             grab = _find_grab(api_url, api_key, api_timeout, entry)
             download_id = grab.get("downloadId") if grab else _find_queued_download(
@@ -754,7 +767,11 @@ def finish_operation(api_url: str, api_key: str, api_timeout: int,
                 api_url, api_key, api_timeout, entry, "stop requested"
             ) else "failed")
         if attempt + 1 < attempts:
-            time.sleep(delay)
+            remaining = _deadline_remaining(entry)
+            if remaining is None:
+                time.sleep(delay)
+            elif remaining > 0:
+                time.sleep(min(delay, remaining))
 
     if not download_id and entry.get("expected_release_title"):
         entry["state"] = "awaiting_correlation"
