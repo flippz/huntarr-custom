@@ -165,7 +165,7 @@ class DefaultsAndPlumbingTests(unittest.TestCase):
         # i.e. only the Python bool True round-trips; a string "true" becomes False.
         self.assertFalse(saved["missing_pack_allow_cutoff_override"])
 
-    def test_missing_pack_allow_cutoff_override_true_is_safety_disabled(self):
+    def test_missing_pack_allow_cutoff_override_true_is_preserved(self):
         class FakeDB:
             saved = None
 
@@ -186,7 +186,7 @@ class DefaultsAndPlumbingTests(unittest.TestCase):
         with mock.patch.object(settings_manager, "get_database", return_value=db):
             self.assertTrue(settings_manager.save_settings("sonarr", payload))
         saved = db.saved["instances"][0]
-        self.assertFalse(saved["missing_pack_allow_cutoff_override"])
+        self.assertTrue(saved["missing_pack_allow_cutoff_override"])
 
     def test_force_option_is_forwarded_only_to_season_upgrade_mode(self):
         with mock.patch.object(sonarr_upgrade, "process_upgrade_seasons_mode", return_value=True) as process, \

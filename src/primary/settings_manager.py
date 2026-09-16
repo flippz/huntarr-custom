@@ -241,9 +241,7 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
     if app_name == 'sonarr' and 'force_season_replacement' in settings_data:
         settings_data['force_season_replacement'] = settings_data.get('force_season_replacement') is True
     if app_name == 'sonarr' and 'missing_pack_allow_cutoff_override' in settings_data:
-        # Legacy option is forcibly disabled: Sonarr may accept shouldOverride but
-        # still partially reject the completed pack during import.
-        settings_data['missing_pack_allow_cutoff_override'] = False
+        settings_data['missing_pack_allow_cutoff_override'] = settings_data.get('missing_pack_allow_cutoff_override') is True
     if app_name == 'sonarr':
         from src.primary.apps.sonarr.api import VALID_MISSING_PACK_PROTOCOLS
         if settings_data.get('missing_pack_download_protocol') not in VALID_MISSING_PACK_PROTOCOLS:
@@ -285,9 +283,7 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
                     instance[qfield] = min(qmax, max(qmin, qvalue))
                 if app_name == 'sonarr':
                     instance['force_season_replacement'] = instance.get('force_season_replacement') is True
-                    # Preserve the key for backward compatibility, but never persist
-                    # the unsafe grab-only override as enabled.
-                    instance['missing_pack_allow_cutoff_override'] = False
+                    instance['missing_pack_allow_cutoff_override'] = instance.get('missing_pack_allow_cutoff_override') is True
                     from src.primary.apps.sonarr.api import VALID_MISSING_PACK_PROTOCOLS
                     if instance.get('missing_pack_download_protocol') not in VALID_MISSING_PACK_PROTOCOLS:
                         instance['missing_pack_download_protocol'] = 'sonarr_default'
