@@ -98,12 +98,13 @@ def _import_succeeded(api_url: str, api_key: str, api_timeout: int,
 
 
 def _same_file_identity(first: str, second: str) -> bool:
-    """Return whether two paths are the same retained file or symlink payload."""
+    """Return whether two paths reference the exact retained filesystem object."""
     if not first or not second or not os.path.lexists(first) or not os.path.lexists(second):
         return False
     try:
-        if os.path.islink(first) and os.path.islink(second):
-            return os.readlink(first) == os.readlink(second)
+        # lstat compares the symlink inode itself rather than following its target.
+        # Rollback restores with a hard link, so a recreated same-text symlink must
+        # not be accepted as the retained original.
         return os.path.samestat(os.lstat(first), os.lstat(second))
     except OSError:
         return False
@@ -259,8 +260,16 @@ def _restored_originals_registered(api_url: str, api_key: str, api_timeout: int,
     for item in entry.get("files", []):
         path = item.get("path")
         backup = item.get("backup_path")
-        if (not isinstance(path, str) or not _same_file_identity(path, backup)
-                or os.path.normpath(path) not in registered_paths):
+        if not isinstance(path, str) or not _same_file_identity(path, backup):
+            return False, f"restored original does not match its retained copy: {path}"
+        registered = os.path.normpath(path) in registered_paths
+        target_was_usable = item.get("target_was_usable")
+        preexisting_broken_symlink = bool(item.get("was_symlink")) and (
+            target_was_usable is False
+            or (target_was_usable is None and os.path.islink(backup)
+                and not os.path.exists(backup))
+        )
+        if not registered and not preexisting_broken_symlink:
             return False, f"restored original is not registered in Sonarr: {path}"
     return True, ""
 
@@ -604,6 +613,10 @@ def prepare_exact_season(api_url: str, api_key: str, api_timeout: int,
             "episode_file_id": int(episode_file["id"]), "path": path,
             "backup_path": os.path.join(recovery_root, relative_path),
             "recovery_root": recovery_root, "was_symlink": os.path.islink(path),
+            # A dangling symlink is still an original worth preserving, but Sonarr
+            # cannot register it. Remember that pre-existing state so rollback does
+            # not turn an unchanged broken link into a global recovery blocker.
+            "target_was_usable": os.path.exists(path),
         })
 
     entry = {

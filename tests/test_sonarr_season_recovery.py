@@ -268,6 +268,61 @@ class SeasonRecoveryTests(unittest.TestCase):
                 )
             self.assertFalse(registered)
 
+    def test_same_text_recreated_symlink_is_not_the_retained_original(self):
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request):
+            journal_id = season_recovery.prepare_exact_season(
+                "http://sonarr", "key", 10, "instance", 7, 1
+            )
+            entry = season_recovery._entry_by_id("instance", journal_id)
+            self.link.symlink_to(self.target)
+            self.assertFalse(season_recovery._same_file_identity(
+                str(self.link), entry["files"][0]["backup_path"]
+            ))
+            registered, _ = season_recovery._restored_originals_registered(
+                "http://sonarr", "key", 10, entry
+            )
+        self.assertFalse(registered)
+
+    def test_preexisting_broken_symlink_does_not_require_sonarr_registration(self):
+        self.target.unlink()
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request):
+            journal_id = season_recovery.prepare_exact_season(
+                "http://sonarr", "key", 10, "instance", 7, 1
+            )
+            entry = season_recovery._entry_by_id("instance", journal_id)
+            self.assertFalse(entry["files"][0]["target_was_usable"])
+            self.assertIsNone(season_recovery._restore_files(entry))
+            with mock.patch.object(
+                season_recovery.sonarr_api, "arr_request",
+                side_effect=lambda *args, **kwargs: []
+                if args[3].startswith("episodefile?") else self._request(*args, **kwargs),
+            ):
+                registered, error = season_recovery._restored_originals_registered(
+                    "http://sonarr", "key", 10, entry
+                )
+        self.assertTrue(registered, error)
+        self.assertTrue(self.link.is_symlink())
+        self.assertFalse(self.link.exists())
+
+    def test_newly_broken_symlink_still_requires_sonarr_registration(self):
+        with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request):
+            journal_id = season_recovery.prepare_exact_season(
+                "http://sonarr", "key", 10, "instance", 7, 1
+            )
+            entry = season_recovery._entry_by_id("instance", journal_id)
+            self.assertTrue(entry["files"][0]["target_was_usable"])
+            self.target.unlink()
+            self.assertIsNone(season_recovery._restore_files(entry))
+            with mock.patch.object(
+                season_recovery.sonarr_api, "arr_request",
+                side_effect=lambda *args, **kwargs: []
+                if args[3].startswith("episodefile?") else self._request(*args, **kwargs),
+            ):
+                registered, _ = season_recovery._restored_originals_registered(
+                    "http://sonarr", "key", 10, entry
+                )
+        self.assertFalse(registered)
+
     def test_repeated_recovery_preserves_different_quarantine_copy(self):
         with mock.patch.object(season_recovery.sonarr_api, "arr_request", side_effect=self._request):
             journal_id = season_recovery.prepare_exact_season(
