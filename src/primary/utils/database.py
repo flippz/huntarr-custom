@@ -1632,6 +1632,28 @@ class HuntarrDatabase(ConfigMixin, StateMixin, UsersMixin, RequestarrMixin, Extr
                 )
             ''')
 
+            # Durable, append-only event feed for the Home dashboard. Hunt history
+            # stores the latest state of an item; this table preserves every
+            # transition so users can see searches, no-results, grabs and failures.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS hunt_activity (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    app_type TEXT NOT NULL,
+                    instance_name TEXT NOT NULL,
+                    media_id TEXT NOT NULL DEFAULT '',
+                    processed_info TEXT NOT NULL DEFAULT '',
+                    operation_type TEXT NOT NULL DEFAULT 'missing',
+                    activity_type TEXT NOT NULL DEFAULT 'search',
+                    status TEXT NOT NULL DEFAULT 'searching',
+                    detail TEXT NOT NULL DEFAULT '',
+                    occurred_at INTEGER NOT NULL,
+                    occurred_at_readable TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_hunt_activity_occurred_at ON hunt_activity(occurred_at DESC)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_hunt_activity_filters ON hunt_activity(app_type, activity_type, status)')
+
             # Add status column if it doesn't exist (for existing databases)
             try:
                 conn.execute("ALTER TABLE hunt_history ADD COLUMN status TEXT DEFAULT 'sent'")

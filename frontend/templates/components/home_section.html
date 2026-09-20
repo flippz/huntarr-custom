@@ -514,6 +514,67 @@
             </div>
         </div>
 
+        <!-- Hunt Activity Log -->
+        <div class="card stats-card hunt-activity-card" id="huntActivityLogCard">
+            <div class="home-section-bar">
+                <div class="home-section-bar-left">
+                    <i class="fas fa-list-alt home-section-icon"></i>
+                    <span class="home-section-title">Hunt Activity Log</span>
+                </div>
+                <div class="hunt-activity-filters">
+                    <label>
+                        <span>Status</span>
+                        <select id="hunt-activity-status-filter">
+                            <option value="all">All statuses</option>
+                            <option value="searching">Searching</option>
+                            <option value="downloaded">Downloaded</option>
+                            <option value="no_results">No results</option>
+                            <option value="failed">Failed</option>
+                            <option value="deferred">Deferred</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>Activity</span>
+                        <select id="hunt-activity-type-filter">
+                            <option value="all">All activity</option>
+                            <option value="search">Search</option>
+                            <option value="download">Download</option>
+                            <option value="deferred">Deferred</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>App</span>
+                        <select id="hunt-activity-app-filter">
+                            <option value="all">All apps</option>
+                            <option value="sonarr">Sonarr</option>
+                            <option value="radarr">Radarr</option>
+                            <option value="lidarr">Lidarr</option>
+                            <option value="readarr">Readarr</option>
+                            <option value="whisparr">Whisparr</option>
+                            <option value="movie_hunt">Movie Hunt</option>
+                            <option value="tv_hunt">TV Hunt</option>
+                            <option value="swaparr">Swaparr</option>
+                            <option value="magnetarr">Magnetarr</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>Time</span>
+                        <select id="hunt-activity-time-filter">
+                            <option value="all">All time</option>
+                            <option value="hour">Last hour</option>
+                            <option value="day">Last day</option>
+                            <option value="week">Last week</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+            <div class="hunt-activity-log-shell">
+                <div id="hunt-activity-log-list" class="hunt-activity-log-list">
+                    <div class="hunt-activity-empty">Waiting for Huntarr activity...</div>
+                </div>
+            </div>
+        </div>
+
         <!-- Swaparr Status Card (only shows when Swaparr is enabled) -->
         <div class="card stats-card" id="swaparrStatusCard" style="display: none;">
             <div class="home-section-bar">

@@ -2,9 +2,36 @@ from flask import Blueprint, request, jsonify, current_app
 import logging
 
 from src.primary.history_manager import get_history, clear_history, add_history_entry
+from src.primary.history_manager import get_activity
 
 logger = logging.getLogger("huntarr")
 history_blueprint = Blueprint('history', __name__)
+
+@history_blueprint.route('/activity', methods=['GET'])
+def get_hunt_activity_feed():
+    """Return the durable Home-dashboard activity feed."""
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+        page_size = max(1, min(200, int(request.args.get('page_size', 20))))
+        result = get_activity(
+            status=request.args.get('status', 'all'),
+            activity_type=request.args.get('type', 'all'),
+            app_type=request.args.get('app', 'all'),
+            instance_name=request.args.get('instance', '') or None,
+            since=request.args.get('since', '') or None,
+            page=page,
+            page_size=page_size,
+        )
+        result["filters"] = {
+            "status": request.args.get('status', 'all'),
+            "type": request.args.get('type', 'all'),
+            "app": request.args.get('app', 'all'),
+            "since": request.args.get('since', ''),
+        }
+        return jsonify(result), 200
+    except Exception as e:
+        logger.error(f"Error getting Hunt activity: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @history_blueprint.route('/<app_type>', methods=['GET'])
 def get_app_history(app_type):

@@ -101,6 +101,33 @@ def update_history_status(entry_id: int, status: str) -> bool:
         logger.error(f"Error updating history status for entry {entry_id}: {e}")
         return False
 
+def record_activity(
+    app_type: str,
+    instance_name: str,
+    media_id: str = "",
+    processed_info: str = "",
+    operation_type: str = "missing",
+    activity_type: str = "search",
+    status: str = "searching",
+    detail: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Record a durable dashboard event without changing hunt history."""
+    try:
+        manager_db = get_manager_database()
+        return manager_db.record_hunt_activity(
+            app_type=app_type,
+            instance_name=instance_name,
+            media_id=media_id,
+            processed_info=processed_info,
+            operation_type=operation_type,
+            activity_type=activity_type,
+            status=status,
+            detail=detail,
+        )
+    except Exception as e:
+        logger.warning(f"Could not record Hunt activity: {e}")
+        return None
+
 def get_history(app_type, search_query=None, page=1, page_size=20, instance_name=None):
     """
     Get history entries for an app
@@ -147,6 +174,36 @@ def get_history(app_type, search_query=None, page=1, page_size=20, instance_name
     except Exception as e:
         logger.error(f"Database error getting history for {app_type}: {e}")
         return {"entries": [], "total_entries": 0, "total_pages": 0, "current_page": 1}
+
+def get_activity(status=None, activity_type=None, app_type=None, instance_name=None, since=None, page=1, page_size=20):
+    """Get recent activity events for the Home dashboard."""
+    try:
+        manager_db = get_manager_database()
+        result = manager_db.get_hunt_activity(
+            status=status,
+            activity_type=activity_type,
+            app_type=app_type,
+            instance_name=instance_name,
+            since=since,
+            page=page,
+            page_size=page_size,
+        )
+        # Prefer the user's configured timezone for timestamps in the UI.
+        try:
+            from src.primary.utils.timezone_utils import get_user_timezone
+            import pytz
+            user_tz = get_user_timezone(prefer_database_for_display=True)
+            for entry in result.get("entries", []):
+                ts = entry.get("occurred_at")
+                if ts is not None:
+                    utc_dt = datetime.fromtimestamp(ts, tz=pytz.UTC)
+                    entry["occurred_at_readable"] = utc_dt.astimezone(user_tz).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        logger.error(f"Database error getting Hunt activity: {e}")
+        return {"entries": [], "total_entries": 0, "total_pages": 1, "current_page": 1, "page_size": page_size}
 
 def clear_history(app_type):
     """

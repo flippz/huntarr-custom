@@ -13,6 +13,7 @@ from src.primary.utils.logger import get_logger
 from src.primary.settings_manager import load_settings, get_advanced_setting
 from src.primary.utils.history_utils import log_processed_media
 from src.primary.history_manager import update_history_status
+from src.primary.history_manager import record_activity
 from src.primary.stats_manager import increment_media_stat_only, check_hourly_cap_exceeded
 from src.primary.stateful_manager import (
     add_processed_id, get_processed_ids, get_state_management_summary, is_processed,
@@ -423,6 +424,11 @@ def process_missing_seasons_packs_mode(
         # Refresh functionality has been removed as it was identified as a performance bottleneck
         
         sonarr_logger.info(f"Searching for season pack: {series_title} - Season {season_number} (contains {episode_count} missing episodes)")
+        record_activity(
+            "sonarr", instance_name, f"{series_id}_{season_number}",
+            f"{series_title} - Season {season_number}", "missing", "search",
+            "searching", "Searching Sonarr season pack",
+        )
 
         # Dispatch permission and lifecycle claims are acquired inside this helper
         # before Sonarr is allowed to perform the synchronous indexer search.
@@ -477,6 +483,11 @@ def process_missing_seasons_packs_mode(
             sonarr_logger.info(
                 "Strict season-pack search did not grab a pack for %s - Season %s.",
                 series_title, season_number,
+            )
+            record_activity(
+                "sonarr", instance_name, f"{series_id}_{season_number}",
+                f"{series_title} - Season {season_number}", "missing", "search",
+                "no_results", "No matching season pack found",
             )
     
     sonarr_logger.info(f"Missing: processed {processed_count} season packs")
@@ -656,6 +667,10 @@ def process_missing_shows_mode(
         
         # Search for all episodes in the show
         sonarr_logger.info(f"Searching for {len(episode_ids)} missing episodes for {show_title}...")
+        record_activity(
+            "sonarr", instance_name, str(show_id), show_title, "missing",
+            "search", "searching", f"Searching Sonarr for {len(episode_ids)} episodes",
+        )
         search_successful = sonarr_api.search_episode(api_url, api_key, api_timeout, episode_ids, instance_name=instance_name)
         
         if search_successful:
@@ -704,6 +719,10 @@ def process_missing_shows_mode(
             sonarr_logger.debug(f"Incremented sonarr hunted statistics by {len(episode_ids)}")
         else:
             sonarr_logger.error(f"Failed to trigger search for {show_title}.")
+            record_activity(
+                "sonarr", instance_name, str(show_id), show_title, "missing",
+                "search", "failed", "Failed to trigger Sonarr search",
+            )
     
     sonarr_logger.info("Missing: show-based processing complete.")
     return processed_any
@@ -857,6 +876,11 @@ def process_missing_episodes_mode(
         sonarr_logger.info(f"Processing episode: {series_title} - {season_episode} - {episode_title}")
 
         _search_start_iso = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
+        record_activity(
+            "sonarr", instance_name, str(episode_id),
+            f"{series_title} - {season_episode}", "missing", "search",
+            "searching", "Searching Sonarr episode",
+        )
         # Search for this specific episode
         search_successful = sonarr_api.search_episode(api_url, api_key, api_timeout, [episode_id], instance_name=instance_name)
 
@@ -899,6 +923,11 @@ def process_missing_episodes_mode(
 
         else:
             sonarr_logger.error(f"Failed to trigger search for episode: {series_title} - {season_episode}")
+            record_activity(
+                "sonarr", instance_name, str(episode_id),
+                f"{series_title} - {season_episode}", "missing", "search",
+                "failed", "Failed to trigger Sonarr episode search",
+            )
     
     sonarr_logger.info(f"Processed {processed_count} individual missing episodes for Sonarr.")
     sonarr_logger.warning("Episodes mode processing complete - consider using Season Packs mode for better efficiency")

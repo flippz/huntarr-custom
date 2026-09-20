@@ -175,6 +175,11 @@ Object.assign(huntarrUI, {
         // Stop stats polling when leaving home section
         if (window.HuntarrStats) window.HuntarrStats.stopPolling();
 
+        // Stop the Home activity feed when navigating away.
+        if (this.currentSection === 'home' && window.HuntActivityLog && typeof window.HuntActivityLog.cleanup === 'function') {
+            window.HuntActivityLog.cleanup();
+        }
+
         // Stop NZB Hunt queue/history polling when leaving NZB Hunt home
         if (this.currentSection === 'nzb-hunt-home' && window.NzbHunt && typeof window.NzbHunt.stopPolling === 'function') {
             window.NzbHunt.stopPolling();
@@ -239,6 +244,10 @@ Object.assign(huntarrUI, {
             if (window.HuntarrStats) {
                 window.HuntarrStats.initViewToggle();
                 window.HuntarrStats.startPolling();
+            }
+            // Load and poll the durable Hunt Activity feed.
+            if (window.HuntActivityLog && typeof window.HuntActivityLog.init === 'function') {
+                window.HuntActivityLog.init();
             }
             // Re-initialize cycle countdown when returning to home (cleanup stops it when leaving)
             if (window.CycleCountdown && typeof window.CycleCountdown.initialize === 'function') {

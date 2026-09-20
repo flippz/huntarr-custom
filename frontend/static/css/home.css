@@ -2863,3 +2863,175 @@ body.setup-wizard-active .app-banners-row {
         display: none;
     }
 }
+
+/* Hunt Activity Log */
+.hunt-activity-card {
+    margin-top: 18px;
+}
+
+.hunt-activity-filters {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.hunt-activity-filters label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    color: #94a3b8;
+    font-size: 0.72rem;
+    font-weight: 600;
+}
+
+.hunt-activity-filters select {
+    min-width: 96px;
+    padding: 5px 24px 5px 8px;
+    border: 1px solid rgba(100, 116, 139, 0.35);
+    border-radius: 6px;
+    background: rgba(15, 23, 42, 0.85);
+    color: #cbd5e1;
+    font-size: 0.72rem;
+    outline: none;
+}
+
+.hunt-activity-filters select:focus {
+    border-color: rgba(99, 102, 241, 0.7);
+    box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.12);
+}
+
+.hunt-activity-log-shell {
+    padding: 8px 14px 12px;
+}
+
+.hunt-activity-log-list {
+    max-height: 330px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding-right: 4px;
+}
+
+.hunt-activity-row {
+    display: grid;
+    grid-template-columns: 118px minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+    padding: 8px 10px;
+    border: 1px solid rgba(148, 163, 184, 0.08);
+    border-radius: 7px;
+    background: rgba(15, 23, 42, 0.52);
+}
+
+.hunt-activity-time {
+    color: #64748b;
+    font-size: 0.7rem;
+    padding-top: 2px;
+    white-space: nowrap;
+}
+
+.hunt-activity-main {
+    min-width: 0;
+}
+
+.hunt-activity-line {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 7px;
+    min-width: 0;
+}
+
+.hunt-activity-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 0.66rem;
+    font-weight: 700;
+    line-height: 1.3;
+}
+
+.hunt-activity-searching {
+    background: rgba(96, 165, 250, 0.14);
+    color: #93c5fd;
+}
+
+.hunt-activity-downloaded {
+    background: rgba(52, 211, 153, 0.14);
+    color: #6ee7b7;
+}
+
+.hunt-activity-no-results {
+    background: rgba(251, 191, 36, 0.14);
+    color: #fcd34d;
+}
+
+.hunt-activity-failed {
+    background: rgba(251, 113, 133, 0.14);
+    color: #fda4af;
+}
+
+.hunt-activity-deferred {
+    background: rgba(167, 139, 250, 0.14);
+    color: #c4b5fd;
+}
+
+.hunt-activity-app {
+    color: #818cf8;
+    font-size: 0.7rem;
+    font-weight: 700;
+}
+
+.hunt-activity-title {
+    color: #e2e8f0;
+    font-size: 0.78rem;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.hunt-activity-detail {
+    margin-top: 3px;
+    color: #94a3b8;
+    font-size: 0.7rem;
+    line-height: 1.35;
+}
+
+.hunt-activity-empty {
+    padding: 18px 8px;
+    color: #64748b;
+    font-size: 0.78rem;
+    text-align: center;
+}
+
+@media (max-width: 900px) {
+    .hunt-activity-filters {
+        justify-content: flex-start;
+        width: 100%;
+        margin-top: 8px;
+    }
+}
+
+@media (max-width: 600px) {
+    .hunt-activity-row {
+        grid-template-columns: 1fr;
+        gap: 4px;
+    }
+
+    .hunt-activity-title {
+        white-space: normal;
+    }
+
+    .hunt-activity-filters label {
+        flex: 1 1 130px;
+    }
+
+    .hunt-activity-filters select {
+        flex: 1;
+        min-width: 0;
+    }
+}

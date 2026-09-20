@@ -14,6 +14,7 @@ from src.primary.stats_manager import increment_media_stat_only
 from src.primary.stateful_manager import add_processed_id
 from src.primary.utils.history_utils import log_processed_media
 from src.primary.history_manager import update_history_status
+from src.primary.history_manager import record_activity
 from src.primary.settings_manager import load_settings
 from src.primary.utils.date_utils import parse_date
 from src.primary.apps._common.settings import extract_app_settings, validate_settings
@@ -291,6 +292,10 @@ def process_cutoff_upgrades(
         
         # Search for cutoff upgrade
         radarr_logger.info(f"  - Searching for quality upgrade...")
+        record_activity(
+            "radarr", instance_key, str(movie_id), movie_title, "upgrade",
+            "search", "searching", "Searching Radarr quality upgrade",
+        )
         _search_start_iso = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
         search_result = radarr_api.movie_search(api_url, api_key, api_timeout, [movie_id])
         
@@ -337,6 +342,10 @@ def process_cutoff_upgrades(
             processed_something = True
         else:
             radarr_logger.warning(f"  - Failed to trigger search for quality upgrade.")
+            record_activity(
+                "radarr", instance_key, str(movie_id), movie_title, "upgrade",
+                "search", "failed", "Failed to trigger Radarr quality-upgrade search",
+            )
             
     # Log final status
     radarr_logger.info(f"Upgrade: processed {processed_count} of {len(movies_to_process)} movies")

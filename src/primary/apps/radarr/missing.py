@@ -15,6 +15,7 @@ from src.primary.stats_manager import increment_media_stat_only
 from src.primary.stateful_manager import add_processed_id
 from src.primary.utils.history_utils import log_processed_media
 from src.primary.history_manager import update_history_status
+from src.primary.history_manager import record_activity
 from src.primary.settings_manager import load_settings
 from src.primary.apps._common.settings import extract_app_settings, validate_settings
 from src.primary.apps._common.filtering import filter_exempt_items, filter_unprocessed
@@ -268,6 +269,10 @@ def process_missing_movies(
         
         # Search for the movie
         radarr_logger.info(f"Searching for movie '{movie_title}' (ID: {movie_id})...")
+        record_activity(
+            "radarr", instance_key, str(movie_id), movie_title, "missing",
+            "search", "searching", "Searching Radarr movie",
+        )
         _search_start_iso = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
         search_success = radarr_api.movie_search(api_url, api_key, api_timeout, [movie_id])
         
@@ -308,6 +313,10 @@ def process_missing_movies(
             processed_any = True
         else:
             radarr_logger.warning(f"Failed to trigger search for movie '{movie_title}'")
+            record_activity(
+                "radarr", instance_key, str(movie_id), movie_title, "missing",
+                "search", "failed", "Failed to trigger Radarr movie search",
+            )
     
     radarr_logger.info(f"Missing: processed {movies_processed} of {len(movies_to_process)} movies")
     return processed_any

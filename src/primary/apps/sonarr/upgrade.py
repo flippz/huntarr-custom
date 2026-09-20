@@ -13,6 +13,7 @@ from src.primary.apps.sonarr.missing import _normalize_exempt_tags
 from src.primary.stats_manager import increment_media_stat_only, check_hourly_cap_exceeded
 from src.primary.stateful_manager import is_processed, add_processed_id
 from src.primary.utils.history_utils import log_processed_media
+from src.primary.history_manager import record_activity
 from src.primary.settings_manager import get_advanced_setting, load_settings
 
 # Get logger for the Sonarr app
@@ -129,6 +130,10 @@ def process_cutoff_upgrades(
             series_id = s.get("id")
             title = s.get("title", f"Series {series_id}")
             sonarr_logger.info(f"Processing tag-based upgrade for series: \"{title}\" (ID: {series_id})")
+            record_activity(
+                "sonarr", instance_name, str(series_id), title, "upgrade",
+                "search", "searching", "Searching Sonarr quality upgrade",
+            )
             if sonarr_api.series_search(api_url, api_key, api_timeout, series_id, instance_name=instance_name):
                 add_processed_id("sonarr", instance_name, f"series_{series_id}")
                 increment_media_stat_only("sonarr", "upgraded", 1, instance_name)
@@ -150,6 +155,11 @@ def process_cutoff_upgrades(
                              api_url, api_key, api_timeout, series_id,
                              sonarr_logger, f"series {series_id}")
                 processed_count += 1
+            else:
+                record_activity(
+                    "sonarr", instance_name, str(series_id), title, "upgrade",
+                    "search", "failed", "Failed to trigger Sonarr quality-upgrade search",
+                )
         sonarr_logger.info(f"Upgrade: processed {processed_count} series (tag-based)")
         return processed_count > 0
     
@@ -382,6 +392,11 @@ def process_upgrade_seasons_mode(
         recovery_id = None
         dispatch_slot_acquired = False
         search_started_at = None
+        record_activity(
+            "sonarr", instance_name, f"{series_id}_{season_number}",
+            f"{series_title} - Season {season_number}", "upgrade", "search",
+            "searching", "Searching Sonarr season-pack quality upgrade",
+        )
         if force_season_replacement:
             if command_wait_attempts <= 0:
                 sonarr_logger.error("Force exact-season replacement requires command waiting; skipping unsafe fire-and-forget search")
@@ -489,8 +504,18 @@ def process_upgrade_seasons_mode(
                         sonarr_logger.error(f"Failed to log history for episode ID {episode_id}: {str(e)}")
             else:
                 sonarr_logger.warning(f"Season pack search command for {series_title} Season {season_number} did not complete successfully")
+                record_activity(
+                    "sonarr", instance_name, f"{series_id}_{season_number}",
+                    f"{series_title} - Season {season_number}", "upgrade", "search",
+                    "failed", "Sonarr quality-upgrade search command failed",
+                )
         else:
             sonarr_logger.error(f"Failed to trigger season pack search command for {series_title} Season {season_number}")
+            record_activity(
+                "sonarr", instance_name, f"{series_id}_{season_number}",
+                f"{series_title} - Season {season_number}", "upgrade", "search",
+                "failed", "Failed to trigger Sonarr quality-upgrade search",
+            )
     
     sonarr_logger.info(f"Upgrade: processed seasons in season-pack mode")
     return processed_any
@@ -624,6 +649,10 @@ def process_upgrade_shows_mode(
             
         # Trigger search for all cutoff unmet episodes in this series
         sonarr_logger.debug(f"Attempting to search for {len(episode_ids)} episodes in {series_title} for upgrades")
+        record_activity(
+            "sonarr", instance_name, str(series_id), series_title, "upgrade",
+            "search", "searching", f"Searching Sonarr quality upgrade for {len(episode_ids)} episodes",
+        )
         search_command_id = sonarr_api.search_episode(api_url, api_key, api_timeout, episode_ids, instance_name=instance_name)
         
         if search_command_id:
@@ -677,8 +706,16 @@ def process_upgrade_shows_mode(
                         sonarr_logger.error(f"Failed to log history for episode ID {episode_id}: {str(e)}")
             else:
                 sonarr_logger.warning(f"Episode upgrade search command for {series_title} did not complete successfully")
+                record_activity(
+                    "sonarr", instance_name, str(series_id), series_title, "upgrade",
+                    "search", "failed", "Sonarr quality-upgrade search command failed",
+                )
         else:
             sonarr_logger.error(f"Failed to trigger upgrade search command for {series_title}")
+            record_activity(
+                "sonarr", instance_name, str(series_id), series_title, "upgrade",
+                "search", "failed", "Failed to trigger Sonarr quality-upgrade search",
+            )
     
     sonarr_logger.info("Upgrade: processed shows in show mode")
     return processed_any
@@ -820,6 +857,11 @@ def process_upgrade_episodes_mode(
         
         sonarr_logger.info(f"Processing upgrade for episode: {series_title} - {season_episode} - {episode_title}")
         
+        record_activity(
+            "sonarr", instance_name, str(episode_id),
+            f"{series_title} - {season_episode}", "upgrade", "search",
+            "searching", "Searching Sonarr episode quality upgrade",
+        )
         # Search for this specific episode upgrade
         search_successful = sonarr_api.search_episode(api_url, api_key, api_timeout, [episode_id], instance_name=instance_name)
         
@@ -870,6 +912,11 @@ def process_upgrade_episodes_mode(
                 sonarr_logger.debug(f"Incremented sonarr upgraded statistics for episode {episode_id}")
         else:
             sonarr_logger.error(f"Failed to trigger upgrade search for episode: {series_title} - {season_episode}")
+            record_activity(
+                "sonarr", instance_name, str(episode_id),
+                f"{series_title} - {season_episode}", "upgrade", "search",
+                "failed", "Failed to trigger Sonarr episode quality-upgrade search",
+            )
     
     sonarr_logger.info(f"Upgrade: processed {processed_count} individual episodes")
     sonarr_logger.warning("Episodes mode upgrade processing complete - consider using Season Packs mode for better efficiency")

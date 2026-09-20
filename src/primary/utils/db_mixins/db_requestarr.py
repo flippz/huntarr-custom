@@ -620,22 +620,62 @@ class RequestarrMixin:
             }
             
             logger.debug(f"Added hunt history entry for {app_type}-{instance_name}: {processed_info}")
+            self._record_activity_for_history_status(
+                app_type, instance_name, media_id, processed_info,
+                operation_type, status, date_time
+            )
             return entry
 
     def update_hunt_history_status(self, entry_id: int, status: str) -> bool:
         """Update the status of a hunt history entry."""
         try:
             with self.get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT app_type, instance_name, media_id, processed_info, operation_type FROM hunt_history WHERE id = ?",
+                    (entry_id,),
+                ).fetchone()
                 conn.execute(
                     "UPDATE hunt_history SET status = ? WHERE id = ?",
                     (status, entry_id)
                 )
                 conn.commit()
                 logger.debug(f"Updated hunt history entry {entry_id} status to '{status}'")
+                if row:
+                    self._record_activity_for_history_status(
+                        row["app_type"], row["instance_name"], row["media_id"],
+                        row["processed_info"], row["operation_type"], status
+                    )
                 return True
         except Exception as e:
             logger.error(f"Error updating hunt history status for entry {entry_id}: {e}")
             return False
+
+    def _record_activity_for_history_status(
+        self, app_type: str, instance_name: str, media_id: str,
+        processed_info: str, operation_type: str, status: str, date_time: int = None
+    ) -> Optional[Dict[str, Any]]:
+        """Map legacy hunt-history states to readable dashboard events."""
+        normalized = (status or "searching").lower()
+        if normalized in ("grabbed", "downloaded", "completed_download"):
+            activity_type, event_status, detail = "download", "downloaded", "Downloaded/grabbed"
+        elif normalized in ("failed", "error", "aborted"):
+            activity_type, event_status, detail = "search", "failed", "Search failed"
+        elif normalized in ("searched", "completed", "no_grab", "no_results"):
+            activity_type, event_status, detail = "search", "no_results", "No results"
+        else:
+            activity_type, event_status, detail = "search", "searching", "Search started"
+        return self.record_hunt_activity(
+            app_type=app_type,
+            instance_name=instance_name,
+            media_id=media_id,
+            processed_info=processed_info,
+            operation_type=operation_type,
+            activity_type=activity_type,
+            status=event_status,
+            detail=detail,
+            date_time=date_time,
+        )
 
     def get_hunt_history(self, app_type: str = None, search_query: str = None, 
                    page: int = 1, page_size: int = 20, instance_name: str = None) -> Dict[str, Any]:
@@ -715,6 +755,142 @@ class RequestarrMixin:
             else:
                 conn.execute("DELETE FROM hunt_history")
                 logger.info("Cleared all hunt history")
+            conn.commit()
+
+    def record_hunt_activity(
+        self,
+        app_type: str,
+        instance_name: str,
+        media_id: str = "",
+        processed_info: str = "",
+        operation_type: str = "missing",
+        activity_type: str = "search",
+        status: str = "searching",
+        detail: str = "",
+        date_time: int = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Append one durable activity event without changing hunt history."""
+        if not app_type or not instance_name:
+            return None
+
+        if date_time is None:
+            date_time = int(time.time())
+
+        try:
+            occurred_readable = datetime.fromtimestamp(date_time).strftime('%Y-%m-%d %H:%M:%S')
+            with self.get_connection() as conn:
+                cursor = conn.execute(
+                    '''
+                    INSERT INTO hunt_activity
+                    (app_type, instance_name, media_id, processed_info, operation_type,
+                     activity_type, status, detail, occurred_at, occurred_at_readable)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        str(app_type),
+                        str(instance_name),
+                        str(media_id or ""),
+                        str(processed_info or ""),
+                        str(operation_type or "missing"),
+                        str(activity_type or "search"),
+                        str(status or "searching"),
+                        str(detail or ""),
+                        int(date_time),
+                        occurred_readable,
+                    ),
+                )
+                conn.commit()
+                return {
+                    "id": cursor.lastrowid,
+                    "app_type": str(app_type),
+                    "instance_name": str(instance_name),
+                    "media_id": str(media_id or ""),
+                    "processed_info": str(processed_info or ""),
+                    "operation_type": str(operation_type or "missing"),
+                    "activity_type": str(activity_type or "search"),
+                    "status": str(status or "searching"),
+                    "detail": str(detail or ""),
+                    "occurred_at": int(date_time),
+                    "occurred_at_readable": occurred_readable,
+                }
+        except Exception as e:
+            # Activity is diagnostic; a database problem must not interrupt a hunt.
+            logger.warning(f"Could not record Hunt activity event: {e}")
+            return None
+
+    def get_hunt_activity(
+        self,
+        status: str = None,
+        activity_type: str = None,
+        app_type: str = None,
+        instance_name: str = None,
+        since: int = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Dict[str, Any]:
+        """Return recent activity events with the dashboard filters."""
+        page = max(1, int(page or 1))
+        page_size = max(1, min(200, int(page_size or 20)))
+
+        where_conditions = []
+        params = []
+        if app_type and app_type != "all":
+            where_conditions.append("app_type = ?")
+            params.append(app_type)
+        if instance_name:
+            where_conditions.append("instance_name = ?")
+            params.append(str(instance_name))
+        if status and status != "all":
+            where_conditions.append("status = ?")
+            params.append(status)
+        if activity_type and activity_type != "all":
+            where_conditions.append("activity_type = ?")
+            params.append(activity_type)
+        if since:
+            try:
+                since = int(since)
+                where_conditions.append("occurred_at >= ?")
+                params.append(since)
+            except (TypeError, ValueError):
+                pass
+
+        where_clause = "WHERE " + " AND ".join(where_conditions) if where_conditions else ""
+        with self.get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            total = conn.execute(f"SELECT COUNT(*) FROM hunt_activity {where_clause}", params).fetchone()[0]
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            offset = (page - 1) * page_size
+            rows = conn.execute(
+                f"SELECT * FROM hunt_activity {where_clause} ORDER BY occurred_at DESC, id DESC LIMIT ? OFFSET ?",
+                params + [page_size, offset],
+            ).fetchall()
+
+        current_time = int(time.time())
+        entries = []
+        for row in rows:
+            entry = dict(row)
+            entry["type"] = entry.pop("activity_type")
+            seconds_ago = max(0, current_time - entry["occurred_at"])
+            entry["how_long_ago"] = self._format_time_ago(seconds_ago)
+            entries.append(entry)
+
+        return {
+            "entries": entries,
+            "total_entries": total,
+            "total_pages": total_pages,
+            "current_page": page,
+            "page_size": page_size,
+        }
+
+    def clear_hunt_activity(self, app_type: str = None):
+        """Clear activity events, optionally for one app."""
+        with self.get_connection() as conn:
+            if app_type and app_type != "all":
+                conn.execute("DELETE FROM hunt_activity WHERE app_type = ?", (app_type,))
+                logger.info(f"Cleared hunt activity for {app_type}")
+            else:
+                conn.execute("DELETE FROM hunt_activity")
+                logger.info("Cleared all hunt activity")
             conn.commit()
 
     def _format_time_ago(self, seconds_ago: int) -> str:
