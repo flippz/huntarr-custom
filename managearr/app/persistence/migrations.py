@@ -262,6 +262,258 @@ MIGRATIONS: list[Migration] = [
             FOR EACH ROW EXECUTE FUNCTION protect_dispatch_item_audit();
         """,
     ),
+    Migration(
+        version=3,
+        name="dispatch_outcome_tracking",
+        sql="""
+            ALTER TABLE dispatch_batches
+                ADD COLUMN reconciliation_state TEXT NOT NULL DEFAULT 'not_reconciled',
+                ADD COLUMN reconciliation_summary VARCHAR(1000) NOT NULL DEFAULT '',
+                ADD COLUMN last_reconciled_at TIMESTAMPTZ,
+                ADD COLUMN command_observed_state TEXT;
+
+            ALTER TABLE dispatch_batches
+                ADD CONSTRAINT dispatch_batches_reconciliation_state_check CHECK (
+                    reconciliation_state IN (
+                        'not_reconciled', 'operator_review', 'unresolved',
+                        'partial', 'resolved', 'error'
+                    )
+                ),
+                ADD CONSTRAINT dispatch_batches_command_observed_state_check CHECK (
+                    command_observed_state IS NULL OR command_observed_state IN (
+                        'queued', 'running', 'completed', 'failed', 'aborted', 'unknown'
+                    )
+                ),
+                ADD CONSTRAINT dispatch_batches_reconciliation_summary_length CHECK (
+                    char_length(reconciliation_summary) <= 1000
+                );
+
+            ALTER TABLE dispatch_batches DROP CONSTRAINT dispatch_batches_state_check;
+            ALTER TABLE dispatch_batches DROP CONSTRAINT dispatch_batches_check3;
+            ALTER TABLE dispatch_batches
+                ADD CONSTRAINT dispatch_batches_state_check CHECK (
+                    state IN ('planned', 'dispatching', 'completed', 'partial', 'failed', 'ambiguous')
+                ),
+                ADD CONSTRAINT dispatch_batches_lifecycle_check CHECK (
+                    (state = 'planned' AND sonarr_command_id IS NULL)
+                    OR (state = 'dispatching' AND selected_count > 0
+                        AND dispatched_count = 0)
+                    OR (state = 'completed' AND selected_count = requested_count
+                        AND dispatched_count = selected_count AND selected_count > 0
+                        AND sonarr_command_id IS NOT NULL)
+                    OR (state = 'partial' AND selected_count < requested_count
+                        AND dispatched_count = selected_count AND selected_count > 0
+                        AND sonarr_command_id IS NOT NULL)
+                    OR (state = 'failed' AND dispatched_count = 0
+                        AND sonarr_command_id IS NULL)
+                    OR (state = 'ambiguous' AND dispatched_count = 0
+                        AND selected_count > 0)
+                );
+
+            ALTER TABLE dispatch_batch_items DROP CONSTRAINT dispatch_batch_items_state_check;
+            ALTER TABLE dispatch_batch_items DROP CONSTRAINT dispatch_batch_items_check;
+            ALTER TABLE dispatch_batch_items
+                ADD CONSTRAINT dispatch_batch_items_state_check CHECK (
+                    state IN ('planned', 'reserved', 'dispatched', 'failed', 'excluded', 'ambiguous')
+                ),
+                ADD CONSTRAINT dispatch_batch_items_reason_check CHECK (
+                    state NOT IN ('failed', 'excluded', 'ambiguous') OR reason IS NOT NULL
+                );
+
+            CREATE TABLE dispatch_reconciliation_attempts (
+                id BIGSERIAL PRIMARY KEY,
+                batch_id BIGINT NOT NULL REFERENCES dispatch_batches (id) ON DELETE RESTRICT,
+                observed_at TIMESTAMPTZ NOT NULL,
+                state TEXT NOT NULL CHECK (
+                    state IN ('unresolved', 'partial', 'resolved', 'error')
+                ),
+                safe_summary VARCHAR(1000) NOT NULL,
+                command_endpoint_read BOOLEAN NOT NULL DEFAULT FALSE,
+                history_endpoint_read BOOLEAN NOT NULL DEFAULT FALSE,
+                queue_endpoint_read BOOLEAN NOT NULL DEFAULT FALSE,
+                inserted_event_count INTEGER NOT NULL DEFAULT 0 CHECK (inserted_event_count >= 0)
+            );
+            CREATE INDEX idx_dispatch_reconciliation_attempts_batch_observed
+                ON dispatch_reconciliation_attempts (batch_id, observed_at DESC);
+
+            CREATE TABLE dispatch_outcome_events (
+                id BIGSERIAL PRIMARY KEY,
+                batch_id BIGINT NOT NULL REFERENCES dispatch_batches (id) ON DELETE RESTRICT,
+                dispatch_item_id BIGINT REFERENCES dispatch_batch_items (id) ON DELETE RESTRICT,
+                candidate_id BIGINT,
+                episode_id INTEGER,
+                observed_at TIMESTAMPTZ NOT NULL,
+                source_endpoint TEXT NOT NULL CHECK (
+                    source_endpoint IN ('command', 'history', 'queue')
+                ),
+                event_type TEXT NOT NULL CHECK (
+                    event_type IN (
+                        'command_queued', 'command_running', 'command_completed',
+                        'command_failed', 'command_aborted', 'grabbed', 'downloading',
+                        'imported', 'download_failed', 'import_failed', 'unknown'
+                    )
+                ),
+                event_state TEXT NOT NULL CHECK (
+                    event_state IN ('nonterminal', 'terminal', 'unknown')
+                ),
+                safe_summary VARCHAR(1000) NOT NULL,
+                sonarr_command_id INTEGER,
+                sonarr_event_id BIGINT,
+                download_id VARCHAR(255),
+                evidence_key VARCHAR(500) NOT NULL,
+                CHECK (episode_id IS NULL OR episode_id > 0),
+                CHECK (sonarr_command_id IS NULL OR sonarr_command_id > 0),
+                CHECK (sonarr_event_id IS NULL OR sonarr_event_id > 0),
+                CHECK (
+                    (dispatch_item_id IS NULL AND candidate_id IS NULL AND episode_id IS NULL)
+                    OR (dispatch_item_id IS NOT NULL AND candidate_id IS NOT NULL AND episode_id IS NOT NULL)
+                ),
+                UNIQUE (batch_id, source_endpoint, evidence_key)
+            );
+            CREATE INDEX idx_dispatch_outcome_events_batch_observed
+                ON dispatch_outcome_events (batch_id, observed_at DESC, id DESC);
+            CREATE INDEX idx_dispatch_outcome_events_item_observed
+                ON dispatch_outcome_events (dispatch_item_id, observed_at DESC, id DESC);
+            CREATE INDEX idx_dispatch_outcome_events_episode
+                ON dispatch_outcome_events (batch_id, episode_id, observed_at DESC);
+
+            CREATE FUNCTION protect_outcome_audit() RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'outcome audit rows are append-only';
+            END;
+            $$ LANGUAGE plpgsql;
+
+            CREATE TRIGGER protect_reconciliation_attempt_audit
+            BEFORE UPDATE OR DELETE ON dispatch_reconciliation_attempts
+            FOR EACH ROW EXECUTE FUNCTION protect_outcome_audit();
+
+            CREATE TRIGGER protect_outcome_event_audit
+            BEFORE UPDATE OR DELETE ON dispatch_outcome_events
+            FOR EACH ROW EXECUTE FUNCTION protect_outcome_audit();
+
+            CREATE OR REPLACE FUNCTION protect_dispatch_batch_audit() RETURNS trigger AS $$
+            DECLARE
+                reconciliation_only BOOLEAN;
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    RAISE EXCEPTION 'dispatch audit rows cannot be deleted';
+                END IF;
+                IF NEW.scan_job_id IS DISTINCT FROM OLD.scan_job_id
+                   OR (
+                       NEW.library_id IS DISTINCT FROM OLD.library_id
+                       AND NOT (OLD.library_id IS NOT NULL AND NEW.library_id IS NULL)
+                   )
+                   OR NEW.library_name IS DISTINCT FROM OLD.library_name
+                   OR NEW.mode IS DISTINCT FROM OLD.mode
+                   OR NEW.requested_count IS DISTINCT FROM OLD.requested_count
+                   OR NEW.selected_count IS DISTINCT FROM OLD.selected_count
+                   OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+                    RAISE EXCEPTION 'dispatch audit identity is immutable';
+                END IF;
+
+                IF OLD.library_id IS NOT NULL AND NEW.library_id IS NULL
+                   AND NEW.state IS NOT DISTINCT FROM OLD.state
+                   AND NEW.dispatched_count IS NOT DISTINCT FROM OLD.dispatched_count
+                   AND NEW.sonarr_command_id IS NOT DISTINCT FROM OLD.sonarr_command_id
+                   AND NEW.sonarr_command_status IS NOT DISTINCT FROM OLD.sonarr_command_status
+                   AND NEW.error_summary IS NOT DISTINCT FROM OLD.error_summary
+                   AND NEW.reconciliation_state IS NOT DISTINCT FROM OLD.reconciliation_state
+                   AND NEW.reconciliation_summary IS NOT DISTINCT FROM OLD.reconciliation_summary
+                   AND NEW.last_reconciled_at IS NOT DISTINCT FROM OLD.last_reconciled_at
+                   AND NEW.command_observed_state IS NOT DISTINCT FROM OLD.command_observed_state
+                   AND NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN
+                    RETURN NEW;
+                END IF;
+
+                reconciliation_only :=
+                    NEW.state IS NOT DISTINCT FROM OLD.state
+                    AND NEW.dispatched_count IS NOT DISTINCT FROM OLD.dispatched_count
+                    AND NEW.sonarr_command_id IS NOT DISTINCT FROM OLD.sonarr_command_id
+                    AND NEW.sonarr_command_status IS NOT DISTINCT FROM OLD.sonarr_command_status
+                    AND NEW.error_summary IS NOT DISTINCT FROM OLD.error_summary;
+
+                IF reconciliation_only THEN
+                    IF (OLD.reconciliation_state = 'resolved'
+                            AND NEW.reconciliation_state <> 'resolved')
+                       OR (OLD.reconciliation_state = 'partial'
+                            AND NEW.reconciliation_state IN (
+                                'not_reconciled', 'operator_review', 'unresolved', 'error'
+                            ))
+                       OR (OLD.reconciliation_state = 'unresolved'
+                            AND NEW.reconciliation_state IN (
+                                'not_reconciled', 'operator_review', 'error'
+                            ))
+                       OR (OLD.reconciliation_state IN ('operator_review', 'error')
+                            AND NEW.reconciliation_state = 'not_reconciled') THEN
+                        RAISE EXCEPTION 'reconciliation state cannot regress';
+                    END IF;
+                    RETURN NEW;
+                END IF;
+
+                IF OLD.state = 'dispatching' AND NEW.state = 'dispatching'
+                   AND OLD.sonarr_command_id IS NULL AND NEW.sonarr_command_id IS NOT NULL
+                   AND NEW.dispatched_count = 0
+                   AND NEW.error_summary IS NOT DISTINCT FROM OLD.error_summary THEN
+                    RETURN NEW;
+                END IF;
+
+                IF OLD.state <> 'dispatching'
+                   OR NEW.state NOT IN ('completed', 'partial', 'failed', 'ambiguous') THEN
+                    RAISE EXCEPTION 'invalid dispatch batch state transition';
+                END IF;
+                IF OLD.sonarr_command_id IS NOT NULL
+                   AND NEW.sonarr_command_id IS DISTINCT FROM OLD.sonarr_command_id THEN
+                    RAISE EXCEPTION 'accepted Sonarr command identity is immutable';
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            CREATE OR REPLACE FUNCTION protect_dispatch_item_audit() RETURNS trigger AS $$
+            DECLARE
+                parent_mode TEXT;
+                parent_state TEXT;
+            BEGIN
+                IF TG_OP = 'INSERT' THEN
+                    SELECT mode, state INTO parent_mode, parent_state
+                    FROM dispatch_batches WHERE id = NEW.batch_id;
+                    IF NOT (
+                        (parent_mode = 'dry_run' AND parent_state = 'planned'
+                            AND NEW.state IN ('planned', 'excluded'))
+                        OR (parent_mode = 'manual' AND parent_state = 'dispatching'
+                            AND NEW.state IN ('reserved', 'excluded'))
+                        OR (parent_mode = 'manual' AND parent_state IN ('completed', 'partial')
+                            AND NEW.state IN ('dispatched', 'excluded'))
+                        OR (parent_mode = 'manual' AND parent_state = 'failed'
+                            AND NEW.state IN ('failed', 'excluded'))
+                        OR (parent_mode = 'manual' AND parent_state = 'ambiguous'
+                            AND NEW.state IN ('ambiguous', 'excluded'))
+                    ) THEN
+                        RAISE EXCEPTION 'dispatch item state does not match its batch';
+                    END IF;
+                    RETURN NEW;
+                END IF;
+                IF TG_OP = 'DELETE' THEN
+                    RAISE EXCEPTION 'dispatch audit rows cannot be deleted';
+                END IF;
+                IF NEW.batch_id IS DISTINCT FROM OLD.batch_id
+                   OR NEW.candidate_id IS DISTINCT FROM OLD.candidate_id
+                   OR NEW.episode_id IS DISTINCT FROM OLD.episode_id
+                   OR NEW.series_id IS DISTINCT FROM OLD.series_id
+                   OR NEW.series_title IS DISTINCT FROM OLD.series_title
+                   OR NEW.season_number IS DISTINCT FROM OLD.season_number
+                   OR NEW.episode_number IS DISTINCT FROM OLD.episode_number
+                   OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+                    RAISE EXCEPTION 'dispatch audit identity is immutable';
+                END IF;
+                IF OLD.state <> 'reserved' OR NEW.state NOT IN ('dispatched', 'failed', 'ambiguous') THEN
+                    RAISE EXCEPTION 'invalid dispatch item state transition';
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+        """,
+    ),
 ]
 
 

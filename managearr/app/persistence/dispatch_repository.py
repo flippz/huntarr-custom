@@ -49,6 +49,12 @@ def _row_to_batch(row, items: list[DispatchBatchItem] | None = None) -> Dispatch
         sonarr_command_id=row["sonarr_command_id"],
         sonarr_command_status=row["sonarr_command_status"],
         error_summary=row["error_summary"],
+        reconciliation_state=row["reconciliation_state"],
+        reconciliation_summary=row["reconciliation_summary"],
+        last_reconciled_at=(
+            row["last_reconciled_at"].isoformat() if row["last_reconciled_at"] else None
+        ),
+        command_observed_state=row["command_observed_state"],
         created_at=row["created_at"].isoformat(),
         updated_at=row["updated_at"].isoformat(),
         items=items,
@@ -92,7 +98,13 @@ class DispatchRepository:
         conn.execute("SELECT pg_advisory_xact_lock(%s, %s)", (_LOCK_CLASSID, library_id))
 
     def expire_stale_reservations(self, library_id: int, *, conn=None) -> None:
-        """Fail any 'dispatching' batch (and its 'reserved' items) whose
+        """Mark any stale dispatch reservation as operator-visible ambiguity.
+
+        Managearr never retries it: Sonarr may have accepted the command before
+        the process stopped. A recorded command id can be reconciled; without
+        one the operator must inspect Sonarr manually.
+
+        Mark any 'dispatching' batch (and its 'reserved' items) whose
         reservation is older than ``RESERVATION_STALE_SECONDS`` - e.g. the
         process crashed between reserving and calling Sonarr. There is no
         background sweep; this only ever runs inline while handling a new
@@ -103,8 +115,20 @@ class DispatchRepository:
             conn,
             """
             UPDATE dispatch_batches
-            SET state = 'failed',
-                error_summary = 'dispatch did not complete (reservation expired)',
+            SET state = 'ambiguous',
+                error_summary = CASE
+                    WHEN sonarr_command_id IS NULL THEN
+                        'dispatch outcome is ambiguous; inspect Sonarr manually before any retry'
+                    ELSE
+                        'Sonarr accepted the command but local finalization did not complete'
+                END,
+                reconciliation_state = 'operator_review',
+                reconciliation_summary = CASE
+                    WHEN sonarr_command_id IS NULL THEN
+                        'No Sonarr command id was recorded; inspect Sonarr manually. Managearr will not retry.'
+                    ELSE
+                        'A Sonarr command id is available for manual reconciliation. Managearr will not retry.'
+                END,
                 updated_at = %s
             WHERE library_id = %s AND mode = 'manual' AND state = 'dispatching'
               AND created_at < %s
@@ -119,7 +143,9 @@ class DispatchRepository:
             conn,
             """
             UPDATE dispatch_batch_items
-            SET state = 'failed', reason = 'reservation expired before Sonarr responded', updated_at = %s
+            SET state = 'ambiguous',
+                reason = 'dispatch reservation expired with an unknown local finalization outcome',
+                updated_at = %s
             WHERE batch_id = ANY(%s) AND state = 'reserved'
             """,
             (now, stale_batch_ids),
@@ -335,6 +361,34 @@ class DispatchRepository:
             if updated_batch != 1:
                 raise RuntimeError("dispatch reservation batch was not live")
         return True
+
+    def record_command_acceptance(
+        self,
+        *,
+        batch_id: int,
+        library_id: int,
+        sonarr_command_id: int,
+        sonarr_command_status: str | None,
+    ) -> bool:
+        """Durably record Sonarr acceptance before finalizing item states.
+
+        This narrows the crash window: if the process stops after this commit,
+        stale-reservation handling exposes an ambiguous batch that can still be
+        reconciled by its known command id. It never resends the search.
+        """
+        now = _now()
+        with self.db.connect() as conn:
+            self.acquire_library_lock(conn, library_id)
+            updated = conn.execute(
+                """
+                UPDATE dispatch_batches
+                SET sonarr_command_id = %s, sonarr_command_status = %s, updated_at = %s
+                WHERE id = %s AND library_id = %s AND state = 'dispatching'
+                  AND sonarr_command_id IS NULL
+                """,
+                (sonarr_command_id, sonarr_command_status, now, batch_id, library_id),
+            ).rowcount
+        return updated == 1
 
     # --- reads -----------------------------------------------------------
 

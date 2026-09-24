@@ -13,8 +13,10 @@ from app.persistence.policy_repository import PolicyRepository
 from app.persistence.activity_repository import ActivityRepository
 from app.persistence.scan_candidate_repository import ScanCandidateRepository
 from app.persistence.dispatch_repository import DispatchRepository
+from app.persistence.outcome_repository import OutcomeRepository
 from app.services.dispatch_planning_service import DispatchPlanningService
 from app.services.dispatch_service import DispatchService
+from app.services.reconciliation_service import ReconciliationService
 
 # Tests run against a real PostgreSQL instance - no SQLite/mock DB layer.
 # Point MANAGEARR_TEST_DB_* at a disposable database; the suite truncates
@@ -29,7 +31,7 @@ TEST_DB_CONFIG = dict(
 
 _DATA_TABLES = (
     "arr_libraries, automation_policy, activity_jobs, scan_candidates, "
-    "dispatch_batches, dispatch_batch_items"
+    "dispatch_batches, dispatch_batch_items, dispatch_reconciliation_attempts, dispatch_outcome_events"
 )
 
 
@@ -114,6 +116,11 @@ def dispatch_repo(database):
 
 
 @pytest.fixture
+def outcome_repo(database):
+    return OutcomeRepository(database)
+
+
+@pytest.fixture
 def dispatch_planning_service(activity_repo, candidate_repo, library_repo, policy_repo, dispatch_repo):
     return DispatchPlanningService(activity_repo, candidate_repo, library_repo, policy_repo, dispatch_repo)
 
@@ -121,3 +128,10 @@ def dispatch_planning_service(activity_repo, candidate_repo, library_repo, polic
 @pytest.fixture
 def dispatch_service(dispatch_planning_service, dispatch_repo, library_repo):
     return DispatchService(dispatch_planning_service, dispatch_repo, library_repo)
+
+
+@pytest.fixture
+def reconciliation_service(dispatch_repo, outcome_repo, library_repo, activity_repo, candidate_repo):
+    return ReconciliationService(
+        dispatch_repo, outcome_repo, library_repo, activity_repo, candidate_repo
+    )

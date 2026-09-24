@@ -4,6 +4,7 @@ from flask import Blueprint, current_app, jsonify, request
 from ..adapters.redaction import redact_libraries, redact_library
 from ..services.sonarr_scan_service import VALIDATION_ERRORS
 from ..services.dispatch_planning_service import JOB_NOT_FOUND_ERROR
+from ..services.reconciliation_service import BATCH_NOT_FOUND
 
 api_bp = Blueprint("api_v1", __name__, url_prefix="/api/v1")
 
@@ -202,3 +203,26 @@ def get_dispatch_batch(batch_id: int):
     if batch is None:
         return jsonify({"errors": ["dispatch batch not found"]}), 404
     return jsonify({"batch": batch.to_dict()})
+
+
+# --- Manual, read-only outcome reconciliation ----------------------------
+
+@api_bp.post("/dispatch-batches/<int:batch_id>/reconcile")
+def reconcile_dispatch_batch(batch_id: int):
+    result, error = _services()["reconciliation"].reconcile(batch_id)
+    if error:
+        if result is not None:
+            # The safe upstream failure is itself durably audited.
+            return jsonify({"errors": [error], "reconciliation": result.to_dict()}), 502
+        if error == BATCH_NOT_FOUND:
+            return jsonify({"errors": [error]}), 404
+        return jsonify({"errors": [error]}), 400
+    return jsonify({"reconciliation": result.to_dict()})
+
+
+@api_bp.get("/dispatch-batches/<int:batch_id>/outcomes")
+def get_dispatch_outcomes(batch_id: int):
+    detail = _services()["reconciliation"].detail(batch_id)
+    if detail is None:
+        return jsonify({"errors": [BATCH_NOT_FOUND]}), 404
+    return jsonify({"outcomes": detail})

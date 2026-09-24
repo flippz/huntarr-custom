@@ -45,8 +45,8 @@ RESERVATION_STALE_SECONDS = 300
 # eligible subset dispatched), or 'failed' (nothing was eligible, or the
 # Sonarr call itself failed).
 DISPATCH_MODES = ("dry_run", "manual")
-BATCH_STATES = ("planned", "dispatching", "completed", "partial", "failed")
-ITEM_STATES = ("planned", "reserved", "dispatched", "failed", "excluded")
+BATCH_STATES = ("planned", "dispatching", "completed", "partial", "failed", "ambiguous")
+ITEM_STATES = ("planned", "reserved", "dispatched", "failed", "excluded", "ambiguous")
 
 
 @dataclass
@@ -95,6 +95,10 @@ class DispatchBatch:
     sonarr_command_id: Optional[int]
     sonarr_command_status: Optional[str]
     error_summary: str
+    reconciliation_state: str
+    reconciliation_summary: str
+    last_reconciled_at: Optional[str]
+    command_observed_state: Optional[str]
     created_at: str
     updated_at: str
     items: list[DispatchBatchItem] | None = None
@@ -113,6 +117,10 @@ class DispatchBatch:
             "sonarr_command_id": self.sonarr_command_id,
             "sonarr_command_status": self.sonarr_command_status,
             "error_summary": self.error_summary,
+            "reconciliation_state": self.reconciliation_state,
+            "reconciliation_summary": self.reconciliation_summary,
+            "last_reconciled_at": self.last_reconciled_at,
+            "command_observed_state": self.command_observed_state,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

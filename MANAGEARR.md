@@ -4,11 +4,14 @@ Managearr is a standalone Flask/PostgreSQL rewrite beside the legacy Huntarr
 application (`main.py`, `src/`). It has its own image, database, port, API, and
 UI. Nothing in this application changes the legacy runtime.
 
-## Current milestone: controlled manual Sonarr dispatch
+## Current milestone: manual Sonarr outcome reconciliation (M3)
 
 A completed Sonarr candidate scan can now be previewed and, only after an
 explicit confirmation, sent to Sonarr as one `EpisodeSearch` command. This is
 not automated hunting: no scheduler or background worker dispatches searches.
+After Sonarr accepts that command, an operator can manually run a read-only
+reconciliation to inspect its command state and bounded related history/queue
+evidence. Reconciliation never sends or retries a search.
 
 Safety properties:
 
@@ -25,9 +28,30 @@ Safety properties:
 - the Sonarr request runs with no database transaction or lock held;
 - success/failure finalization uses a fresh transaction and the same library
   lock, updating the batch and reserved items atomically;
+- an accepted command ID is committed before local finalization, narrowing the
+  crash ambiguity window and allowing later read-only reconciliation;
 - failed attempts remain audited but release their reservation for retry;
 - dry-run rows never count as a dispatch or start cooldown;
 - URLs and API keys are never returned in dispatch errors or audit rows.
+
+Reconciliation safety properties:
+
+- only an existing `manual` dispatch in `completed`, `partial`, or crash-
+  `ambiguous` state with a recorded positive Sonarr command ID is eligible;
+- dry-runs, ordinary failures, missing-command rows, disabled/wrong-type/
+  missing-key libraries, and cross-library ownership ambiguity are rejected
+  before any Sonarr request;
+- it uses GET only: command status, at most three 50-row history pages per
+  episode (with Sonarr's episode filter), and at most three 100-row queue-detail
+  pages; dated evidence older than the dispatch is excluded;
+- database transactions are not held across those network reads;
+- only bounded, normalized identifiers/states and static safe summaries are
+  stored--never API keys, configured URLs, arbitrary upstream messages, or raw
+  response bodies;
+- evidence is deduplicated by a stable batch/source/evidence key while every
+  operator reconciliation attempt remains append-only audit history; and
+- `command_completed` means only that the search command finished. It never
+  fabricates a grab, download, or import outcome.
 
 ## Architecture
 
@@ -37,17 +61,19 @@ managearr/
     domain/          dataclasses and pure validation/rules
       dispatch.py    dispatch batch/item model and limits
     adapters/
-      sonarr_client.py   Sonarr v3 GETs plus the single allowed POST
+      sonarr_client.py   bounded Sonarr v3 GETs plus the single allowed POST
       redaction.py
     persistence/
       database.py
-      migrations.py      PostgreSQL schema v1 + dispatch-ledger v2
+      migrations.py      PostgreSQL schema v1 + dispatch v2 + outcomes v3
       dispatch_repository.py
+      outcome_repository.py
       *_repository.py
     services/
       sonarr_scan_service.py
       dispatch_planning_service.py
       dispatch_service.py
+      reconciliation_service.py
       library_readiness.py
     api/routes.py
     web/             Jinja templates and vanilla JS/CSS
@@ -101,6 +127,21 @@ transitions. Only lifecycle result fields may advance:
 Dry-run and excluded rows are terminal. Test cleanup uses `TRUNCATE` against a
 dedicated test database; the application exposes no audit-delete path.
 
+Migration v3 adds dedicated reconciliation summary columns plus two append-only
+tables. `dispatch_reconciliation_attempts` records when each operator read ran,
+which endpoints completed, its explicit `resolved`/`partial`/`unresolved`/
+`error` result, and how many new evidence rows were inserted.
+`dispatch_outcome_events` records the source endpoint, normalized event type,
+terminal/nonterminal/unknown classification, safe summary, command/history/
+download identifiers when present, and the dispatch-item/candidate/episode
+mapping. Length/check/FK constraints bound the data, a unique evidence key
+makes unchanged reruns idempotent, and triggers reject updates/deletes.
+
+The original dispatch identity remains immutable. Reconciliation only updates
+its dedicated state/summary/time and observed-command-state columns. A resolved
+summary cannot regress. Dispatch lifecycle triggers also allow the narrow
+`dispatching -> ambiguous` crash transition while preserving any command ID.
+
 Migrations run under a PostgreSQL advisory transaction lock. Bootstrap,
 pending DDL, and `schema_migrations` rows commit together, so concurrent starts
 serialize and any failed pending migration rolls back its DDL and bookkeeping.
@@ -113,6 +154,9 @@ Read-only methods remain:
 - `GET /api/v3/system/status`
 - `GET /api/v3/series`
 - `GET /api/v3/episode?seriesId=<id>`
+- `GET /api/v3/command/<known-command-id>`
+- `GET /api/v3/history` with validated page/page-size and optional episode ID
+- `GET /api/v3/queue/details` with validated page/page-size
 
 There is exactly one write method:
 
@@ -124,8 +168,10 @@ Content-Type: application/json
 {"name":"EpisodeSearch","episodeIds":[...]}
 ```
 
-`search_episodes()` validates 1-25 unique positive integer IDs before sending
-and validates the returned positive command ID, command name, and status shape.
+The reconciliation reads validate endpoint shape and return only whitelisted,
+bounded fields. `search_episodes()` validates 1-25 unique positive integer IDs
+before sending and validates the returned positive command ID, command name,
+and status shape.
 Timeouts, connection failures, auth errors, non-2xx responses, and malformed
 JSON/command responses map to static safe exceptions that contain neither the
 base URL nor API key.
@@ -150,6 +196,8 @@ All JSON error responses use `{"errors":["safe message"]}`.
 | **POST** | **`/api/v1/activity/<job_id>/dispatch`** | **Confirmed manual dispatch** |
 | GET | `/api/v1/activity/<job_id>/dispatch-batches` | Audit summaries |
 | GET | `/api/v1/dispatch-batches/<batch_id>` | Audit detail with items |
+| **POST** | **`/api/v1/dispatch-batches/<batch_id>/reconcile`** | **Manual GET-only Sonarr reconciliation; sends no search** |
+| GET | `/api/v1/dispatch-batches/<batch_id>/outcomes` | Attempts, batch evidence, and per-candidate timelines |
 
 Preview request:
 
@@ -171,6 +219,13 @@ Sonarr rejection or timeout is represented by a `failed` batch with a safe
 `error_summary`; it remains a successfully recorded API attempt rather than
 losing the audit in an opaque 5xx response.
 
+The reconciliation response includes the refreshed batch summary, one durable
+attempt, count of newly inserted deduplicated events, and an explicit item
+result for every dispatched candidate. The result remains `unresolved` or
+`partial` when evidence is absent, unknown, or exceeds bounded pagination.
+Upstream read failures return a safe 502 and still append an `error` attempt;
+they do not store or echo a raw Sonarr payload.
+
 ## Web UI
 
 The Activity scan-detail modal now provides:
@@ -182,6 +237,12 @@ The Activity scan-detail modal now provides:
 - an explicit warning checkbox;
 - a disabled-until-confirmed red **Send searches to Sonarr** button; and
 - a dispatch audit table showing previews and manual attempts.
+
+The dispatch audit also shows the latest observed command state,
+reconciliation state/summary/time, and read-only **Reconcile**/**Evidence**
+controls. Evidence detail renders batch command observations and each
+candidate's latest outcome plus timeline. The UI repeats that reconciliation
+sends no search and command completion is not proof of a grab or import.
 
 Changing candidate selection clears the preview and confirmation. The server
 still re-plans after confirmation, so stale UI state cannot bypass policy.
@@ -239,23 +300,35 @@ MANAGEARR_TEST_DB_PASSWORD=<test password> \
 python3 -m pytest tests -q
 ```
 
-Coverage includes migration v2 idempotence/rollback/constraints/immutability,
+Coverage includes migration v2/v3 idempotence/rollback/constraints/immutability,
 candidate ownership/dedupe/max selection, cross-job/library rejection, cap,
 cooldown, dry-run isolation, exact confirmation, success/failure/retry audit,
 concurrent duplicate and cap-overbooking prevention, response redaction, the
-single Sonarr POST shape, API contracts, and UI confirmation wiring.
+single Sonarr POST shape, API contracts, and UI confirmation wiring. M3 tests
+cover command queued/completed/failed/aborted normalization, no false success,
+grab/download/import/failure mapping, unrelated-event exclusion, pagination
+bounds, crash ambiguity, cross-library rejection, idempotent reruns, append-only
+evidence, safe errors, and no secret/raw-payload leakage. Sonarr remains mocked.
 
 ## Current limitations
 
 - Sonarr only; other Arr types remain CRUD-only.
-- Dispatch is manual only; no scheduler, worker, automatic search, grab,
-  download, or import pipeline exists.
+- Dispatch and reconciliation are manual only; no scheduler, worker, polling,
+  automatic retry/search, download-client API, grab, download, or import
+  pipeline exists.
 - Managearr has no authentication/authorization yet; protect the service at the
   network/reverse-proxy layer.
 - A process crash after Sonarr accepts a command but before local finalization
   is inherently ambiguous because Sonarr's command API offers no idempotency
-  key. The reservation remains visible and blocks retry for five minutes, then
-  is failed for operator-visible audit; an operator should inspect Sonarr before
-  retrying that rare case.
+  key. The reservation blocks another dispatch for five minutes, then becomes
+  operator-visible `ambiguous`; Managearr never retries it. If the accepted
+  command ID was durably recorded, the operator can reconcile it. If no command
+  ID was recorded, reconciliation is refused and the UI/API instructs the
+  operator to inspect Sonarr manually before any retry.
+- History and queue reads are deliberately bounded (150 history rows per
+  dispatched episode and 300 queue rows). A larger Sonarr result is reported as
+  partial; Managearr does not guess beyond the observed evidence.
+- Queue state names vary across Sonarr/download-client versions. Unrecognized
+  related states are retained as `unknown`, not promoted to success.
 - Candidate scans remain capped at 500 rows and skip an individual series when
   its episode fetch fails, recording that fact in activity details.

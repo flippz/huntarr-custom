@@ -195,6 +195,18 @@ class DispatchService:
             return DispatchOutcome(batch=self.dispatch_repo.get_batch(batch_id), plan=result), None
 
         final_state = "completed" if len(result.selected) == result.requested_count else "partial"
+        # Persist Sonarr's accepted command identity in its own short
+        # transaction before finalizing the local reservation. If the process
+        # stops between these commits, the stale reservation remains
+        # operator-visible and can be reconciled without resending a search.
+        accepted = self.dispatch_repo.record_command_acceptance(
+            batch_id=batch_id,
+            library_id=library.id,
+            sonarr_command_id=command.get("id"),
+            sonarr_command_status=command.get("status"),
+        )
+        if not accepted:
+            return DispatchOutcome(batch=self.dispatch_repo.get_batch(batch_id), plan=result), None
         self.dispatch_repo.finalize_attempt(
             batch_id=batch_id,
             item_ids=item_ids,

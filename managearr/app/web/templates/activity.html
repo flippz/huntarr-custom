@@ -4,6 +4,7 @@
 <h1>Activity</h1>
 <p class="muted">Durable scan history and controlled manual Sonarr dispatch audit.</p>
 <p class="readonly-notice">Candidate scans only read Sonarr. A search is sent only from a completed scan after selecting candidates, previewing the plan, checking the explicit confirmation, and pressing the red Send button.</p>
+<p class="readonly-notice">Outcome reconciliation is manual and read-only: it sends no search. A completed EpisodeSearch command is not proof that Sonarr grabbed, downloaded, or imported an episode.</p>
 
 <section class="card">
   <label>Filter by state
@@ -72,9 +73,14 @@
       <h3>Dispatch audit</h3>
       <div class="table-scroll">
         <table class="data-table">
-          <thead><tr><th>ID</th><th>Mode</th><th>State</th><th>Requested</th><th>Selected</th><th>Dispatched</th><th>Command</th><th>Created</th><th>Result</th></tr></thead>
+          <thead><tr><th>ID</th><th>Mode</th><th>Dispatch</th><th>Counts</th><th>Command</th><th>Reconciliation</th><th>Last read</th><th>Result</th><th></th></tr></thead>
           <tbody id="dispatch-audit"><tr><td colspan="9">Loading...</td></tr></tbody>
         </table>
+      </div>
+      <div id="outcome-detail" class="dispatch-preview" hidden>
+        <strong>Outcome evidence</strong>
+        <p id="outcome-notice" class="muted"></p>
+        <div id="outcome-timelines"></div>
       </div>
     </section>
   </div>
@@ -140,14 +146,37 @@ async function loadDispatchAudit(jobId) {
   data.batches.forEach(batch => {
     const tr = document.createElement('tr');
     const command = batch.sonarr_command_id ? `#${batch.sonarr_command_id} ${batch.sonarr_command_status || ''}` : '-';
+    const canReconcile = batch.mode === 'manual' && ['completed', 'partial', 'ambiguous'].includes(batch.state) && batch.sonarr_command_id;
     tr.innerHTML = `
       <td>${batch.id}</td><td>${escapeHtml(batch.mode)}</td>
       <td><span class="state-pill state-${escapeHtml(batch.state)}">${escapeHtml(batch.state)}</span></td>
-      <td>${batch.requested_count}</td><td>${batch.selected_count}</td><td>${batch.dispatched_count}</td>
-      <td>${escapeHtml(command)}</td><td>${escapeHtml(batch.created_at)}</td>
-      <td>${escapeHtml(batch.error_summary || '')}</td>`;
+      <td>${batch.requested_count}/${batch.selected_count}/${batch.dispatched_count}</td>
+      <td>${escapeHtml(command)}<br><span class="muted">${escapeHtml(batch.command_observed_state || '')}</span></td>
+      <td>${escapeHtml(batch.reconciliation_state)}<br><span class="muted">${escapeHtml(batch.reconciliation_summary || '')}</span></td>
+      <td>${escapeHtml(batch.last_reconciled_at || 'never')}</td>
+      <td>${escapeHtml(batch.error_summary || '')}</td>
+      <td><button type="button" data-action="outcomes" data-batch-id="${batch.id}">Evidence</button>
+      ${canReconcile ? `<button type="button" data-action="reconcile" data-batch-id="${batch.id}">Reconcile (read-only)</button>` : ''}</td>`;
     tbody.appendChild(tr);
   });
+}
+
+async function showOutcomeDetail(batchId) {
+  const data = await api(`/api/v1/dispatch-batches/${batchId}/outcomes`);
+  const detail = data.outcomes;
+  document.getElementById('outcome-notice').textContent = detail.notice;
+  const root = document.getElementById('outcome-timelines');
+  root.innerHTML = '';
+  const command = document.createElement('p');
+  command.textContent = `Batch evidence: ${detail.batch_events.map(e => e.event_type).join(', ') || 'none'}`;
+  root.appendChild(command);
+  detail.items.forEach(item => {
+    const block = document.createElement('div');
+    const timeline = item.outcomes.map(event => `${event.event_type} (${event.source_endpoint}: ${event.safe_summary})`).join(' → ');
+    block.textContent = `Candidate #${item.candidate_id}, episode #${item.episode_id}: ${timeline || 'unresolved; no related evidence'}`;
+    root.appendChild(block);
+  });
+  document.getElementById('outcome-detail').hidden = false;
 }
 
 async function openJob(jobId) {
@@ -158,6 +187,7 @@ async function openJob(jobId) {
   document.getElementById('job-modal-candidates').innerHTML = '<tr><td colspan="6">Loading...</td></tr>';
   document.getElementById('dispatch-audit').innerHTML = '<tr><td colspan="9">Loading...</td></tr>';
   document.getElementById('dispatch-controls').hidden = true;
+  document.getElementById('outcome-detail').hidden = true;
   document.getElementById('job-modal').hidden = false;
 
   try {
@@ -220,6 +250,22 @@ document.getElementById('select-all-candidates').addEventListener('click', () =>
   });
   updateSelectionCount();
   clearPreview();
+});
+document.getElementById('dispatch-audit').addEventListener('click', async ev => {
+  const btn = ev.target.closest('button[data-batch-id]');
+  if (!btn) return;
+  try {
+    if (btn.dataset.action === 'reconcile') {
+      btn.disabled = true;
+      const data = await api(`/api/v1/dispatch-batches/${btn.dataset.batchId}/reconcile`, {method: 'POST'});
+      toast(`Read-only reconciliation: ${data.reconciliation.batch.reconciliation_state}`);
+      await loadDispatchAudit(currentJobId);
+    }
+    await showOutcomeDetail(btn.dataset.batchId);
+  } catch (err) {
+    toast('Reconciliation failed: ' + err.message);
+    btn.disabled = false;
+  }
 });
 document.getElementById('clear-dispatch-preview').addEventListener('click', clearPreview);
 document.getElementById('dispatch-confirm').addEventListener('change', ev => {

@@ -271,3 +271,82 @@ def test_search_episodes_never_calls_get():
     client = make_client(session)
     client.search_episodes([1])
     assert calls == ["post"]
+
+
+# --- bounded outcome reconciliation reads -----------------------------
+
+def test_get_command_validates_and_redacts_shape():
+    session = FakeSession(FakeResponse(200, {
+        "id": 42, "name": "EpisodeSearch", "status": "completed",
+        "body": {"episodeIds": [1]}, "message": "ignored upstream detail",
+    }))
+    command = make_client(session).get_command(42)
+    assert command == {"id": 42, "name": "EpisodeSearch", "status": "completed"}
+    assert session.calls[0]["method"] == "GET"
+    assert session.calls[0]["url"].endswith("/api/v3/command/42")
+    assert "body" not in command and "message" not in command
+
+
+@pytest.mark.parametrize("payload", [
+    [], {"id": 43, "name": "EpisodeSearch", "status": "completed"},
+    {"id": 42, "name": "SeriesSearch", "status": "completed"},
+    {"id": 42, "name": "EpisodeSearch", "status": {"bad": True}},
+])
+def test_get_command_rejects_malformed_or_mismatched_response(payload):
+    with pytest.raises(SonarrDataError):
+        make_client(FakeSession(FakeResponse(200, payload))).get_command(42)
+
+
+def test_get_history_uses_bounded_filter_and_returns_only_safe_fields():
+    session = FakeSession(FakeResponse(200, {
+        "page": 1, "pageSize": 50, "totalRecords": 1,
+        "records": [{
+            "id": 9, "eventType": "grabbed", "episodeId": 101,
+            "date": "2026-09-24T12:00:00Z", "downloadId": "abc",
+            "data": {"downloadClientName": "secret-ish", "droppedPath": "/private/path"},
+        }],
+    }))
+    history = make_client(session).get_history(page=1, page_size=50, episode_id=101)
+    assert history["records"] == [{
+        "id": 9, "event_type": "grabbed", "episode_id": 101,
+        "date": "2026-09-24T12:00:00Z", "download_id": "abc",
+    }]
+    assert session.calls[0]["params"]["episodeId"] == 101
+    assert session.calls[0]["params"]["pageSize"] == 50
+    assert "/private/path" not in repr(history)
+
+
+def test_get_queue_details_is_bounded_and_normalized():
+    session = FakeSession(FakeResponse(200, {
+        "totalRecords": 1,
+        "records": [{
+            "id": 77, "downloadId": "dl-1", "episode": {"id": 101},
+            "status": "downloading", "trackedDownloadState": "downloading",
+            "statusMessages": [{"messages": ["unbounded detail"]}],
+        }],
+    }))
+    queue = make_client(session).get_queue_details(page=1, page_size=25)
+    assert queue["records"] == [{
+        "episode_ids": [101], "status": "downloading",
+        "tracked_state": "downloading", "download_id": "dl-1", "added": None,
+    }]
+    assert session.calls[0]["url"].endswith("/api/v3/queue/details")
+    assert session.calls[0]["params"]["pageSize"] == 25
+
+
+@pytest.mark.parametrize("method", ["history", "queue"])
+def test_read_pagination_rejects_unbounded_parameters_without_request(method):
+    session = FakeSession(FakeResponse(200, {}))
+    client = make_client(session)
+    with pytest.raises(ValueError):
+        if method == "history":
+            client.get_history(page=11, page_size=101)
+        else:
+            client.get_queue_details(page=0, page_size=101)
+    assert session.calls == []
+
+
+def test_reconciliation_adapter_exposes_no_new_mutating_http_method():
+    session = FakeSession(FakeResponse(200, {"id": 1, "name": "EpisodeSearch", "status": "queued"}))
+    make_client(session).get_command(1)
+    assert [call["method"] for call in session.calls] == ["GET"]

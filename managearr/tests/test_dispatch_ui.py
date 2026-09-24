@@ -32,3 +32,13 @@ def test_global_preview_banner_no_longer_claims_no_search_can_be_sent(client):
     html = client.get("/activity").get_data(as_text=True)
     assert "Sonarr searches require an explicit preview and confirmation" in html
     assert "no searches are sent and nothing in Sonarr is changed" not in html
+
+
+def test_activity_ui_exposes_read_only_reconciliation_and_evidence_timeline(client):
+    html = client.get("/activity").get_data(as_text=True)
+    assert "Outcome reconciliation is manual and read-only: it sends no search" in html
+    assert "not proof that Sonarr grabbed, downloaded, or imported" in html
+    assert 'id="outcome-detail"' in html
+    assert 'data-action="reconcile"' in html
+    assert "/reconcile`, {method: 'POST'}" in html
+    assert "/outcomes`" in html

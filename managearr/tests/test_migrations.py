@@ -132,12 +132,49 @@ def test_dispatch_ledger_tables_and_columns_exist(database):
         "id", "scan_job_id", "library_id", "library_name", "mode", "state",
         "requested_count", "selected_count", "dispatched_count",
         "sonarr_command_id", "sonarr_command_status", "error_summary",
+        "reconciliation_state", "reconciliation_summary", "last_reconciled_at",
+        "command_observed_state",
         "created_at", "updated_at",
     }
     assert columns_by_table["dispatch_batch_items"] == {
         "id", "batch_id", "candidate_id", "episode_id", "series_id", "series_title",
         "season_number", "episode_number", "state", "reason", "created_at", "updated_at",
     }
+
+
+def test_outcome_audit_tables_and_indexes_exist(database):
+    with database.connect() as conn:
+        column_rows = conn.execute(
+            """
+            SELECT table_name, column_name FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name IN ('dispatch_reconciliation_attempts', 'dispatch_outcome_events')
+            """
+        ).fetchall()
+        indexes = {
+            row["indexname"]
+            for row in conn.execute(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
+            ).fetchall()
+        }
+    columns = {}
+    for row in column_rows:
+        columns.setdefault(row["table_name"], set()).add(row["column_name"])
+    assert columns["dispatch_reconciliation_attempts"] == {
+        "id", "batch_id", "observed_at", "state", "safe_summary",
+        "command_endpoint_read", "history_endpoint_read", "queue_endpoint_read",
+        "inserted_event_count",
+    }
+    assert columns["dispatch_outcome_events"] == {
+        "id", "batch_id", "dispatch_item_id", "candidate_id", "episode_id",
+        "observed_at", "source_endpoint", "event_type", "event_state",
+        "safe_summary", "sonarr_command_id", "sonarr_event_id", "download_id",
+        "evidence_key",
+    }
+    assert "idx_dispatch_reconciliation_attempts_batch_observed" in indexes
+    assert "idx_dispatch_outcome_events_batch_observed" in indexes
+    assert "idx_dispatch_outcome_events_item_observed" in indexes
+    assert "idx_dispatch_outcome_events_episode" in indexes
 
 
 def test_dispatch_ledger_foreign_keys_have_expected_delete_behavior(database):
