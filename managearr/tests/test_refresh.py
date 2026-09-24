@@ -622,6 +622,7 @@ def test_nonterminal_reconciliation_schedules_prompt_followup(
             "INSERT INTO refresh_runs (kind, trigger, state) VALUES ('reconcile','scheduled','queued') RETURNING id"
         ).fetchone()["id"]
     monkeypatch.setattr(refresh_repo, "eligible_reconciliation_batches", lambda limit: [42])
+    monkeypatch.setattr(refresh_repo, "record_reconciled_batch", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         refresh_service.reconciliation_service,
         "reconcile",
