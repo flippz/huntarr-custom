@@ -353,5 +353,6 @@ document.getElementById('send-dispatch').addEventListener('click', async () => {
 });
 
 Promise.all([loadActivity(), loadRecentDispatches()]).catch(err => toast('Failed to load activity: ' + err.message));
+setInterval(() => loadRecentDispatches().catch(() => {}), 15000);
 </script>
 {% endblock %}

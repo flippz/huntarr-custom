@@ -611,3 +611,26 @@ def test_refresh_runs_api_list_and_detail(client):
 def test_refresh_ui_wiring_mentions_read_only_notice(client):
     assert "never sends Sonarr commands" in client.get("/").get_data(as_text=True)
     assert "never sends Sonarr commands" in client.get("/settings").get_data(as_text=True)
+
+
+def test_nonterminal_reconciliation_schedules_prompt_followup(
+    database, refresh_repo, refresh_service, monkeypatch,
+):
+    from types import SimpleNamespace
+    with database.connect() as conn:
+        run_id = conn.execute(
+            "INSERT INTO refresh_runs (kind, trigger, state) VALUES ('reconcile','scheduled','queued') RETURNING id"
+        ).fetchone()["id"]
+    monkeypatch.setattr(refresh_repo, "eligible_reconciliation_batches", lambda limit: [42])
+    monkeypatch.setattr(
+        refresh_service.reconciliation_service,
+        "reconcile",
+        lambda batch_id: (SimpleNamespace(batch=SimpleNamespace(reconciliation_state="unresolved")), None),
+    )
+    run = refresh_repo.start_next_run("followup-worker")
+    refresh_service.execute_run(run, heartbeat=lambda: True)
+    with database.connect() as conn:
+        row = conn.execute(
+            "SELECT next_reconcile_due_at <= now() + interval '65 seconds' AS prompt FROM refresh_settings WHERE id=1"
+        ).fetchone()
+    assert row["prompt"] is True

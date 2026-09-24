@@ -101,6 +101,8 @@ class RefreshService:
                 self.refresh_repo.record_reconciled_batch(
                     run["id"], batch_id, result.batch.reconciliation_state, None
                 )
+                if result.batch.reconciliation_state != "resolved":
+                    self.refresh_repo.schedule_reconcile_followup(delay_seconds=60)
 
         total = len(batch_ids)
         if not batch_ids:

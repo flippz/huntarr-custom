@@ -252,6 +252,28 @@ class RefreshRepository:
         with self.db.connect() as owned_conn:
             return owned_conn.execute(sql).fetchone()["c"]
 
+    def schedule_reconcile_followup(self, *, delay_seconds: int = 60) -> None:
+        """Bring the next reconciliation forward for nonterminal outcomes.
+
+        The normal cadence is intentionally relaxed, but a just-dispatched
+        Sonarr command often changes from running to terminal within seconds.
+        Poll it again soon without retrying any dispatch or tight-looping.
+        """
+        delay_seconds = max(30, min(int(delay_seconds), 300))
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE refresh_settings
+                SET next_reconcile_due_at = LEAST(
+                        COALESCE(next_reconcile_due_at, now() + (%s * interval '1 second')),
+                        now() + (%s * interval '1 second')
+                    ),
+                    updated_at = now()
+                WHERE id = 1
+                """,
+                (delay_seconds, delay_seconds),
+            )
+
     def enqueue_reconcile_if_due(self) -> int | None:
         """Queue one bounded reconciliation pass when the cooldown has
         elapsed and at least one dispatch batch still needs it. Always
