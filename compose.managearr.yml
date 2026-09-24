@@ -10,7 +10,9 @@ services:
     secrets:
       - managearr_db_password
     volumes:
-      - managearr-postgres-data:/var/lib/postgresql/data
+      # PostgreSQL 18+ stores major-version-specific clusters below this
+      # parent path, which also keeps future pg_upgrade --link possible.
+      - managearr-postgres-data:/var/lib/postgresql
     # No host port published - PostgreSQL is only reachable from other
     # containers on this Compose stack's private network.
     healthcheck:
