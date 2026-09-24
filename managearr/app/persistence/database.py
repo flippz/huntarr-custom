@@ -94,6 +94,23 @@ class Database:
     def init_schema(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            # CREATE TABLE IF NOT EXISTS does not add columns to databases
+            # created by the Huntarr v2 preview. Apply the two additive,
+            # backward-compatible columns explicitly before repositories run.
+            activity_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(activity_jobs)").fetchall()
+            }
+            if "job_type" not in activity_columns:
+                conn.execute(
+                    "ALTER TABLE activity_jobs "
+                    "ADD COLUMN job_type TEXT NOT NULL DEFAULT 'legacy'"
+                )
+            if "candidate_count" not in activity_columns:
+                conn.execute(
+                    "ALTER TABLE activity_jobs "
+                    "ADD COLUMN candidate_count INTEGER NOT NULL DEFAULT 0"
+                )
 
     def health_check(self) -> bool:
         try:

@@ -1,6 +1,8 @@
 import os
+import sqlite3
 
 from app.domain.automation_policy import BALANCED_DEFAULTS
+from app.persistence.database import Database
 
 
 def test_database_health_check_ok(database):
@@ -10,6 +12,44 @@ def test_database_health_check_ok(database):
 def test_database_creates_directory_and_file(db_path, database):
     database.init_schema()
     assert os.path.exists(db_path)
+
+
+def test_database_migrates_preview_activity_table(tmp_path):
+    db_path = tmp_path / "preview.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE activity_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                library_id INTEGER,
+                library_name TEXT NOT NULL,
+                state TEXT NOT NULL,
+                title TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO activity_jobs
+                (library_name, state, title, created_at, updated_at)
+            VALUES ('Sonarr', 'completed', 'Preview job', 'now', 'now')
+            """
+        )
+
+    database = Database(str(db_path))
+    database.init_schema()
+
+    with database.connect() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(activity_jobs)")}
+        migrated = conn.execute(
+            "SELECT job_type, candidate_count FROM activity_jobs WHERE title = 'Preview job'"
+        ).fetchone()
+
+    assert {"job_type", "candidate_count"}.issubset(columns)
+    assert dict(migrated) == {"job_type": "legacy", "candidate_count": 0}
 
 
 def test_library_repository_crud_round_trip(library_repo):
