@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from random import Random
 
 from ..domain.scheduler import MAX_SIMULATION_SELECTION, validate_scheduler_settings
+from ..persistence.live_repository import LiveRepository
 from ..persistence.policy_repository import PolicyRepository
 from ..persistence.refresh_repository import RefreshRepository
 from ..persistence.scheduler_repository import SchedulerRepository
@@ -16,10 +17,12 @@ class SchedulerService:
         scheduler_repo: SchedulerRepository,
         policy_repo: PolicyRepository,
         refresh_repo: RefreshRepository | None = None,
+        live_repo: LiveRepository | None = None,
     ):
         self.scheduler_repo = scheduler_repo
         self.policy_repo = policy_repo
         self.refresh_repo = refresh_repo or RefreshRepository(scheduler_repo.db)
+        self.live_repo = live_repo or LiveRepository(scheduler_repo.db)
 
     def settings(self) -> dict:
         return self.scheduler_repo.status()
@@ -30,6 +33,10 @@ class SchedulerService:
             return None, errors
         policy = self.policy_repo.get()
         settings = self.scheduler_repo.update_mode(payload["mode"], policy.cycle_interval_minutes)
+        # A direct PATCH can only ever land on off/simulate (validated
+        # above), so this always invalidates any pending live
+        # authorization - idempotent no-op if nothing was armed.
+        self.live_repo.disarm_for_mode_change(new_mode=settings.mode, actor="system")
         return settings.to_dict(), []
 
     def queue_manual(self) -> tuple[dict, bool]:
@@ -70,10 +77,14 @@ class SchedulerService:
     def execute_cycle(self, cycle: dict, heartbeat=None) -> None:
         cycle_id = cycle["id"]
         policy = cycle["policy_snapshot"]
-        # A scheduled cycle queued before mode was disabled is audited as skipped.
-        if cycle["trigger"] == "scheduled" and self.scheduler_repo.current_mode() != "simulate":
+        # A scheduled cycle queued under one mode (simulate/live) is
+        # audited as skipped if the mode drifted away before it started -
+        # planning never silently runs under a different mode than the one
+        # it was queued for.
+        if cycle["trigger"] == "scheduled" and self.scheduler_repo.current_mode() != cycle["mode_snapshot"]:
             self.scheduler_repo.finish_cycle(
-                cycle_id, "skipped", {}, "Scheduled simulation skipped because scheduler mode is off."
+                cycle_id, "skipped", {},
+                f"Scheduled {cycle['mode_snapshot']} cycle skipped because scheduler mode changed.",
             )
             return
 
@@ -120,20 +131,31 @@ class SchedulerService:
                 except Exception:
                     pass
 
+        is_live = cycle["mode_snapshot"] == "live"
+        # Planning itself never sends a Sonarr command in either mode - see
+        # module docstring. For a live cycle, whether anything was actually
+        # dispatched afterward is recorded separately in
+        # live_dispatch_ledger by LiveDispatchCoordinator, which runs only
+        # after this method returns - see app/worker.py.
+        dispatch_note = (
+            "planning only; any live dispatch attempts are recorded separately in the live dispatch ledger."
+            if is_live else "no Sonarr commands were sent."
+        )
+        label = "Live cycle planning" if is_live else "Simulation"
         if not libraries:
             state = "skipped"
-            summary = "No enabled Sonarr libraries; simulation sent no Sonarr commands."
+            summary = f"No enabled Sonarr libraries; {label.lower()} sent no Sonarr commands."
         elif totals["failed_library_count"]:
             state = "failed" if totals["failed_library_count"] == len(libraries) else "partial"
-            summary = "Simulation planning completed with library failures; no Sonarr commands were sent."
+            summary = f"{label} completed with library failures; {dispatch_note}"
         elif skipped_count == len(libraries):
             state = "skipped"
-            summary = "All enabled Sonarr libraries were skipped; no Sonarr commands were sent."
+            summary = f"All enabled Sonarr libraries were skipped; {dispatch_note}"
         else:
             state = "completed"
             summary = (
-                f"Simulation selected {totals['selected_count']} of {totals['considered_count']} candidates; "
-                "no Sonarr commands were sent."
+                f"{label} selected {totals['selected_count']} of {totals['considered_count']} candidates; "
+                f"{dispatch_note}"
             )
         self.scheduler_repo.finish_cycle(cycle_id, state, totals, summary)
 

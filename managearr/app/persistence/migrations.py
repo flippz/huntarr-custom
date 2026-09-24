@@ -919,6 +919,199 @@ MIGRATIONS: list[Migration] = [
                 FOR EACH ROW EXECUTE FUNCTION protect_refresh_run();
         """,
     ),
+    Migration(
+        version=6,
+        name="controlled_live_dispatch",
+        sql="""
+            -- Widen the mode constraints that previously hard-limited the
+            -- scheduler to off/simulate. 'live' is added as a value the
+            -- scheduler can be switched to; nothing about off/simulate
+            -- behavior changes and no existing row's mode is touched.
+            ALTER TABLE scheduler_settings DROP CONSTRAINT scheduler_settings_mode_check;
+            ALTER TABLE scheduler_settings
+                ADD CONSTRAINT scheduler_settings_mode_check CHECK (mode IN ('off', 'simulate', 'live'));
+
+            ALTER TABLE scheduler_mode_audit DROP CONSTRAINT scheduler_mode_audit_previous_mode_check;
+            ALTER TABLE scheduler_mode_audit DROP CONSTRAINT scheduler_mode_audit_new_mode_check;
+            ALTER TABLE scheduler_mode_audit
+                ADD CONSTRAINT scheduler_mode_audit_previous_mode_check
+                    CHECK (previous_mode IN ('off', 'simulate', 'live')),
+                ADD CONSTRAINT scheduler_mode_audit_new_mode_check
+                    CHECK (new_mode IN ('off', 'simulate', 'live'));
+
+            ALTER TABLE scheduler_cycle_runs DROP CONSTRAINT scheduler_cycle_runs_mode_snapshot_check;
+            ALTER TABLE scheduler_cycle_runs
+                ADD CONSTRAINT scheduler_cycle_runs_mode_snapshot_check
+                    CHECK (mode_snapshot IN ('simulate', 'live'));
+
+            -- Emergency stop must be able to cancel an already-queued (not
+            -- yet started) live cycle immediately, so 'queued' -> 'skipped'
+            -- becomes a second controlled transition alongside the
+            -- existing 'queued' -> 'running' one.
+            CREATE OR REPLACE FUNCTION protect_scheduler_cycle_run() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    RAISE EXCEPTION 'scheduler cycle audit rows cannot be deleted';
+                END IF;
+                IF NEW.request_id IS DISTINCT FROM OLD.request_id
+                   OR NEW.trigger IS DISTINCT FROM OLD.trigger
+                   OR NEW.mode_snapshot IS DISTINCT FROM OLD.mode_snapshot
+                   OR NEW.policy_snapshot IS DISTINCT FROM OLD.policy_snapshot
+                   OR NEW.random_seed IS DISTINCT FROM OLD.random_seed
+                   OR NEW.queued_at IS DISTINCT FROM OLD.queued_at THEN
+                    RAISE EXCEPTION 'scheduler cycle identity is immutable';
+                END IF;
+                IF OLD.state = 'queued' AND NEW.state = 'running' THEN RETURN NEW; END IF;
+                IF OLD.state = 'queued' AND NEW.state = 'skipped' THEN RETURN NEW; END IF;
+                IF OLD.state = 'running'
+                   AND NEW.state IN ('completed', 'partial', 'failed', 'skipped') THEN RETURN NEW; END IF;
+                RAISE EXCEPTION 'invalid scheduler cycle state transition';
+            END;
+            $$ LANGUAGE plpgsql;
+
+            -- Live-control state is a singleton row separate from
+            -- scheduler_settings.mode. 'armed' only ever becomes TRUE
+            -- through the application's arm-confirm path; a bare restart
+            -- never sets it, and it always carries a bounded expires_at.
+            CREATE TABLE live_control (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                armed BOOLEAN NOT NULL DEFAULT FALSE,
+                arm_generation BIGINT NOT NULL DEFAULT 0 CHECK (arm_generation >= 0),
+                armed_at TIMESTAMPTZ,
+                armed_by VARCHAR(255),
+                armed_reason VARCHAR(500),
+                expires_at TIMESTAMPTZ,
+                emergency_stopped_at TIMESTAMPTZ,
+                emergency_stop_reason VARCHAR(500),
+                emergency_stop_generation BIGINT NOT NULL DEFAULT 0 CHECK (emergency_stop_generation >= 0),
+                max_dispatches_per_cycle INTEGER NOT NULL DEFAULT 1
+                    CHECK (max_dispatches_per_cycle BETWEEN 1 AND 5),
+                min_delay_seconds_between_dispatches INTEGER NOT NULL DEFAULT 30
+                    CHECK (min_delay_seconds_between_dispatches BETWEEN 5 AND 600),
+                default_arm_ttl_minutes INTEGER NOT NULL DEFAULT 15
+                    CHECK (default_arm_ttl_minutes BETWEEN 1 AND 60),
+                max_arm_ttl_minutes INTEGER NOT NULL DEFAULT 60
+                    CHECK (max_arm_ttl_minutes BETWEEN 1 AND 60),
+                last_dispatch_at TIMESTAMPTZ,
+                last_dispatch_summary VARCHAR(1000) NOT NULL DEFAULT '',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                CHECK (default_arm_ttl_minutes <= max_arm_ttl_minutes),
+                CHECK (
+                    (armed = FALSE AND armed_at IS NULL AND armed_by IS NULL
+                        AND armed_reason IS NULL AND expires_at IS NULL)
+                    OR
+                    (armed = TRUE AND armed_at IS NOT NULL AND armed_by IS NOT NULL
+                        AND armed_reason IS NOT NULL AND expires_at IS NOT NULL
+                        AND arm_generation > 0)
+                )
+            );
+            INSERT INTO live_control (id) VALUES (1);
+
+            -- Short-lived, server-issued challenges for the two-step
+            -- enable-live-mode and arm flows. Only a SHA-256 hash of the
+            -- opaque token is ever stored - never the raw token.
+            CREATE TABLE live_challenges (
+                id BIGSERIAL PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('enable_mode', 'arm')),
+                token_hash VARCHAR(64) NOT NULL,
+                policy_digest VARCHAR(64) NOT NULL,
+                requested_reason VARCHAR(500),
+                requested_ttl_minutes INTEGER CHECK (requested_ttl_minutes IS NULL OR requested_ttl_minutes BETWEEN 1 AND 60),
+                state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'confirmed', 'expired', 'consumed')),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                confirmed_at TIMESTAMPTZ,
+                CHECK (kind = 'arm' OR (requested_reason IS NULL AND requested_ttl_minutes IS NULL)),
+                CHECK (kind = 'enable_mode' OR (requested_reason IS NOT NULL AND requested_ttl_minutes IS NOT NULL)),
+                CHECK ((state = 'confirmed') = (confirmed_at IS NOT NULL))
+            );
+            CREATE INDEX idx_live_challenges_kind_state_expires
+                ON live_challenges (kind, state, expires_at);
+
+            CREATE FUNCTION protect_live_append_only() RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'live control audit rows are append-only';
+            END;
+            $$ LANGUAGE plpgsql;
+
+            CREATE FUNCTION protect_live_challenge() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    RAISE EXCEPTION 'live challenge audit rows cannot be deleted';
+                END IF;
+                IF NEW.kind IS DISTINCT FROM OLD.kind
+                   OR NEW.token_hash IS DISTINCT FROM OLD.token_hash
+                   OR NEW.policy_digest IS DISTINCT FROM OLD.policy_digest
+                   OR NEW.requested_reason IS DISTINCT FROM OLD.requested_reason
+                   OR NEW.requested_ttl_minutes IS DISTINCT FROM OLD.requested_ttl_minutes
+                   OR NEW.created_at IS DISTINCT FROM OLD.created_at
+                   OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN
+                    RAISE EXCEPTION 'live challenge identity is immutable';
+                END IF;
+                IF OLD.state = 'pending' AND NEW.state IN ('confirmed', 'expired', 'consumed') THEN
+                    RETURN NEW;
+                END IF;
+                RAISE EXCEPTION 'invalid live challenge state transition';
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER protect_live_challenge_row
+                BEFORE UPDATE OR DELETE ON live_challenges
+                FOR EACH ROW EXECUTE FUNCTION protect_live_challenge();
+
+            -- Append-only audit of every mode/arm/disarm/emergency-stop
+            -- transition, independent of the mutable live_control row.
+            CREATE TABLE live_control_audit (
+                id BIGSERIAL PRIMARY KEY,
+                event_type TEXT NOT NULL CHECK (event_type IN (
+                    'mode_enabled', 'mode_disabled', 'armed', 'disarmed',
+                    'emergency_stop', 'arm_expired'
+                )),
+                previous_mode TEXT,
+                new_mode TEXT,
+                reason VARCHAR(500),
+                actor VARCHAR(255),
+                arm_generation BIGINT,
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX idx_live_control_audit_occurred
+                ON live_control_audit (occurred_at DESC, id DESC);
+            CREATE TRIGGER protect_live_control_audit
+                BEFORE UPDATE OR DELETE ON live_control_audit
+                FOR EACH ROW EXECUTE FUNCTION protect_live_append_only();
+
+            -- Per-cycle live dispatch ledger: exactly one row per candidate
+            -- a live cycle actually attempted (or explicitly declined to
+            -- attempt), linking the scheduler's planning audit to the
+            -- reused manual dispatch ledger row it produced.
+            CREATE TABLE live_dispatch_ledger (
+                id BIGSERIAL PRIMARY KEY,
+                cycle_run_id BIGINT NOT NULL REFERENCES scheduler_cycle_runs (id) ON DELETE RESTRICT,
+                library_result_id BIGINT REFERENCES scheduler_library_results (id) ON DELETE RESTRICT,
+                candidate_result_id BIGINT REFERENCES scheduler_candidate_results (id) ON DELETE RESTRICT,
+                library_id BIGINT REFERENCES arr_libraries (id) ON DELETE SET NULL,
+                candidate_id BIGINT REFERENCES scan_candidates (id) ON DELETE RESTRICT,
+                dispatch_batch_id BIGINT REFERENCES dispatch_batches (id) ON DELETE RESTRICT,
+                dispatch_item_id BIGINT REFERENCES dispatch_batch_items (id) ON DELETE RESTRICT,
+                attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+                arm_generation BIGINT NOT NULL CHECK (arm_generation > 0),
+                state TEXT NOT NULL CHECK (state IN ('dispatched', 'failed', 'ambiguous', 'blocked', 'skipped')),
+                sonarr_command_id INTEGER CHECK (sonarr_command_id IS NULL OR sonarr_command_id > 0),
+                sonarr_command_status TEXT,
+                terminal_reason VARCHAR(500) NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (cycle_run_id, candidate_result_id)
+            );
+            CREATE INDEX idx_live_dispatch_ledger_cycle
+                ON live_dispatch_ledger (cycle_run_id, id);
+            CREATE INDEX idx_live_dispatch_ledger_batch
+                ON live_dispatch_ledger (dispatch_batch_id);
+            CREATE INDEX idx_live_dispatch_ledger_library
+                ON live_dispatch_ledger (library_id, created_at DESC);
+            CREATE TRIGGER protect_live_dispatch_ledger
+                BEFORE UPDATE OR DELETE ON live_dispatch_ledger
+                FOR EACH ROW EXECUTE FUNCTION protect_live_append_only();
+        """,
+    ),
 ]
 
 

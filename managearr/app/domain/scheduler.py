@@ -1,7 +1,11 @@
 """Safe scheduler domain values for the simulation-only M4 worker."""
 from dataclasses import dataclass
 
-SCHEDULER_MODES = ("off", "simulate")
+SCHEDULER_MODES = ("off", "simulate", "live")
+# Direct PATCH may only ever select one of these two modes. Switching to
+# 'live' requires the dedicated two-step challenge/confirm flow (see
+# app/services/live_control_service.py) - never a single PATCH.
+DIRECTLY_SETTABLE_MODES = ("off", "simulate")
 CYCLE_STATES = ("queued", "running", "completed", "partial", "failed", "skipped")
 CYCLE_TRIGGERS = ("scheduled", "manual")
 MAX_SIMULATION_SELECTION = 25
@@ -30,6 +34,11 @@ def validate_scheduler_settings(data) -> list[str]:
         errors.append("only mode may be changed")
     if "mode" not in data:
         errors.append("mode is required")
-    elif data["mode"] not in SCHEDULER_MODES:
+    elif data["mode"] == "live":
+        errors.append(
+            "mode live cannot be set directly; use the live mode challenge/confirm "
+            "flow at /api/v1/scheduler/live/mode-challenge and /mode-confirm"
+        )
+    elif data["mode"] not in DIRECTLY_SETTABLE_MODES:
         errors.append("mode must be one of: off, simulate")
     return errors

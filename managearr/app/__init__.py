@@ -20,6 +20,7 @@ from .persistence.dispatch_repository import DispatchRepository
 from .persistence.outcome_repository import OutcomeRepository
 from .persistence.scheduler_repository import SchedulerRepository
 from .persistence.refresh_repository import RefreshRepository
+from .persistence.live_repository import LiveRepository
 from .services.library_service import LibraryService
 from .services.policy_service import PolicyService
 from .services.activity_service import ActivityService
@@ -31,6 +32,7 @@ from .services.dispatch_service import DispatchService
 from .services.reconciliation_service import ReconciliationService
 from .services.scheduler_service import SchedulerService
 from .services.refresh_settings_service import RefreshSettingsService
+from .services.live_control_service import LiveControlService
 from .api import api_bp
 from .web import web_bp
 
@@ -65,6 +67,7 @@ def create_app(config: dict | None = None) -> Flask:
     outcome_repo = OutcomeRepository(db)
     scheduler_repo = SchedulerRepository(db)
     refresh_repo = RefreshRepository(db)
+    live_repo = LiveRepository(db)
 
     sonarr_timeout = app.config.get("SONARR_TIMEOUT_SECONDS")
 
@@ -85,9 +88,16 @@ def create_app(config: dict | None = None) -> Flask:
         "dispatch_repo": dispatch_repo,
         "outcome_repo": outcome_repo,
         "scheduler_repo": scheduler_repo,
-        "scheduler": SchedulerService(scheduler_repo, policy_repo, refresh_repo),
+        "scheduler": SchedulerService(scheduler_repo, policy_repo, refresh_repo, live_repo),
         "refresh_repo": refresh_repo,
         "refresh": RefreshSettingsService(refresh_repo),
+        "live_repo": live_repo,
+        # LiveControlService never imports DispatchService or a Sonarr
+        # adapter - it can only change mode/arm state through the
+        # two-step challenge/confirm flow. Scheduled live dispatch itself
+        # only ever runs from app/worker.py's LiveDispatchCoordinator -
+        # this API process never executes it.
+        "live_control": LiveControlService(live_repo, scheduler_repo, policy_repo),
         "dispatch_planning": dispatch_planning,
         "dispatch": DispatchService(
             dispatch_planning, dispatch_repo, library_repo, timeout=sonarr_timeout

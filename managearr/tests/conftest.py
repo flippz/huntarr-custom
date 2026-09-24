@@ -16,12 +16,15 @@ from app.persistence.dispatch_repository import DispatchRepository
 from app.persistence.outcome_repository import OutcomeRepository
 from app.persistence.scheduler_repository import SchedulerRepository
 from app.persistence.refresh_repository import RefreshRepository
+from app.persistence.live_repository import LiveRepository
 from app.services.dispatch_planning_service import DispatchPlanningService
 from app.services.dispatch_service import DispatchService
 from app.services.reconciliation_service import ReconciliationService
 from app.services.scheduler_service import SchedulerService
 from app.services.refresh_service import RefreshService
 from app.services.refresh_settings_service import RefreshSettingsService
+from app.services.live_control_service import LiveControlService
+from app.services.live_dispatch_coordinator import LiveDispatchCoordinator
 
 # Tests run against a real PostgreSQL instance - no SQLite/mock DB layer.
 # Point MANAGEARR_TEST_DB_* at a disposable database; the suite truncates
@@ -39,7 +42,8 @@ _DATA_TABLES = (
     "dispatch_batches, dispatch_batch_items, dispatch_reconciliation_attempts, dispatch_outcome_events, "
     "scheduler_candidate_results, scheduler_library_results, scheduler_cycle_runs, "
     "scheduler_run_requests, scheduler_mode_audit, "
-    "refresh_run_reconciled_batches, refresh_runs, refresh_requests"
+    "refresh_run_reconciled_batches, refresh_runs, refresh_requests, "
+    "live_dispatch_ledger, live_control_audit, live_challenges"
 )
 
 
@@ -87,6 +91,13 @@ def _reset_tables(_migrated_db):
             "next_reconcile_due_at = NULL, updated_at = now()"
         )
         conn.execute(f"TRUNCATE {_DATA_TABLES} RESTART IDENTITY CASCADE")
+        conn.execute(
+            "UPDATE live_control SET armed = FALSE, arm_generation = 0, armed_at = NULL, "
+            "armed_by = NULL, armed_reason = NULL, expires_at = NULL, emergency_stopped_at = NULL, "
+            "emergency_stop_reason = NULL, emergency_stop_generation = 0, max_dispatches_per_cycle = 1, "
+            "min_delay_seconds_between_dispatches = 30, default_arm_ttl_minutes = 15, "
+            "max_arm_ttl_minutes = 60, last_dispatch_at = NULL, last_dispatch_summary = '', updated_at = now()"
+        )
         conn.execute(
             "UPDATE scheduler_leases SET owner_id = NULL, acquired_at = NULL, "
             "heartbeat_at = NULL, expires_at = NULL"
@@ -178,3 +189,18 @@ def refresh_settings_service(refresh_repo):
 @pytest.fixture
 def refresh_service(refresh_repo, library_repo, activity_repo, candidate_repo, dispatch_repo, outcome_repo):
     return RefreshService(refresh_repo, library_repo, activity_repo, candidate_repo, dispatch_repo, outcome_repo)
+
+
+@pytest.fixture
+def live_repo(database):
+    return LiveRepository(database)
+
+
+@pytest.fixture
+def live_control_service(live_repo, scheduler_repo, policy_repo):
+    return LiveControlService(live_repo, scheduler_repo, policy_repo)
+
+
+@pytest.fixture
+def live_coordinator(live_repo, scheduler_repo, dispatch_service):
+    return LiveDispatchCoordinator(live_repo, scheduler_repo, dispatch_service)

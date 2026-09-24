@@ -453,6 +453,55 @@ def test_refresh_run_state_transitions_are_controlled(database):
             )
 
 
+# --- v6: controlled live dispatch ----------------------------------------
+
+
+def test_v6_widens_mode_constraints_without_touching_existing_rows(database):
+    assert MIGRATIONS[5].version == 6
+    with database.connect() as conn:
+        settings = conn.execute("SELECT mode FROM scheduler_settings WHERE id = 1").fetchone()
+    assert settings["mode"] == "off"  # unchanged by the migration itself
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with database.connect() as conn:
+            conn.execute("UPDATE scheduler_settings SET mode = 'not-a-real-mode' WHERE id = 1")
+
+
+def test_v6_live_tables_and_indexes_exist(database):
+    with database.connect() as conn:
+        tables = {r["table_name"] for r in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+        ).fetchall()}
+        indexes = {r["indexname"] for r in conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname='public'"
+        ).fetchall()}
+    assert {"live_control", "live_challenges", "live_control_audit", "live_dispatch_ledger"} <= tables
+    assert {
+        "idx_live_challenges_kind_state_expires", "idx_live_control_audit_occurred",
+        "idx_live_dispatch_ledger_cycle", "idx_live_dispatch_ledger_batch", "idx_live_dispatch_ledger_library",
+    } <= indexes
+
+
+def test_v6_live_control_bounds_are_enforced(database):
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with database.connect() as conn:
+            conn.execute("UPDATE live_control SET max_dispatches_per_cycle = 6 WHERE id = 1")
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with database.connect() as conn:
+            conn.execute("UPDATE live_control SET max_arm_ttl_minutes = 61 WHERE id = 1")
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with database.connect() as conn:
+            conn.execute("UPDATE live_control SET min_delay_seconds_between_dispatches = 1 WHERE id = 1")
+
+
+def test_v6_live_challenge_kind_shape_is_enforced(database):
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with database.connect() as conn:
+            conn.execute(
+                "INSERT INTO live_challenges (kind, token_hash, policy_digest, expires_at) "
+                "VALUES ('arm', 'h', 'd', now() + interval '1 minute')"
+            )  # arm challenges require requested_reason/requested_ttl_minutes
+
+
 def test_failed_pending_migration_rolls_back_ddl_and_bookkeeping(database, monkeypatch):
     bad = Migration(
         version=999,

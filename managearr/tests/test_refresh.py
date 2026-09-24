@@ -137,12 +137,26 @@ def test_read_only_adapter_rejects_write_methods_and_proxies_reads(monkeypatch):
 
 
 def test_worker_and_refresh_service_never_import_dispatch_or_write_method():
-    worker_source = open("app/worker.py", encoding="utf-8").read()
+    # Unchanged in M6: the read-only refresh path (scan freshness +
+    # reconciliation) has no access to DispatchService or a write-capable
+    # Sonarr client at all - see app/adapters/read_only_sonarr_client.py.
     refresh_source = open("app/services/refresh_service.py", encoding="utf-8").read()
-    assert "import DispatchService" not in worker_source
+    scheduler_source = open("app/services/scheduler_service.py", encoding="utf-8").read()
     assert "import DispatchService" not in refresh_source
     assert "search_episodes" not in refresh_source
     assert "import SonarrClient" not in refresh_source  # only ReadOnlySonarrClient is used
+    # Simulation/live *planning* also never imports DispatchService or a
+    # Sonarr adapter - only app/services/live_dispatch_coordinator.py (the
+    # dedicated M6 gated component) is allowed to, and app/worker.py only
+    # ever constructs it lazily for an already-planned mode='live' cycle -
+    # see SchedulerWorker._ensure_live_coordinator.
+    assert "import DispatchService" not in scheduler_source
+    assert "SonarrClient" not in scheduler_source
+    coordinator_source = open("app/services/live_dispatch_coordinator.py", encoding="utf-8").read()
+    assert "import DispatchService" not in coordinator_source  # only .dispatch_service import NO_ELIGIBLE_..., not the class
+    worker_source = open("app/worker.py", encoding="utf-8").read()
+    assert "LiveDispatchCoordinator" in worker_source
+    assert "_ensure_live_coordinator" in worker_source
 
 
 # --- settings -----------------------------------------------------------

@@ -138,7 +138,74 @@ def get_scheduler_cycle(cycle_id: int):
     cycle = _services()["scheduler"].cycle_detail(cycle_id)
     if cycle is None:
         return jsonify({"errors": ["scheduler cycle not found"]}), 404
+    ledger = _services()["live_repo"].ledger_for_cycle(cycle_id)
+    if ledger:
+        cycle["live_dispatch_ledger"] = ledger
     return jsonify({"cycle": cycle})
+
+
+# --- Controlled live dispatch (M6) ---------------------------------------
+#
+# Every endpoint below only ever changes scheduler mode or live_control
+# state (armed/disarmed/emergency-stopped) - none of them import
+# DispatchService or a Sonarr adapter, and none of them can themselves send
+# a Sonarr command. Scheduled live dispatch only ever executes from
+# app/worker.py's LiveDispatchCoordinator, gated on mode=live AND a valid
+# unexpired arm - see LiveControlService/LiveRepository.
+
+@api_bp.get("/scheduler/live/status")
+def live_status():
+    return jsonify({"live": _services()["live_control"].status()})
+
+
+@api_bp.post("/scheduler/live/mode-challenge")
+def live_mode_challenge():
+    return jsonify(_services()["live_control"].request_mode_challenge()), 201
+
+
+@api_bp.post("/scheduler/live/mode-confirm")
+def live_mode_confirm():
+    payload = request.get_json(silent=True) or {}
+    actor = request.headers.get("X-Managearr-Actor", "operator")[:255]
+    result, errors = _services()["live_control"].confirm_mode_challenge(payload, actor=actor)
+    if errors:
+        return jsonify({"errors": errors}), 400
+    return jsonify({"result": result, "live": _services()["live_control"].status()})
+
+
+@api_bp.post("/scheduler/live/arm-challenge")
+def live_arm_challenge():
+    payload = request.get_json(silent=True) or {}
+    result, errors = _services()["live_control"].request_arm_challenge(payload)
+    if errors:
+        return jsonify({"errors": errors}), 400
+    return jsonify(result), 201
+
+
+@api_bp.post("/scheduler/live/arm-confirm")
+def live_arm_confirm():
+    payload = request.get_json(silent=True) or {}
+    actor = request.headers.get("X-Managearr-Actor", "operator")[:255]
+    result, errors = _services()["live_control"].confirm_arm_challenge(payload, actor=actor)
+    if errors:
+        return jsonify({"errors": errors}), 400
+    return jsonify({"control": result, "live": _services()["live_control"].status()})
+
+
+@api_bp.post("/scheduler/live/disarm")
+def live_disarm():
+    payload = request.get_json(silent=True) or {}
+    actor = request.headers.get("X-Managearr-Actor", "operator")[:255]
+    control = _services()["live_control"].disarm(payload, actor=actor)
+    return jsonify({"control": control, "live": _services()["live_control"].status()})
+
+
+@api_bp.post("/scheduler/live/emergency-stop")
+def live_emergency_stop():
+    payload = request.get_json(silent=True) or {}
+    actor = request.headers.get("X-Managearr-Actor", "operator")[:255]
+    result = _services()["live_control"].emergency_stop(payload, actor=actor)
+    return jsonify({"result": result, "live": _services()["live_control"].status()})
 
 
 # --- Read-only scheduled refresh/reconciliation (M5) ---------------------

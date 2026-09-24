@@ -49,9 +49,15 @@ def test_v4_schema_constraints_and_indexes(database):
             "scheduler_run_requests", "scheduler_cycle_runs", "scheduler_library_results",
             "scheduler_candidate_results"} <= tables
     assert "uq_scheduler_one_active_manual_request" in indexes
+    # 'live' became a valid mode value in migration v6 (see
+    # test_live_dispatch.py for the full M6 coverage); only a genuinely
+    # invalid value is still rejected by the column check.
     with pytest.raises(psycopg.errors.CheckViolation):
         with database.connect() as conn:
-            conn.execute("UPDATE scheduler_settings SET mode='live' WHERE id=1")
+            conn.execute("UPDATE scheduler_settings SET mode='turbo' WHERE id=1")
+    with database.connect() as conn:
+        conn.execute("UPDATE scheduler_settings SET mode='live' WHERE id=1")
+        conn.execute("UPDATE scheduler_settings SET mode='off' WHERE id=1")
 
 
 def test_scheduler_mode_defaults_off_and_change_is_audited(database, scheduler_repo, policy_repo):

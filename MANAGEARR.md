@@ -4,7 +4,292 @@ Managearr is a standalone Flask/PostgreSQL rewrite beside the legacy Huntarr
 application (`main.py`, `src/`). It has its own image, database, port, API, and
 UI. Nothing in this application changes the legacy runtime.
 
-## Current milestone: scheduled read-only refresh/reconciliation (M5)
+## Current milestone: controlled scheduled live dispatch (M6)
+
+M6 adds a real, scheduled `live` dispatch path alongside the existing
+simulation scheduler, without weakening any earlier milestone's safety
+model. **A fresh or freshly-upgraded deployment is always unarmed and
+defaults to scheduler mode `off`.** Enabling `live` mode and arming it are
+two separate, typed, expiring, server-confirmed actions - nothing in this
+milestone can be reached by a single PATCH, a page reload, or a container
+restart.
+
+### Two-gate safety model
+
+Live dispatch requires **both**, re-checked immediately before every single
+Sonarr command:
+
+1. **Scheduler mode is `live`.** Set only via a two-step challenge/confirm
+   (`POST .../live/mode-challenge` then `.../mode-confirm`) - never a plain
+   `PATCH /api/v1/scheduler/settings` (that endpoint now explicitly rejects
+   `mode: "live"` with a message pointing at the challenge flow). Enabling
+   live mode **does not arm anything**.
+2. **A valid, unexpired arm.** Set only via a second, independent two-step
+   challenge/confirm (`.../live/arm-challenge` then `.../arm-confirm`),
+   requiring a typed exact phrase, a non-empty reason, and a bounded TTL
+   (1-60 minutes, default 15). Arming produces a monotonically increasing
+   `arm_generation`; every dispatch attempt re-reads live state fresh from
+   the database and refuses to proceed unless the mode is still `live`, the
+   arm is still the exact generation the cycle captured at its start, it
+   has not expired, and no emergency stop has occurred since.
+
+Switching away from `live` (to `off` or `simulate`), an explicit disarm, or
+an emergency stop all immediately invalidate any pending arm - the running
+worker's next authorization check fails safely rather than continuing on
+stale state.
+
+### Schema v6
+
+Migration v6:
+
+- widens `scheduler_settings.mode`, `scheduler_mode_audit`, and
+  `scheduler_cycle_runs.mode_snapshot` to also accept `live`, alongside the
+  unchanged `off`/`simulate` values - a fresh install's `scheduler_settings`
+  row is untouched (`mode = 'off'`);
+- adds a second, independent controlled transition
+  (`queued -> skipped`) to the scheduler cycle-run trigger, needed so
+  emergency stop can cancel an already-queued live cycle that has not
+  started yet, alongside the pre-existing `queued -> running -> terminal`
+  path;
+- adds `live_control`: a singleton row holding `armed`, `arm_generation`,
+  `armed_at`/`armed_by`/`armed_reason`, `expires_at`,
+  `emergency_stopped_at`/`emergency_stop_reason`/`emergency_stop_generation`,
+  the bounded operator-configurable `max_dispatches_per_cycle` (1-5, default
+  1), `min_delay_seconds_between_dispatches` (5-600s, default 30),
+  `default_arm_ttl_minutes`/`max_arm_ttl_minutes` (1-60, default 15/60), and
+  `last_dispatch_at`/`last_dispatch_summary`. A `CHECK` constraint enforces
+  that `armed = TRUE` always carries every one of `armed_at`/`armed_by`/
+  `armed_reason`/`expires_at`/a positive `arm_generation` together - there
+  is no way to have a "half-armed" row. **No API secrets are stored here or
+  anywhere in M6.**
+- adds `live_challenges`: short-lived (120 second TTL) server-issued
+  challenges for the two flows above. Only a SHA-256 hash of the opaque
+  token is ever stored - the raw token exists only in the HTTP response and
+  the operator's clipboard. A challenge can be confirmed exactly once
+  (`pending -> confirmed`, enforced by trigger); replay, wrong token,
+  wrong phrase, expiry, and policy drift (see below) are all rejected
+  before anything changes;
+- adds `live_control_audit`: an append-only log of every
+  mode-enabled/armed/disarmed/emergency-stop/arm-expired transition, with
+  actor, reason, and the arm generation involved;
+- adds `live_dispatch_ledger`: an append-only, per-cycle record of exactly
+  one row per candidate a live cycle actually attempted or explicitly
+  declined to attempt, linking `scheduler_cycle_runs` /
+  `scheduler_library_results` / `scheduler_candidate_results` to the
+  resulting `dispatch_batches` / `dispatch_batch_items` row (if any),
+  the arm generation it ran under, and a safe terminal reason
+  (`dispatched` / `failed` / `ambiguous` / `blocked` / `skipped`).
+
+Rollback compatibility: the migration only widens existing `CHECK`
+constraints and adds new tables/columns - it never alters or drops M1-M5
+data, and an M1-M5 build of the application code still runs unmodified
+against a v6 database (it simply never reads the new tables/mode value).
+
+### Policy digest binding
+
+Both challenge flows bind a `policy_digest` - a SHA-256 hash of the current
+automation policy plus the current live-dispatch bounds plus the current
+scheduler mode - into the challenge at issuance time. Confirmation
+recomputes the digest and rejects the confirmation if anything changed in
+between (`policy or scheduler settings changed since the challenge was
+issued; request a new challenge`). This closes the gap where an operator
+reads a policy summary, someone else changes the policy, and the original
+operator then confirms authorization for a policy they never actually saw.
+
+### API
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/v1/scheduler/live/status` | Safe live state: mode, armed/expiry/countdown, policy digest, pending live cycles, last dispatch, and explicit reasons dispatch is currently blocked |
+| POST | `/api/v1/scheduler/live/mode-challenge` | Issue a one-time, policy-bound challenge to enable live mode (120s TTL) |
+| POST | `/api/v1/scheduler/live/mode-confirm` | Confirm with `{challenge_id, token, phrase}`; sets mode to `live` but leaves it unarmed |
+| POST | `/api/v1/scheduler/live/arm-challenge` | Issue a one-time challenge to arm, with `{reason, ttl_minutes}`; requires mode already `live` |
+| POST | `/api/v1/scheduler/live/arm-confirm` | Confirm with `{challenge_id, token, phrase}`; arms live dispatch for the requested (capped) TTL |
+| POST | `/api/v1/scheduler/live/disarm` | Immediately unarm; always available, idempotent |
+| POST | `/api/v1/scheduler/live/emergency-stop` | Immediately unarm, block new claims/dispatch, and cancel any queued (not yet started) live cycle; **idempotent, never deletes data or cancels an already-sent Sonarr command** |
+
+`PATCH /api/v1/scheduler/settings` (and its `/scheduler` alias) now
+explicitly rejects `{"mode": "live"}` with a 400 pointing at the challenge
+flow; `off`/`simulate` continue to work exactly as in M4/M5, and moving
+away from `live` through this endpoint also disarms.
+
+### Worker-only dispatch: `LiveDispatchCoordinator`
+
+`app/services/live_dispatch_coordinator.py` is the **only** component in
+the whole codebase - API process or worker - allowed to hold both
+`DispatchService` and a write-capable Sonarr client for *scheduled* work.
+The API process's existing `DispatchService` wiring for the M2 manual
+endpoint is unaffected and unrelated; `LiveControlService` (everything
+under `/api/v1/scheduler/live/*`) never imports `DispatchService` or a
+Sonarr adapter at all - it can only flip mode/arm state.
+
+Inside the worker, construction is lazy and structural, not just
+convention: `SchedulerWorker` never builds a `DispatchService` in its
+constructor. `_ensure_live_coordinator()` only constructs one the first
+time `run_once()` has an actual `mode_snapshot = 'live'` cycle to hand it -
+every `off`/`simulate` iteration, and a `live` iteration with nothing
+selected, never reaches that code path. Even once constructed,
+`DispatchService.__init__` itself never instantiates a `SonarrClient` -
+that only happens inside `.dispatch()`, which the coordinator only calls
+after a fully gated per-candidate authorization check.
+
+A live worker iteration therefore runs in two independent phases:
+
+1. **Planning** (`SchedulerService.execute_cycle`, unchanged code, mode-
+   agnostic) - identical to a `simulate` cycle: same fresh-scan-snapshot
+   requirement, same deterministic ordering, same cap/cooldown/queue/
+   success-target math, same durable `scheduler_library_results` /
+   `scheduler_candidate_results` audit rows. This half **never** sends a
+   Sonarr command in either mode and has no Sonarr adapter dependency at
+   all - see `test_worker_and_refresh_service_never_import_dispatch_or_write_method`.
+2. **Live dispatch** (`LiveDispatchCoordinator.execute`, only reached when
+   `mode_snapshot == 'live'`) - walks the already-selected candidates in
+   order and, for each one, up to `max_dispatches_per_cycle`:
+   - re-verifies mode/armed/arm-generation/emergency-stop fresh from the
+     database (`LiveRepository.check_dispatch_authorized`);
+   - re-verifies the minimum delay since the last live dispatch has
+     elapsed (`check_dispatch_delay_elapsed`) - there is no burst catch-up
+     after downtime: a long idle period does not permit a burst of
+     dispatches once it wakes back up, only the same bounded per-cycle cap;
+   - calls the **exact same** `DispatchService.dispatch(job_id,
+     [candidate_id], confirm=True)` the M2 manual endpoint uses - same
+     per-library advisory lock, same fresh re-plan of cooldown/in-flight/
+     hourly-cap immediately before the network call, same
+     reserve-then-call-then-finalize sequence, same
+     `dispatching -> completed|partial|failed|ambiguous` lifecycle, same
+     single `EpisodeSearch` request shape. **No HTTP self-call and no
+     duplicated Sonarr-mutation code exist anywhere in M6.**
+   - records exactly one `live_dispatch_ledger` row for that candidate.
+
+   The moment authorization fails, the delay has not elapsed, or a real
+   Sonarr-side failure occurs (anything other than "nothing was eligible
+   any more"), the coordinator **stops the rest of the cycle** rather than
+   trying the next candidate - this is the bounded, no-tight-retry backoff
+   for 429/5xx/timeout-shaped failures. `last_dispatch_at` is updated on
+   both a successful dispatch and a real failed attempt, so the minimum-
+   delay gate also bounds retry pacing across cycles.
+
+`max_dispatches_per_cycle` defaults to 1 and is hard-capped at 5 by a
+database `CHECK` constraint - no configuration path can raise it further.
+
+Read-only refresh (scan freshness + reconciliation, see M5) now also runs
+during `live` mode, on the same cooldown-gated cadence as `simulate` - it
+remains strictly GET-only either way (`ReadOnlySonarrClient`) and a live
+cycle needs an equally fresh snapshot to plan from.
+
+### Missing-only, no upgrades, no other mutation
+
+Live dispatch reuses the same `scan_candidates` produced by the existing
+read-only Sonarr scan (see M1), which only ever records missing episodes -
+there is no upgrade-scan code path anywhere in this application for it to
+reuse. `DispatchService` (M2, unchanged) has exactly one Sonarr write call,
+`SonarrClient.search_episodes`, which issues one
+`POST /api/v3/command {"name": "EpisodeSearch", ...}`. There is no delete,
+series/season search, download-client mutation, or command-cancel call
+anywhere in the codebase for the live path (or any path) to reach.
+
+### Failure and restart semantics
+
+- **Crash before the Sonarr call**: the reservation stays `dispatching`
+  with no `sonarr_command_id`. The worker's general reservation sweep
+  (`DispatchRepository.expire_stale_reservations`, run for every enabled
+  Sonarr library on **every** worker iteration regardless of mode) marks
+  it `ambiguous` with a safe "inspect Sonarr manually" summary once it is
+  older than five minutes - it is never automatically retried.
+- **Crash at/after Sonarr accepts the command**: `record_command_acceptance`
+  durably commits the returned command id in its own short transaction
+  before local finalization, narrowing (never eliminating) the ambiguity
+  window; the same reservation sweep exposes it as `ambiguous` with the
+  command id available for the existing manual, read-only reconciliation
+  path (M3) - it is still never resent.
+- **Across a restart**: `SchedulerRepository.recover_interrupted` (existing,
+  unchanged, mode-agnostic) fails any cycle left `running` by the previous
+  lease owner without retry; the reservation sweep above independently
+  bounds any interrupted dispatch attempt. `live_control.armed` is a plain
+  database column no code path sets except a confirmed arm - a restart
+  reads it back exactly as it was, defaulting to `FALSE` on every fresh
+  install, and never sets it itself.
+- **429/5xx/timeout**: recorded as a `failed` dispatch batch (same as M2)
+  and a `failed` ledger row; the coordinator stops the rest of that cycle
+  (see above) rather than retrying in a tight loop.
+
+### UI
+
+Settings gained a **Live dispatch (danger zone)** card: current mode/armed/
+expiry, the configured per-cycle/delay bounds, the two-step enable-then-arm
+flow (each step requires requesting a challenge, then typing the exact
+phrase shown), and dedicated Disarm/Emergency stop buttons. Nothing on
+page load calls anything but the read-only status endpoint - reloading the
+page can never arm or enable live dispatch.
+
+Overview gained a prominent **LIVE: ARMED / UNARMED / EXPIRED / STOPPED /
+OFF** banner, the remaining per-cycle dispatch allowance, the latest
+dispatch summary, and its own Emergency stop button.
+
+The scheduler cycle detail API (`GET /api/v1/scheduler/cycles/<id>`) now
+includes `live_dispatch_ledger` for any cycle that has entries, linking the
+planned candidate straight to its dispatch batch/command outcome so
+ambiguous/manual-review rows are easy to find from the cycle that produced
+them.
+
+### Safety proof and limitations
+
+Real-PostgreSQL tests (`managearr/tests/test_live_dispatch.py`, plus the v6
+section of `test_migrations.py`) cover: v6 migration idempotence/
+constraints; challenge issuance/confirm/replay/expiry/wrong-phrase/wrong-
+token/policy-digest-drift for both flows; mode-confirm never arms; arm TTL
+bounds and capping; disarm and mode-change-away-from-live both invalidating
+a pending arm; emergency stop idempotence and queued-live-cycle
+cancellation; off/simulate/unarmed-live iterations never instantiating a
+write-capable Sonarr client (`SonarrClient.__init__` monkeypatched to
+raise); a fully armed live cycle dispatching exactly the expected candidate
+and recording a matching ledger row; `max_dispatches_per_cycle` and the
+minimum-delay gate each independently bounding a cycle; the coordinator
+stopping immediately (no tight retry) when the arm expires mid-cycle, when
+emergency-stopped mid-cycle, or on a real Sonarr-side failure; the stub
+Sonarr client raising if anything but `search_episodes` is ever called;
+crash-before-send recovering to a safe state without a resend; restart
+never implicitly re-arming; full API round-trip coverage; UI danger-zone
+wiring and inline-script syntax; and redaction (no library URL/API key in
+any live-status response).
+
+M6 limitations are intentional: no manual "run live cycle now" endpoint -
+live cycles only ever run on the normal scheduled cadence, exactly like
+simulate; no per-library live arm (arming is global); no automatic re-arm
+after expiry or emergency stop (an operator must explicitly go through
+arm-confirm again); the crash-recovery sweep is bounded to enabled Sonarr
+libraries checked once per worker iteration, not instant; and, like M2-M5,
+upgrades remain completely unsupported and dispatch itself only ever
+selects from already-scanned missing episodes.
+
+### Deployment and rollback
+
+```bash
+docker compose -f compose.managearr.yml up -d --build managearr managearr-worker
+```
+
+No Compose changes are required - `managearr-worker` already runs
+`python -m app.worker` and picks up live dispatch automatically; it stays
+process-isolated from the API (`managearr`), which never executes
+scheduled dispatch itself. **Deploying M6 leaves the current scheduler
+mode completely unchanged and always unarmed** - a fresh install starts at
+`off` as always, and an existing M4/M5 deployment upgrading to this build
+stays in whatever mode (`off`/`simulate`) it was already in; nothing about
+this milestone can cause a deployment to start sending real Sonarr commands
+by itself. **Production verification of this change must not arm or
+dispatch**: verifying the deploy means confirming `GET
+/api/v1/scheduler/live/status` reports `mode` unchanged from before the
+deploy and `control.armed: false` - going further and actually running the
+enable/arm flow against a real Sonarr instance is a separate, explicit
+operator decision outside the scope of a deploy check.
+
+Rolling the application code back to a pre-M6 build still works against a
+v6 database: the older code never reads `live_control`/`live_challenges`/
+`live_control_audit`/`live_dispatch_ledger` and never accepts `mode=live`
+either at the API or in `SCHEDULER_MODES`, so it simply behaves as if the
+new tables/value do not exist.
+
+## Previous milestone: scheduled read-only refresh/reconciliation (M5)
 
 M5 adds a bounded, restart-safe read-only refresh/reconciliation facility to
 the same worker process introduced in M4. It keeps scheduler simulations
@@ -366,16 +651,18 @@ managearr/
   app/
     domain/          dataclasses and pure validation/rules
       dispatch.py    dispatch batch/item model and limits
+      live.py        M6 phrases, bounds, policy-digest, challenge validation
     adapters/
       sonarr_client.py   bounded Sonarr v3 GETs plus the single allowed POST
       read_only_sonarr_client.py   GET-only guard used by the refresh worker
       redaction.py
     persistence/
       database.py
-      migrations.py      PostgreSQL schema v1 + dispatch v2 + outcomes v3 + scheduler v4 + refresh v5
+      migrations.py      PostgreSQL schema v1 + dispatch v2 + outcomes v3 + scheduler v4 + refresh v5 + live dispatch v6
       dispatch_repository.py
       scheduler_repository.py
       refresh_repository.py
+      live_repository.py    M6 arm state, challenges, audit, dispatch ledger
       outcome_repository.py
       *_repository.py
     services/
@@ -383,11 +670,13 @@ managearr/
       dispatch_planning_service.py
       dispatch_service.py
       reconciliation_service.py
-      scheduler_service.py    simulation-only planner
+      scheduler_service.py    simulation/live planner (never imports DispatchService)
       refresh_service.py      read-only scan/reconcile execution (worker-only)
       refresh_settings_service.py
+      live_control_service.py       M6 API-facing arm/mode orchestration (no Sonarr access)
+      live_dispatch_coordinator.py  M6 worker-only gated live dispatch (imports DispatchService)
       library_readiness.py
-    worker.py              dedicated lease-owning process; scheduler + refresh
+    worker.py              dedicated lease-owning process; scheduler + refresh + live dispatch
     api/routes.py
     web/             Jinja templates and vanilla JS/CSS
   tools/import_sqlite.py
@@ -628,11 +917,13 @@ of `test_migrations.py`) is summarized in their own sections above.
 ## Current limitations
 
 - Sonarr only; other Arr types remain CRUD-only.
-- Dispatch itself is manual only. Reconciliation runs both on explicit
-  operator request (M3) and on a bounded automatic cooldown (M5); neither
-  path ever dispatches, retries, or sends a search - see M4/M5 above for the
-  read-only scheduler/refresh worker. No download-client API, grab,
-  download, or import pipeline exists.
+- Automatic dispatch exists only via the M6 controlled live scheduler path
+  (mode `live` plus a valid unexpired arm - see M6 above); every deployment
+  still defaults to `off` and unarmed. The M2 manual endpoint remains
+  available and independent of scheduler mode. Reconciliation runs both on
+  explicit operator request (M3) and on a bounded automatic cooldown (M5);
+  no path here or in M6 ever retries a sent search. No download-client API,
+  grab, download, or import pipeline exists.
 - Managearr has no authentication/authorization yet; protect the service at the
   network/reverse-proxy layer.
 - A process crash after Sonarr accepts a command but before local finalization

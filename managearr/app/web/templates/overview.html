@@ -38,6 +38,16 @@
   <p><strong>Next due:</strong> <span id="ov-next-due">-</span></p>
   <p><strong>Latest cycle:</strong> <span id="ov-latest-cycle">none</span></p>
 </section>
+<section class="card danger-zone" id="ov-live-card">
+  <h2>Live dispatch</h2>
+  <p class="metric" id="ov-live-banner">LIVE: OFF</p>
+  <p id="ov-live-detail">-</p>
+  <p class="muted" id="ov-live-allowance">-</p>
+  <p class="muted" id="ov-live-last-dispatch">Last dispatch: none</p>
+  <div class="form-actions">
+    <button type="button" id="ov-live-emergency-stop" class="button-danger">Emergency stop</button>
+  </div>
+</section>
 <section class="card">
   <h2>Read-only refresh automation</h2>
   <p class="simulation-notice"><strong>Read-only refresh automation never sends Sonarr commands.</strong> It only runs scans and reconciliation reads.</p>
@@ -70,7 +80,34 @@ async function loadOverview() {
   setText('ov-refresh-scan', scan ? `#${scan.id} ${scan.state} (${scan.library_name})` : 'none');
   setText('ov-refresh-reconcile', reconcile ? `#${reconcile.id} ${reconcile.state}` : 'none');
   setText('ov-refresh-active', refresh.active_runs.length);
+
+  // This only ever reads status - a page load/reload can never arm or
+  // enable live dispatch by itself.
+  const live = (await api('/api/v1/scheduler/live/status')).live;
+  let banner = 'LIVE: OFF';
+  if (live.mode === 'live') {
+    if (live.control.emergency_stopped_at) banner = 'LIVE: STOPPED';
+    else if (live.control.armed) banner = 'LIVE: ARMED';
+    else banner = 'LIVE: UNARMED / EXPIRED';
+  }
+  setText('ov-live-banner', banner);
+  setText('ov-live-detail', live.dispatch_allowed ? 'Live dispatch is currently allowed to run.' : live.blocked_reasons.join('; '));
+  setText('ov-live-allowance', `Up to ${live.control.max_dispatches_per_cycle} dispatch(es) per cycle, ${live.pending_live_cycles} live cycle(s) pending.`);
+  setText(
+    'ov-live-last-dispatch',
+    live.control.last_dispatch_at ? `Last dispatch: ${live.control.last_dispatch_at} - ${live.control.last_dispatch_summary}` : 'Last dispatch: none'
+  );
 }
 loadOverview().catch(err => toast('Failed to load overview: ' + err.message));
+
+document.getElementById('ov-live-emergency-stop').addEventListener('click', async () => {
+  try {
+    await api('/api/v1/scheduler/live/emergency-stop', {
+      method: 'POST', body: { reason: 'operator emergency stop from overview' },
+    });
+    toast('Emergency stop applied; live dispatch is unarmed');
+    await loadOverview();
+  } catch (err) { toast('Emergency stop failed: ' + err.message); }
+});
 </script>
 {% endblock %}

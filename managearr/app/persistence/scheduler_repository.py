@@ -230,17 +230,17 @@ class SchedulerRepository:
             settings = conn.execute(
                 "SELECT * FROM scheduler_settings WHERE id = 1 FOR UPDATE"
             ).fetchone()
-            if (settings["mode"] != "simulate" or settings["next_due_at"] is None
+            if (settings["mode"] not in ("simulate", "live") or settings["next_due_at"] is None
                     or settings["next_due_at"] > conn.execute("SELECT now() AS now").fetchone()["now"]):
                 return None
             row = conn.execute(
                 """
                 INSERT INTO scheduler_cycle_runs (
                     trigger, state, mode_snapshot, policy_snapshot, random_seed
-                ) VALUES ('scheduled', 'queued', 'simulate', %s, %s)
+                ) VALUES ('scheduled', 'queued', %s, %s, %s)
                 RETURNING id
                 """,
-                (Jsonb(_policy_snapshot(policy)), SystemRandom().randrange(1, 2**63 - 1)),
+                (settings["mode"], Jsonb(_policy_snapshot(policy)), SystemRandom().randrange(1, 2**63 - 1)),
             ).fetchone()
             conn.execute(
                 """
