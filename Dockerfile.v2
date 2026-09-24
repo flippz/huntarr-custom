@@ -15,4 +15,7 @@ ENV HUNTARR_V2_DB_PATH=/data-v2/huntarr_v2.db
 
 EXPOSE 9706
 
-CMD ["python", "run.py"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9706/health', timeout=3)"]
+
+CMD ["waitress-serve", "--host=0.0.0.0", "--port=9706", "run:app"]
