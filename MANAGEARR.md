@@ -3,7 +3,14 @@
 This document describes the `managearr/` application: a standalone rewrite
 that lives alongside the legacy Huntarr v1 app (`main.py`, `src/`) without
 touching it. v1 continues to run exactly as before - Managearr has its own
-dependencies, its own database, its own Docker image, and its own port.
+dependencies, its own database, its own Docker image(s), and its own port.
+
+**PostgreSQL is the only runtime database.** Earlier previews used a local
+SQLite file; this milestone replaces that entirely with PostgreSQL 18,
+run as a second Compose service with file-based credentials, deterministic
+schema migrations, and a one-time SQLite importer for anyone carrying data
+forward from a prior preview - see
+[PostgreSQL migration](#postgresql-migration) below.
 
 **Current milestone (M1): read-only Sonarr scan preview.** On top of the
 foundation milestone (library/policy/activity CRUD), this milestone adds a
@@ -30,16 +37,21 @@ managearr/
     adapters/       boundary transforms + external integrations
       redaction.py       strips api_key before any HTTP response
       sonarr_client.py   read-only Sonarr API v3 client (requests, timeouts)
-    persistence/    SQLite schema + repositories (stdlib sqlite3, no ORM)
-      database.py, library_repository.py, policy_repository.py,
+    persistence/    PostgreSQL schema/migrations + repositories (psycopg 3, no ORM)
+      database.py     connection pool (psycopg_pool), startup retry/backoff, health check
+      migrations.py   deterministic, transactional schema migrations + schema_migrations table
+      library_repository.py, policy_repository.py,
       activity_repository.py, scan_candidate_repository.py
     api/            JSON API blueprint, mounted at /api/v1
     web/            server-rendered UI shell (Jinja2 + vanilla JS/CSS, no build step)
-  config.py         env-driven runtime config
+  tools/
+    import_sqlite.py  one-time, explicit SQLite -> PostgreSQL importer (see below)
+  config.py         env-driven runtime config (incl. file-based DB credentials)
   run.py            entry point (Flask dev server)
-  requirements.txt  runtime deps (Flask + CVE-pinned Werkzeug/Jinja2 + requests)
+  requirements.txt  runtime deps (Flask + CVE-pinned Werkzeug/Jinja2 + requests + psycopg[binary,pool])
   requirements-dev.txt  adds pytest
-  tests/            pytest suite (unit + Flask test-client integration, all mocked)
+  tests/            pytest suite (unit + Flask test-client integration + real-PostgreSQL
+                     integration tests; only Sonarr network calls are mocked)
 ```
 
 Data flows one direction: `web`/`api` call into `services`, `services` call
@@ -51,7 +63,7 @@ Nothing in `domain` or `persistence` knows about Flask.
 
 - **ArrLibrary** - a configured connection to one of six *Arr ecosystems:
   `sonarr`, `radarr`, `lidarr`, `readarr`, `whisparr`, `eros`. Fields:
-  `name`, `type`, `url`, `api_key`, `enabled`. Persisted in SQLite via
+  `name`, `type`, `url`, `api_key`, `enabled`. Persisted in PostgreSQL via
   `LibraryRepository`, full CRUD exposed at `/api/v1/libraries`.
   **`api_key` is never present in list/detail API responses** - the
   `redact_library`/`redact_libraries` adapter strips it and exposes a
@@ -142,6 +154,14 @@ construct a `SonarrClient` and call it. Two entry points:
   failures are recorded on the job, not surfaced as a second class of API
   error.
 
+  **No long-lived DB transaction ever wraps a Sonarr call.** Each step
+  above that touches PostgreSQL (job creation, `create_many`,
+  `update_state`) opens and closes its own short transaction via
+  `Database.connect()`; the Sonarr HTTP calls in between (`get_series`,
+  `get_episodes`) always run with no DB transaction open. A slow or
+  hanging Sonarr instance therefore never holds a PostgreSQL connection
+  or lock.
+
 #### Idempotent snapshots
 
 Every call to `run_scan` creates a brand-new `activity_jobs` row and a
@@ -154,12 +174,49 @@ in `tests/test_sonarr_scan_service.py`.
 
 ### Persistence
 
-Plain `sqlite3` (stdlib), one short-lived connection per operation, schema
-created idempotently via `CREATE TABLE IF NOT EXISTS` on startup
-(`Database.init_schema`). `activity_jobs` gained `job_type` and
-`candidate_count` columns (both `NOT NULL DEFAULT`, so old-shaped inserts
-still work); a new `scan_candidates` table was added, foreign-keyed to
-`activity_jobs(id)` (cascade delete) and `arr_libraries(id)` (set null).
+PostgreSQL via `psycopg` 3 with a small connection pool (`psycopg_pool`),
+dict-row results, and one pooled connection checked out per repository
+operation - the same short-lived-connection-per-operation shape the prior
+SQLite implementation used, so no repository ever holds a transaction open
+across an external network call (see
+[Scan orchestration](#scan-orchestration-appservicessonarr_scan_servicepy)
+below for why that matters).
+
+Schema is applied by `app/persistence/migrations.py`: a fixed, ordered list
+of `Migration(version, name, sql)` entries, each applied inside its own
+transaction and recorded in a `schema_migrations` table. `run_migrations()`
+only applies versions it hasn't seen yet, so calling it on every app/tool
+startup (as `create_app()` and `tools/import_sqlite.py` both do) is always
+a safe no-op once the schema is current. All four tables
+(`arr_libraries`, `automation_policy`, `activity_jobs`, `scan_candidates`)
+keep the same columns, foreign keys, and delete behavior as the previous
+SQLite schema (`activity_jobs.library_id` → `SET NULL`,
+`scan_candidates.job_id` → `CASCADE`, `scan_candidates.library_id` →
+`SET NULL`); `created_at`/`updated_at` are `TIMESTAMPTZ` so every stored
+instant is unambiguously UTC, and indexes exist on the columns the app
+actually filters/sorts by (`state`, `library_id`, `updated_at`,
+`job_id`, `LOWER(name)`).
+
+**Credentials** are never hardcoded or defaulted to a real password:
+`Database` is always constructed from `MANAGEARR_DB_*` env vars, and the
+password specifically comes from `config.read_secret()`, which prefers
+`MANAGEARR_DB_PASSWORD_FILE` (a file-based secret - see
+[PostgreSQL migration](#postgresql-migration)) over the plain
+`MANAGEARR_DB_PASSWORD` env var.
+
+**Startup** calls `Database.wait_ready(timeout_seconds)`, which opens the
+connection pool with a bounded wait (`psycopg_pool`'s own internal retry
+loop, capped by `MANAGEARR_DB_STARTUP_TIMEOUT_SECONDS`, default 30s) and
+raises `DatabaseUnavailableError` - a static, safe message that never
+includes the configured host/port/user/password - if PostgreSQL never
+becomes reachable in time.
+
+**`/health` and `/api/v1/status`** report PostgreSQL connectivity
+(`database` / `database.connected`) and the applied `schema_version`,
+and nothing else about the connection - never the host, user, or
+password (verified by
+`test_health_reports_schema_version_without_connection_details` and
+`test_status_reports_schema_version_without_connection_details`).
 
 ### API surface
 
@@ -213,31 +270,55 @@ Automated hunting is not active yet."*
 
 ### Locally
 
+Requires a reachable PostgreSQL instance (there is no embedded/file
+database anymore):
+
 ```bash
 cd managearr
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements-dev.txt   # includes runtime deps + pytest
-./.venv/bin/python run.py                          # serves on :9706
+MANAGEARR_DB_HOST=localhost MANAGEARR_DB_PASSWORD=devpassword ./.venv/bin/python run.py   # serves on :9706
 ```
 
 Config is entirely environment-driven (see `config.py`):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MANAGEARR_DB_PATH` | `data-managearr/managearr.db` | SQLite file path |
 | `MANAGEARR_HOST` | `0.0.0.0` | Bind host |
 | `MANAGEARR_PORT` | `9706` | Bind port |
 | `MANAGEARR_DEBUG` | `false` | Flask debug mode |
 | `MANAGEARR_SONARR_TIMEOUT_SECONDS` | `10` | Per-request timeout for Sonarr calls |
+| `MANAGEARR_DB_HOST` | `postgres` | PostgreSQL host |
+| `MANAGEARR_DB_PORT` | `5432` | PostgreSQL port |
+| `MANAGEARR_DB_NAME` | `managearr` | PostgreSQL database name |
+| `MANAGEARR_DB_USER` | `managearr` | PostgreSQL user |
+| `MANAGEARR_DB_PASSWORD_FILE` | _(unset)_ | Path to a file containing the DB password - **preferred**, see [PostgreSQL migration](#postgresql-migration) |
+| `MANAGEARR_DB_PASSWORD` | _(unset)_ | Plain-env-var DB password fallback, only used when `*_FILE` is unset - local dev only |
+| `MANAGEARR_DB_SSLMODE` | `prefer` | libpq `sslmode` |
+| `MANAGEARR_DB_POOL_MIN_SIZE` / `MANAGEARR_DB_POOL_MAX_SIZE` | `1` / `5` | Connection pool sizing |
+| `MANAGEARR_DB_CONNECT_TIMEOUT_SECONDS` | `5` | Per-connection-attempt timeout |
+| `MANAGEARR_DB_STARTUP_TIMEOUT_SECONDS` | `30` | Bounded total startup retry/backoff window - see `Database.wait_ready()` |
 
 ### Tests
 
+Most of the suite is real integration testing against PostgreSQL (not
+mocks) - only the Sonarr HTTP boundary is ever faked. Point
+`MANAGEARR_TEST_DB_*` at a disposable database (defaults assume
+`127.0.0.1:5432/managearr_test`, user `managearr_test`); the suite
+truncates its tables before every test, so use a database dedicated to
+testing:
+
 ```bash
 cd managearr
-./.venv/bin/python -m pytest tests/ -v
+./.venv/bin/pip install -r requirements-dev.txt
+MANAGEARR_TEST_DB_PASSWORD=<your test db password> ./.venv/bin/python -m pytest tests/ -v
 ```
 
-**93 tests, all passing.** Breakdown:
+If no PostgreSQL test database is reachable, every DB-backed test is
+skipped with a clear reason (pure-logic tests - `test_scan_candidate_rules.py`,
+parts of `test_policy.py`/`test_credential_loading.py` - still run).
+
+**123 tests.** Breakdown:
 - 40 carried over from the foundation milestone (health/status, redaction,
   policy, library CRUD, persistence), migrated to `/api/v1` and the
   `managearr` naming with no behavior change.
@@ -260,38 +341,109 @@ cd managearr
   Flask test client and `/api/v1/*` HTTP surface, including a raw-body
   substring check that a timeout error response never contains the
   library's URL or API key.
+- `test_migrations.py` (6 tests) - `run_migrations` idempotence,
+  `schema_migrations` bookkeeping, expected columns/indexes, and FK
+  `ON DELETE` behavior (`SET NULL` / `CASCADE`) read back from
+  PostgreSQL's own catalogs (not assumed).
+- `test_db_startup.py` (5 tests) - bounded startup retry/backoff against
+  an unreachable host (fails well under the configured timeout, never
+  hangs) and a static, safe `DatabaseUnavailableError` message that
+  never contains the configured host/user/password.
+- `test_credential_loading.py` (7 tests) - `config.read_secret()`:
+  file-based secret precedence over a plain env var, whitespace
+  stripping, missing-file behavior, and the no-secret-configured case.
+- `test_sqlite_import.py` (11 tests) - `tools/import_sqlite.py` against a
+  real PostgreSQL target: dry-run counts with no writes, no API key ever
+  printed (dry-run or real), ID/timestamp preservation, sequence reset
+  after import, refusal on a non-empty target, `--allow-nonempty`
+  permitting it, idempotent refusal on repeat runs, transactional
+  rollback on a forced re-import's primary-key collision, and importing
+  a pre-M1 legacy schema missing `job_type`/`candidate_count`.
 
 ### Docker
 
 ```bash
+./scripts/generate-managearr-db-password.sh   # one-time: writes secrets/managearr_db_password.txt
 docker compose -f compose.managearr.yml up --build
 ```
 
 This builds `Dockerfile.managearr` (context: repo root, copies only
-`managearr/`), tags the image `managearr:preview`, runs container
-`managearr`, and binds host port **9706** (distinct from v1's 9705). The
-SQLite database lives at `./data-managearr/managearr.db` on the host
-(distinct from v1's `./data/config`) - **Managearr never mounts or reads
-v1's `./data` directory or database.**
+`managearr/`), tags the image `managearr:preview`, and starts two
+services: `postgres` (PostgreSQL 18, named volume, no published host
+port, healthcheck-gated) and `managearr` (binds host port **9706**,
+distinct from v1's 9705, waits for `postgres`'s healthcheck via
+`depends_on: condition: service_healthy`). Both read the same
+password from `secrets/managearr_db_password.txt`
+(`POSTGRES_PASSWORD_FILE` / `MANAGEARR_DB_PASSWORD_FILE`) - see
+[PostgreSQL migration](#postgresql-migration). **Managearr never mounts
+or reads v1's `./data` directory or database.**
 
 > **Docker was not available in this environment** (no `docker` binary on
 > PATH), so the image build and container smoke test above were not
-> executed here, same as the foundation milestone. The commands are exact
-> and ready to run; local test coverage (`pytest`, 93 tests) and manual
-> `curl`/browser smoke tests against the Flask dev server (see below) were
-> used instead to verify behavior.
+> executed here, same as prior milestones. The commands are exact and
+> ready to run. In their place: (1) local test coverage (`pytest`, 123
+> tests) against a real PostgreSQL 17 instance installed directly in this
+> environment (`apt-get install postgresql`) - the same SQL, schema,
+> transaction, and pooling code paths the container will run, just not
+> inside a container, and against major version 17 rather than the
+> pinned `postgres:18.6-alpine` image; and (2) manual `curl`/browser
+> smoke tests against the Flask dev server pointed at that same
+> PostgreSQL instance (see below). Compose YAML structure (service
+> names, healthchecks, `depends_on` condition, secrets, volumes) was
+> reviewed but not exercised end-to-end - verify with a real
+> `docker compose up --build` in an environment with Docker before
+> deploying.
 
 Manual smoke test performed against the dev server (not the container),
-confirming: `/health` and `/api/v1/status` return 200; creating a `sonarr`
-library and calling `/test` and `/scan` against an intentionally
-unreachable address returns HTTP 502 with a safe `{"errors": [...]}` body
-containing neither the configured URL nor API key; the resulting
-`sonarr_scan` job is visible (state `failed`) via `/api/v1/activity` and
-its (empty) candidate list via `/api/v1/activity/<id>/candidates`; all four
-UI pages and both static assets (`/static/style.css`, `/static/app.js`)
-return 200.
+pointed at a real local PostgreSQL instance, confirming: `/health` and
+`/api/v1/status` return 200 with `schema_version: 1` and no connection
+details in the body; creating a `sonarr` library and calling `/test` and
+`/scan` against an intentionally unreachable address returns HTTP 502
+with a safe `{"errors": [...]}` body containing neither the configured
+URL nor API key; the resulting `sonarr_scan` job is visible (state
+`failed`) via `/api/v1/activity` and its (empty) candidate list via
+`/api/v1/activity/<id>/candidates`; all four UI pages and both static
+assets (`/static/style.css`, `/static/app.js`) return 200; `tools/import_sqlite.py`
+was run end-to-end (dry-run, real import, refusal on non-empty target,
+forced re-import rollback on collision) against the same PostgreSQL
+instance - see `tests/test_sqlite_import.py`.
 
-## Current milestone (M1)
+## Current milestone: PostgreSQL migration
+
+Replaces the SQLite persistence layer used through M1 with PostgreSQL,
+end to end:
+
+- `psycopg` 3 + `psycopg_pool` connection pool replace `sqlite3`; every
+  repository query is parameterized, uses dict rows, and runs inside a
+  short transaction (commit on success / rollback on error) via
+  `Database.connect()` - see [Persistence](#persistence).
+- Deterministic, transactional schema migrations
+  (`app/persistence/migrations.py`) replace the previous ad-hoc
+  `CREATE TABLE IF NOT EXISTS` + manual `ALTER TABLE` dance.
+- `compose.managearr.yml` is now a two-service stack (`managearr` +
+  `postgres`) with file-based credentials, a healthcheck-gated
+  `depends_on`, a named PostgreSQL volume with no published host port,
+  and healthchecks on both services - see [Docker](#docker).
+- Bounded startup retry/backoff (`Database.wait_ready`) and a safe,
+  static `DatabaseUnavailableError` if PostgreSQL never becomes
+  reachable in time; `/health`/`/api/v1/status` report DB connectivity
+  and schema version without ever revealing host/user/password.
+- A new, explicit, idempotent one-time importer
+  (`tools/import_sqlite.py`) replaces the old manual `sqlite3 ALTER
+  TABLE` carry-forward steps - see
+  [One-time SQLite → PostgreSQL import](#one-time-sqlite--postgresql-import).
+- API behavior, IDs, constraints, and cascade/set-null/redaction
+  behavior are unchanged - the pre-existing behavioral suite passes
+  against PostgreSQL with no logic changes (only its two SQLite-mechanics
+  tests were swapped for equivalent PostgreSQL FK-behavior tests, and two
+  schema-version assertions were added to the health/status tests), plus
+  29 new tests in four new files (`test_migrations.py`,
+  `test_db_startup.py`, `test_credential_loading.py`,
+  `test_sqlite_import.py`) covering migrations, startup failure handling,
+  credential-file loading, and the importer - 123 tests total, see
+  [Tests](#tests).
+
+## Previous milestone (M1)
 
 Adds to the foundation milestone:
 - Read-only Sonarr v3 adapter (`SonarrClient`) - connection test, series
@@ -336,66 +488,124 @@ Adds to the foundation milestone:
   silently skipped (noted in the job's `details`) rather than failing the
   whole scan - by design, but it means a scan can under-report candidates
   for a library with one broken series.
-- No migration tooling beyond idempotent `CREATE TABLE IF NOT EXISTS`.
 - Docker image build/run was not exercised in this environment (no Docker
-  available); commands above are ready but unverified end-to-end.
+  available); commands above are ready but unverified end-to-end - see
+  the [Docker](#docker) section.
+- The one-time SQLite importer (`tools/import_sqlite.py`) must be run
+  explicitly - nothing starts it automatically, and it refuses to touch
+  a non-empty PostgreSQL target unless told to.
 
 ## Migration safety
 
 - `managearr/` is fully standalone: separate dependencies
-  (`managearr/requirements.txt`), separate database (`data-managearr/`,
-  never `data/`), separate Docker image (`managearr:preview` via
-  `Dockerfile.managearr`/`compose.managearr.yml`), separate port (9706 vs
-  v1's 9705), separate container/service name (`managearr`).
-- No file under `main.py` or `src/` was modified for this or the prior
+  (`managearr/requirements.txt`), separate database (PostgreSQL, its own
+  named Compose volume, never v1's `data/`), separate Docker image(s)
+  (`managearr:preview` via `Dockerfile.managearr`/`compose.managearr.yml`),
+  separate port (9706 vs v1's 9705), separate container/service names
+  (`managearr`, `managearr-postgres`).
+- No file under `main.py` or `src/` was modified for this or any prior
   milestone.
 - Managearr never opens, reads, or writes v1's `./data/config` directory
   or `huntarr.db` file - there is no shared state between v1 and
   Managearr, by design, so both can run side by side safely during
   evaluation.
-- **No automatic access to the v1 Huntarr database exists anywhere in this
-  codebase** - the only way v1 data ever reaches Managearr is the manual,
-  one-time copy step below.
+- **No automatic access to the v1 Huntarr database, or to any prior
+  Managearr SQLite preview database, exists anywhere in the running
+  application** - the only way old data ever reaches the new PostgreSQL
+  database is the explicit, one-time importer below.
 
-### Carrying a tested preview library forward
+## PostgreSQL migration
 
-If you've been running the (pre-Sonarr-scan) foundation preview and want
-to keep the one Sonarr library you configured there instead of re-typing
-it, copy the SQLite file forward **once**, manually, then run one schema
-fixup before starting the new version. `init_schema()` uses
-`CREATE TABLE IF NOT EXISTS`, which does **not** add new columns to a
-table that already exists - `arr_libraries` and `automation_policy` are
-unchanged and open cleanly as-is, but the old `activity_jobs` table
-predates the `job_type`/`candidate_count` columns this milestone adds, so
-it needs one manual `ALTER TABLE` (verified against a real old-shaped
-database while writing this milestone - starting the app against a
-copied-forward file without this step fails with
-`sqlite3.OperationalError: table activity_jobs has no column named job_type`
-the first time a scan runs):
+### Credentials
+
+PostgreSQL is a private, no-public-port service on the Compose network;
+Managearr reaches it only as `postgres:5432`. Neither service ever gets
+a hardcoded or default password - both read the same generated secret
+file via `POSTGRES_PASSWORD_FILE` / `MANAGEARR_DB_PASSWORD_FILE`:
 
 ```bash
-# Stop any running Managearr container/process first.
-cp ./data-v2/huntarr_v2.db ./data-managearr/managearr.db   # one-time copy from the old preview
-
-# activity_jobs was never written to in the foundation milestone (no seed
-# data, no write path) - confirm it's empty, then add the two new columns:
-sqlite3 ./data-managearr/managearr.db "SELECT COUNT(*) FROM activity_jobs;"   # expect 0
-sqlite3 ./data-managearr/managearr.db "ALTER TABLE activity_jobs ADD COLUMN job_type TEXT NOT NULL DEFAULT 'legacy';"
-sqlite3 ./data-managearr/managearr.db "ALTER TABLE activity_jobs ADD COLUMN candidate_count INTEGER NOT NULL DEFAULT 0;"
-
-# Now start the new version - init_schema() will add the new
-# scan_candidates table on first run (CREATE TABLE IF NOT EXISTS):
-cd managearr && ./.venv/bin/python run.py
-# or: docker compose -f compose.managearr.yml up --build
+./scripts/generate-managearr-db-password.sh   # writes secrets/managearr_db_password.txt, never prints it
 ```
 
-If the `SELECT COUNT(*)` above returns anything other than `0` (it
-shouldn't, by design), stop and inspect those rows before proceeding - the
-`ALTER TABLE` statements themselves are safe either way (they only add
-columns with defaults), but this milestone's scan feature assumes
-`activity_jobs` starts from a known-empty state for the `sonarr_scan`
-job_type.
+The file is `chmod 600`, gitignored (`secrets/*` except `secrets/README.md`
+- see `.gitignore`), and mounted read-only into both containers by
+Compose's native `secrets:` block. See `secrets/README.md` for details
+and for what to do if the file is lost after the PostgreSQL volume has
+already initialized.
 
-This is a **one-time, manual, explicit copy plus a two-line schema
-fixup** - nothing in the application ever reaches into a v1 or
-prior-preview database path on its own.
+### Schema migrations
+
+`app/persistence/migrations.py` applies a fixed, ordered list of
+transactional migrations on every startup (app, and
+`tools/import_sqlite.py`), tracked in a `schema_migrations` table.
+Re-running is always a safe no-op once the schema is current - see
+[Persistence](#persistence) above.
+
+### One-time SQLite → PostgreSQL import
+
+If you have data in a prior Managearr SQLite preview database
+(`./data-managearr/managearr.db`) that you want to carry forward instead
+of re-configuring libraries by hand, use `tools/import_sqlite.py`. It:
+
+- reads the SQLite file **read-only** (opened with SQLite's own
+  `mode=ro` URI flag - a write attempt against the source fails
+  immediately, see `test_read_source_never_writes_to_sqlite_file`);
+- **refuses to write into a non-empty PostgreSQL target** unless you pass
+  `--allow-nonempty` - safe by default against accidental double-imports;
+- preserves every row's original `id` and timestamps exactly, including
+  `arr_libraries`, `automation_policy`, `activity_jobs`, and
+  `scan_candidates`, then resets PostgreSQL's identity sequences so the
+  next app-created row continues after the highest imported id (never
+  collides with imported data);
+- runs the entire import as **one PostgreSQL transaction** - any error
+  (e.g. an id collision on a forced re-import) rolls back everything the
+  run wrote, leaving the target exactly as it was before
+  (`test_forced_reimport_id_collision_rolls_back_transactionally`);
+- supports `--dry-run`, which reads the source and reports row counts
+  per table without writing anything to PostgreSQL;
+- **never prints an API key**, in `--dry-run` or normal mode - only row
+  counts and non-secret identifiers are logged
+  (`test_dry_run_never_prints_api_key`, `test_real_import_never_prints_api_key`);
+- transparently defaults `job_type`/`candidate_count` for a pre-M1
+  source database that predates those columns, and tolerates a source
+  with no `scan_candidates` table at all.
+
+**Usage** (locally):
+
+```bash
+cd managearr
+./.venv/bin/python tools/import_sqlite.py --sqlite-path ../data-managearr/managearr.db --dry-run
+./.venv/bin/python tools/import_sqlite.py --sqlite-path ../data-managearr/managearr.db
+```
+
+**Usage** (as a one-shot Compose command, `tools` profile - see
+`compose.managearr.yml`):
+
+```bash
+docker compose -f compose.managearr.yml --profile tools run --rm \
+  managearr-import --sqlite-path /legacy/managearr.db --dry-run
+docker compose -f compose.managearr.yml --profile tools run --rm \
+  managearr-import --sqlite-path /legacy/managearr.db
+```
+
+(`managearr-import` mounts `./data-managearr` read-only at `/legacy` -
+put the SQLite file there, or adjust the volume mount.)
+
+**Rollback** (undoing a completed import):
+
+1. Preferred: restore the `managearr-postgres-data` Compose volume from a
+   snapshot/backup taken before the import.
+2. Manual (irreversible - only if certain no writes have happened in
+   PostgreSQL since the import completed): connect to the target
+   database and run
+   ```sql
+   TRUNCATE arr_libraries, automation_policy, activity_jobs,
+       scan_candidates RESTART IDENTITY CASCADE;
+   ```
+   Schema migrations never need to be rolled back for this - the
+   `schema_migrations` table is untouched by the importer, and
+   re-running migrations on next startup is always a safe no-op.
+
+A **failed** run never needs rollback at all: because the import is one
+transaction, PostgreSQL has already discarded every row a failed run
+attempted to write by the time the process exits.

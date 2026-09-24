@@ -1,15 +1,84 @@
 services:
+  postgres:
+    image: postgres:18.6-alpine
+    container_name: managearr-postgres
+    environment:
+      - TZ=${TZ:-Europe/Oslo}
+      - POSTGRES_DB=managearr
+      - POSTGRES_USER=managearr
+      - POSTGRES_PASSWORD_FILE=/run/secrets/managearr_db_password
+    secrets:
+      - managearr_db_password
+    volumes:
+      - managearr-postgres-data:/var/lib/postgresql/data
+    # No host port published - PostgreSQL is only reachable from other
+    # containers on this Compose stack's private network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U managearr -d managearr"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
   managearr:
     build:
       context: .
       dockerfile: Dockerfile.managearr
     image: managearr:preview
     container_name: managearr
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "9706:9706"
-    volumes:
-      - ./data-managearr:/data-managearr   # managearr SQLite database only - never mount v1's ./data
     environment:
       - TZ=${TZ:-Europe/Oslo}
-      - MANAGEARR_DB_PATH=/data-managearr/managearr.db
+      - MANAGEARR_DB_HOST=postgres
+      - MANAGEARR_DB_PORT=5432
+      - MANAGEARR_DB_NAME=managearr
+      - MANAGEARR_DB_USER=managearr
+      - MANAGEARR_DB_PASSWORD_FILE=/run/secrets/managearr_db_password
+      - MANAGEARR_DB_SSLMODE=disable
+    secrets:
+      - managearr_db_password
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9706/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     restart: unless-stopped
+
+  # One-shot SQLite -> PostgreSQL importer. Not started by `up`; run
+  # explicitly with the `tools` profile, e.g.:
+  #   docker compose -f compose.managearr.yml --profile tools run --rm \
+  #     managearr-import --sqlite-path /legacy/managearr.db --dry-run
+  managearr-import:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile.managearr
+    image: managearr:preview
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data-managearr:/legacy:ro   # mount the directory holding the legacy SQLite file, read-only
+    environment:
+      - MANAGEARR_DB_HOST=postgres
+      - MANAGEARR_DB_PORT=5432
+      - MANAGEARR_DB_NAME=managearr
+      - MANAGEARR_DB_USER=managearr
+      - MANAGEARR_DB_PASSWORD_FILE=/run/secrets/managearr_db_password
+      - MANAGEARR_DB_SSLMODE=disable
+    secrets:
+      - managearr_db_password
+    entrypoint: ["python", "tools/import_sqlite.py"]
+
+volumes:
+  managearr-postgres-data:
+
+secrets:
+  managearr_db_password:
+    file: ./secrets/managearr_db_password.txt

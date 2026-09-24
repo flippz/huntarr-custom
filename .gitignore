@@ -250,6 +250,11 @@ huntarr.db
 
 # Managearr v1 local development data
 data-managearr/
+
+# Managearr PostgreSQL secrets - generated locally by
+# scripts/generate-managearr-db-password.sh, never committed.
+secrets/*
+!secrets/README.md
 /config/
 /logs/
 /settings/

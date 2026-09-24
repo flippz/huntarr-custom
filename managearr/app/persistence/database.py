@@ -1,121 +1,89 @@
-"""SQLite connection management and schema bootstrap for Managearr v1.
+"""PostgreSQL connection management for Managearr v1.
 
-Deliberately minimal: no ORM, a short-lived connection per operation
-(SQLite handles this fine at the scale this preview targets), and
-plain ``CREATE TABLE IF NOT EXISTS`` migrations.
+Uses psycopg 3 with a small connection pool (``psycopg_pool``). Every
+``connect()`` call checks out one pooled connection, opens a real
+transaction for the block (psycopg connections default to
+``autocommit=False``), and commits on clean exit / rolls back on
+exception - the same short-lived-connection-per-operation shape the
+previous SQLite implementation used.
+
+Callers must never hold a connection open (i.e. stay inside one
+``with db.connect()`` block) across an external network call such as a
+Sonarr request - see ``app/services/sonarr_scan_service.py``, which
+always closes its DB transaction before calling out to Sonarr and opens
+a fresh one afterward to persist results.
 """
-import os
-import sqlite3
 from contextlib import contextmanager
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS arr_libraries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    type TEXT NOT NULL,
-    url TEXT NOT NULL,
-    api_key TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool, PoolTimeout
 
-CREATE TABLE IF NOT EXISTS automation_policy (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    missing_enabled INTEGER NOT NULL,
-    upgrades_enabled INTEGER NOT NULL,
-    cycle_interval_minutes INTEGER NOT NULL,
-    hourly_api_cap INTEGER NOT NULL,
-    successful_grab_target INTEGER NOT NULL,
-    dispatch_interval_seconds INTEGER NOT NULL,
-    queue_target INTEGER NOT NULL,
-    cooldown_minutes INTEGER NOT NULL,
-    search_order TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS activity_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    library_id INTEGER,
-    library_name TEXT NOT NULL,
-    job_type TEXT NOT NULL DEFAULT 'legacy',
-    state TEXT NOT NULL,
-    title TEXT NOT NULL,
-    details TEXT NOT NULL DEFAULT '',
-    candidate_count INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (library_id) REFERENCES arr_libraries(id) ON DELETE SET NULL
-);
-
--- One row per (series, episode) candidate identified by a read-only
--- Sonarr scan. Rows are an immutable snapshot tied to the job that
--- created them - a repeat scan creates a new job_id and new rows
--- rather than mutating a previous scan's rows.
-CREATE TABLE IF NOT EXISTS scan_candidates (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL,
-    library_id INTEGER,
-    series_id INTEGER NOT NULL,
-    series_title TEXT NOT NULL,
-    episode_id INTEGER NOT NULL,
-    season_number INTEGER NOT NULL,
-    episode_number INTEGER NOT NULL,
-    air_date TEXT,
-    reason TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY (job_id) REFERENCES activity_jobs(id) ON DELETE CASCADE,
-    FOREIGN KEY (library_id) REFERENCES arr_libraries(id) ON DELETE SET NULL
-);
-"""
+class DatabaseUnavailableError(RuntimeError):
+    """Raised when PostgreSQL could not be reached within the configured
+    startup timeout. The message is always static and safe - it never
+    includes the configured host, port, user, or password."""
 
 
 class Database:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        directory = os.path.dirname(os.path.abspath(db_path))
-        if directory:
-            os.makedirs(directory, exist_ok=True)
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        dbname: str,
+        user: str,
+        password: str | None,
+        sslmode: str = "prefer",
+        min_size: int = 1,
+        max_size: int = 5,
+        connect_timeout: int = 5,
+    ):
+        conninfo = psycopg.conninfo.make_conninfo(
+            host=host,
+            port=port,
+            dbname=dbname,
+            user=user,
+            password=password or "",
+            sslmode=sslmode,
+            connect_timeout=connect_timeout,
+        )
+        # open=False: the pool is constructed but makes no connection
+        # attempt until wait_ready() (or first use) - lets startup retry
+        # be explicit and bounded rather than failing at import time.
+        self._pool = ConnectionPool(
+            conninfo,
+            min_size=min_size,
+            max_size=max_size,
+            open=False,
+            kwargs={"row_factory": dict_row, "autocommit": False},
+        )
+
+    def wait_ready(self, timeout_seconds: int) -> None:
+        """Block until at least one pooled connection is established, or
+        raise ``DatabaseUnavailableError`` once ``timeout_seconds`` has
+        elapsed. The pool retries with its own internal backoff while
+        waiting - this just bounds the total wait."""
+        try:
+            self._pool.open(wait=True, timeout=timeout_seconds)
+        except PoolTimeout as exc:
+            raise DatabaseUnavailableError(
+                "Could not connect to the database within the configured startup timeout"
+            ) from exc
+
+    def close(self) -> None:
+        self._pool.close()
 
     @contextmanager
     def connect(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        try:
+        with self._pool.connection() as conn:
             yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def init_schema(self) -> None:
-        with self.connect() as conn:
-            conn.executescript(SCHEMA)
-            # CREATE TABLE IF NOT EXISTS does not add columns to databases
-            # created by the Huntarr v2 preview. Apply the two additive,
-            # backward-compatible columns explicitly before repositories run.
-            activity_columns = {
-                row["name"]
-                for row in conn.execute("PRAGMA table_info(activity_jobs)").fetchall()
-            }
-            if "job_type" not in activity_columns:
-                conn.execute(
-                    "ALTER TABLE activity_jobs "
-                    "ADD COLUMN job_type TEXT NOT NULL DEFAULT 'legacy'"
-                )
-            if "candidate_count" not in activity_columns:
-                conn.execute(
-                    "ALTER TABLE activity_jobs "
-                    "ADD COLUMN candidate_count INTEGER NOT NULL DEFAULT 0"
-                )
 
     def health_check(self) -> bool:
         try:
             with self.connect() as conn:
                 conn.execute("SELECT 1").fetchone()
             return True
-        except sqlite3.Error:
+        except psycopg.Error:
             return False

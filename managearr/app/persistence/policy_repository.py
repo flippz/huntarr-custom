@@ -5,14 +5,14 @@ from ..domain.automation_policy import AutomationPolicy, BALANCED_DEFAULTS
 from .database import Database
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _row_to_policy(row) -> AutomationPolicy:
     return AutomationPolicy(
-        missing_enabled=bool(row["missing_enabled"]),
-        upgrades_enabled=bool(row["upgrades_enabled"]),
+        missing_enabled=row["missing_enabled"],
+        upgrades_enabled=row["upgrades_enabled"],
         cycle_interval_minutes=row["cycle_interval_minutes"],
         hourly_api_cap=row["hourly_api_cap"],
         successful_grab_target=row["successful_grab_target"],
@@ -20,7 +20,7 @@ def _row_to_policy(row) -> AutomationPolicy:
         queue_target=row["queue_target"],
         cooldown_minutes=row["cooldown_minutes"],
         search_order=row["search_order"],
-        updated_at=row["updated_at"],
+        updated_at=row["updated_at"].isoformat(),
     )
 
 
@@ -42,11 +42,11 @@ class PolicyRepository:
                         id, missing_enabled, upgrades_enabled, cycle_interval_minutes,
                         hourly_api_cap, successful_grab_target, dispatch_interval_seconds,
                         queue_target, cooldown_minutes, search_order, updated_at
-                    ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
-                        int(defaults["missing_enabled"]),
-                        int(defaults["upgrades_enabled"]),
+                        defaults["missing_enabled"],
+                        defaults["upgrades_enabled"],
                         defaults["cycle_interval_minutes"],
                         defaults["hourly_api_cap"],
                         defaults["successful_grab_target"],
@@ -72,14 +72,14 @@ class PolicyRepository:
             conn.execute(
                 """
                 UPDATE automation_policy
-                SET missing_enabled = ?, upgrades_enabled = ?, cycle_interval_minutes = ?,
-                    hourly_api_cap = ?, successful_grab_target = ?, dispatch_interval_seconds = ?,
-                    queue_target = ?, cooldown_minutes = ?, search_order = ?, updated_at = ?
+                SET missing_enabled = %s, upgrades_enabled = %s, cycle_interval_minutes = %s,
+                    hourly_api_cap = %s, successful_grab_target = %s, dispatch_interval_seconds = %s,
+                    queue_target = %s, cooldown_minutes = %s, search_order = %s, updated_at = %s
                 WHERE id = 1
                 """,
                 (
-                    int(current["missing_enabled"]),
-                    int(current["upgrades_enabled"]),
+                    bool(current["missing_enabled"]),
+                    bool(current["upgrades_enabled"]),
                     current["cycle_interval_minutes"],
                     current["hourly_api_cap"],
                     current["successful_grab_target"],

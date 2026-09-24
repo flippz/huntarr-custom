@@ -3,3 +3,4 @@ waitress==3.0.2
 Werkzeug>=3.1.5    # CVE-2026-21860: safe_join Windows device name bypass
 Jinja2>=3.1.6      # CVE-2025-27516, CVE-2024-56326, CVE-2024-56201: sandbox escapes
 requests==2.32.3
+psycopg[binary,pool]==3.3.6

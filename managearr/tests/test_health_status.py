@@ -6,6 +6,15 @@ def test_health_ok(client):
     assert data["database"] is True
 
 
+def test_health_reports_schema_version_without_connection_details(client):
+    resp = client.get("/health")
+    data = resp.get_json()
+    assert data["schema_version"] == 1
+    body = resp.get_data(as_text=True)
+    for leaked in ("host", "password", "user="):
+        assert leaked not in body.lower()
+
+
 def test_status_reports_db_and_counts(client):
     resp = client.get("/api/v1/status")
     assert resp.status_code == 200
@@ -14,6 +23,15 @@ def test_status_reports_db_and_counts(client):
     assert data["database"]["connected"] is True
     assert data["libraries"] == {"configured": 0, "enabled": 0}
     assert "version" in data
+
+
+def test_status_reports_schema_version_without_connection_details(client):
+    resp = client.get("/api/v1/status")
+    data = resp.get_json()
+    assert data["database"]["schema_version"] == 1
+    body = resp.get_data(as_text=True)
+    for leaked in ("host", "password", "user="):
+        assert leaked not in body.lower()
 
 
 def test_status_reflects_created_libraries(client):

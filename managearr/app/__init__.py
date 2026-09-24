@@ -4,13 +4,14 @@ Layering:
   domain/      - plain dataclasses + validation, no I/O
   services/    - use-case orchestration over domain + persistence
   adapters/    - boundary transforms (e.g. secret redaction)
-  persistence/ - SQLite schema + repositories
+  persistence/ - PostgreSQL schema/migrations + repositories
   api/         - JSON API blueprint (/api/v1/*)
   web/         - server-rendered UI shell
 """
 from flask import Flask, jsonify
 
 from .persistence.database import Database
+from .persistence.migrations import run_migrations
 from .persistence.library_repository import LibraryRepository
 from .persistence.policy_repository import PolicyRepository
 from .persistence.activity_repository import ActivityRepository
@@ -31,9 +32,21 @@ def create_app(config: dict | None = None) -> Flask:
     app = Flask(__name__, static_folder=None)
     app.config.update(config or {})
 
-    db_path = app.config.get("DB_PATH", "data-managearr/managearr.db")
-    db = Database(db_path)
-    db.init_schema()
+    db = Database(
+        host=app.config.get("DB_HOST", "postgres"),
+        port=app.config.get("DB_PORT", 5432),
+        dbname=app.config.get("DB_NAME", "managearr"),
+        user=app.config.get("DB_USER", "managearr"),
+        password=app.config.get("DB_PASSWORD"),
+        sslmode=app.config.get("DB_SSLMODE", "prefer"),
+        min_size=app.config.get("DB_POOL_MIN_SIZE", 1),
+        max_size=app.config.get("DB_POOL_MAX_SIZE", 5),
+        connect_timeout=app.config.get("DB_CONNECT_TIMEOUT_SECONDS", 5),
+    )
+    # Bounded startup retry/backoff - raises DatabaseUnavailableError (a
+    # safe, static message) if PostgreSQL never becomes reachable.
+    db.wait_ready(timeout_seconds=app.config.get("DB_STARTUP_TIMEOUT_SECONDS", 30))
+    run_migrations(db)
 
     library_repo = LibraryRepository(db)
     policy_repo = PolicyRepository(db)
