@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Managearr v1 (Preview) - {% block title %}{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('web.static', filename='style.css') }}">
+</head>
+<body>
+  <div class="preview-banner">
+    Managearr v1 - Development Preview. Read-only Sonarr scan preview: no searches are sent and nothing in Sonarr is changed. Automated hunting is not active yet.
+  </div>
+  <header class="topbar">
+    <div class="brand">Managearr <span class="v1-badge">v1</span></div>
+    <nav>
+      <a href="{{ url_for('web.overview') }}" class="{{ 'active' if active == 'overview' else '' }}">Overview</a>
+      <a href="{{ url_for('web.libraries') }}" class="{{ 'active' if active == 'libraries' else '' }}">Libraries</a>
+      <a href="{{ url_for('web.activity') }}" class="{{ 'active' if active == 'activity' else '' }}">Activity</a>
+      <a href="{{ url_for('web.settings') }}" class="{{ 'active' if active == 'settings' else '' }}">Settings</a>
+    </nav>
+  </header>
+  <main class="content">
+    {% block content %}{% endblock %}
+  </main>
+  <div id="toast" class="toast" hidden></div>
+  <script src="{{ url_for('web.static', filename='app.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

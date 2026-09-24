@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install Python dependencies first (better layer caching)
+COPY managearr/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy only the managearr application source - never the v1 tree
+COPY managearr/ .
+
+# Persistent data directory for the managearr SQLite database (distinct from v1's ./data)
+RUN mkdir -p /data-managearr
+ENV MANAGEARR_DB_PATH=/data-managearr/managearr.db
+
+EXPOSE 9706
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9706/health', timeout=3)"]
+
+CMD ["waitress-serve", "--host=0.0.0.0", "--port=9706", "run:app"]

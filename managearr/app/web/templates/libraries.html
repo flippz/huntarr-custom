@@ -1,0 +1,200 @@
+{% extends "base.html" %}
+{% block title %}Libraries{% endblock %}
+{% block content %}
+<h1>Libraries</h1>
+<p class="muted">API keys are never shown here once saved - only whether one is configured.</p>
+<p class="readonly-notice">Read-only scan preview: Test checks connectivity only, and Scan only reads series/episode data from Sonarr. No searches are sent and nothing in Sonarr is changed.</p>
+
+<section class="card">
+  <h2 id="form-title">Add library</h2>
+  <form id="library-form" class="form-grid">
+    <input type="hidden" id="lib-id" value="">
+    <label>Name
+      <input type="text" id="lib-name" required>
+    </label>
+    <label>Type
+      <select id="lib-type" required>
+        {% for t in arr_types %}
+        <option value="{{ t }}">{{ t }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>URL
+      <input type="text" id="lib-url" placeholder="http://host:port" required>
+    </label>
+    <label>API key
+      <input type="password" id="lib-api-key" placeholder="Required for new libraries; leave blank to keep current">
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" id="lib-enabled" checked>
+      Enabled
+    </label>
+    <div class="form-actions">
+      <button type="submit">Save</button>
+      <button type="button" id="cancel-edit" hidden>Cancel</button>
+    </div>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Configured libraries</h2>
+  <table class="data-table">
+    <thead>
+      <tr><th>Name</th><th>Type</th><th>URL</th><th>API key</th><th>Enabled</th><th>Sonarr status</th><th></th></tr>
+    </thead>
+    <tbody id="library-rows">
+      <tr><td colspan="7">Loading...</td></tr>
+    </tbody>
+  </table>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+const form = document.getElementById('library-form');
+const cancelBtn = document.getElementById('cancel-edit');
+
+function statusBadge(text, kind) {
+  return `<span class="state-pill status-${kind}">${escapeHtml(text)}</span>`;
+}
+
+function libraryRow(lib) {
+  const tr = document.createElement('tr');
+  tr.dataset.id = lib.id;
+  const isSonarr = lib.type === 'sonarr';
+  const sonarrActions = isSonarr
+    ? `<button data-action="test" data-id="${lib.id}">Test</button>
+       <button data-action="scan" data-id="${lib.id}">Scan</button>`
+    : '<span class="muted">n/a</span>';
+  tr.innerHTML = `
+    <td>${escapeHtml(lib.name)}</td>
+    <td>${escapeHtml(lib.type)}</td>
+    <td>${escapeHtml(lib.url)}</td>
+    <td>${lib.has_api_key ? 'configured' : 'not set'}</td>
+    <td>${lib.enabled ? 'yes' : 'no'}</td>
+    <td class="sonarr-status">${isSonarr ? statusBadge('Untested', 'unknown') : '<span class="muted">n/a</span>'}</td>
+    <td class="row-actions">
+      ${sonarrActions}
+      <button data-action="edit" data-id="${lib.id}">Edit</button>
+      <button data-action="delete" data-id="${lib.id}">Delete</button>
+    </td>
+  `;
+  return tr;
+}
+
+async function loadLibraries() {
+  const data = await api('/api/v1/libraries');
+  const tbody = document.getElementById('library-rows');
+  tbody.innerHTML = '';
+  if (data.libraries.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7">No libraries configured yet.</td></tr>';
+    return;
+  }
+  data.libraries.forEach(lib => tbody.appendChild(libraryRow(lib)));
+}
+
+function resetForm() {
+  form.reset();
+  document.getElementById('lib-id').value = '';
+  document.getElementById('form-title').textContent = 'Add library';
+  document.getElementById('lib-api-key').required = true;
+  document.getElementById('lib-api-key').placeholder = 'Required for new libraries';
+  cancelBtn.hidden = true;
+}
+
+cancelBtn.addEventListener('click', resetForm);
+
+document.getElementById('library-rows').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  const id = btn.dataset.id;
+  const row = btn.closest('tr');
+  const statusCell = row ? row.querySelector('.sonarr-status') : null;
+
+  if (btn.dataset.action === 'delete') {
+    if (!confirm('Delete this library?')) return;
+    await api(`/api/v1/libraries/${id}`, { method: 'DELETE' });
+    toast('Library deleted');
+    loadLibraries();
+    return;
+  }
+
+  if (btn.dataset.action === 'edit') {
+    const data = await api(`/api/v1/libraries/${id}`);
+    const lib = data.library;
+    document.getElementById('lib-id').value = lib.id;
+    document.getElementById('lib-name').value = lib.name;
+    document.getElementById('lib-type').value = lib.type;
+    document.getElementById('lib-url').value = lib.url;
+    document.getElementById('lib-api-key').value = '';
+    document.getElementById('lib-api-key').required = false;
+    document.getElementById('lib-api-key').placeholder = 'Leave blank to keep current key';
+    document.getElementById('lib-enabled').checked = lib.enabled;
+    document.getElementById('form-title').textContent = `Edit ${lib.name}`;
+    cancelBtn.hidden = false;
+    return;
+  }
+
+  if (btn.dataset.action === 'test') {
+    if (statusCell) statusCell.innerHTML = statusBadge('Testing...', 'unknown');
+    try {
+      const data = await api(`/api/v1/libraries/${id}/test`, { method: 'POST' });
+      const version = data.status && data.status.version ? ` (v${data.status.version})` : '';
+      if (statusCell) statusCell.innerHTML = statusBadge('Reachable' + version, 'ok');
+      toast('Connection test succeeded');
+    } catch (err) {
+      if (statusCell) statusCell.innerHTML = statusBadge('Unreachable', 'error');
+      toast('Connection test failed: ' + err.message);
+    }
+    return;
+  }
+
+  if (btn.dataset.action === 'scan') {
+    if (statusCell) statusCell.innerHTML = statusBadge('Scanning...', 'unknown');
+    try {
+      const data = await api(`/api/v1/libraries/${id}/scan`, { method: 'POST' });
+      const job = data.job;
+      if (job.state === 'completed') {
+        if (statusCell) statusCell.innerHTML = statusBadge(`${job.candidate_count} candidate(s)`, 'ok');
+        toast(`Scan complete: ${job.candidate_count} candidate(s). See Activity for details.`);
+      } else {
+        if (statusCell) statusCell.innerHTML = statusBadge('Scan failed', 'error');
+        toast('Scan failed: ' + job.details);
+      }
+    } catch (err) {
+      if (statusCell) statusCell.innerHTML = statusBadge('Scan failed', 'error');
+      toast('Scan failed: ' + err.message);
+    }
+    return;
+  }
+});
+
+form.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const id = document.getElementById('lib-id').value;
+  const payload = {
+    name: document.getElementById('lib-name').value,
+    type: document.getElementById('lib-type').value,
+    url: document.getElementById('lib-url').value,
+    enabled: document.getElementById('lib-enabled').checked,
+  };
+  const apiKey = document.getElementById('lib-api-key').value;
+  if (apiKey) payload.api_key = apiKey;
+
+  try {
+    if (id) {
+      await api(`/api/v1/libraries/${id}`, { method: 'PUT', body: payload });
+      toast('Library updated');
+    } else {
+      await api('/api/v1/libraries', { method: 'POST', body: payload });
+      toast('Library added');
+    }
+    resetForm();
+    loadLibraries();
+  } catch (err) {
+    toast('Save failed: ' + err.message);
+  }
+});
+
+loadLibraries().catch(err => toast('Failed to load libraries: ' + err.message));
+</script>
+{% endblock %}

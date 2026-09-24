@@ -248,8 +248,8 @@ data/
 *.sqlite3
 huntarr.db
 
-# Huntarr v2 local development data
-data-v2/
+# Managearr v1 local development data
+data-managearr/
 /config/
 /logs/
 /settings/

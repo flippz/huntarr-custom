@@ -1,0 +1,15 @@
+services:
+  managearr:
+    build:
+      context: .
+      dockerfile: Dockerfile.managearr
+    image: managearr:preview
+    container_name: managearr
+    ports:
+      - "9706:9706"
+    volumes:
+      - ./data-managearr:/data-managearr   # managearr SQLite database only - never mount v1's ./data
+    environment:
+      - TZ=${TZ:-Europe/Oslo}
+      - MANAGEARR_DB_PATH=/data-managearr/managearr.db
+    restart: unless-stopped

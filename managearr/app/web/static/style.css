@@ -1,0 +1,182 @@
+:root {
+  --bg: #0f1216;
+  --panel: #171b21;
+  --border: #262c34;
+  --text: #e6e9ef;
+  --muted: #8b94a3;
+  --accent: #4f8cff;
+  --danger: #e5484d;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.preview-banner {
+  background: #4a3300;
+  color: #ffd479;
+  text-align: center;
+  padding: 6px 12px;
+  font-size: 0.85rem;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.brand { font-size: 1.2rem; font-weight: 600; }
+.v1-badge {
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.7rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  vertical-align: middle;
+}
+
+.topbar nav { display: flex; gap: 16px; flex-wrap: wrap; }
+.topbar nav a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 6px 10px;
+  border-radius: 6px;
+}
+.topbar nav a:hover { color: var(--text); }
+.topbar nav a.active { color: var(--text); background: var(--panel); }
+
+.content { max-width: 960px; margin: 0 auto; padding: 20px; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 20px;
+  margin-bottom: 20px;
+}
+.card h2 { margin-top: 0; font-size: 1rem; color: var(--muted); }
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.card-grid .card { margin-bottom: 0; }
+.metric { font-size: 1.6rem; font-weight: 600; margin: 4px 0 0; }
+
+.muted { color: var(--muted); }
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+.form-grid label { display: flex; flex-direction: column; font-size: 0.85rem; color: var(--muted); gap: 4px; }
+.form-grid label.checkbox { flex-direction: row; align-items: center; gap: 8px; }
+.form-grid input[type=text], .form-grid input[type=password], .form-grid input[type=number], .form-grid select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+.form-actions { display: flex; gap: 10px; align-items: center; }
+
+button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+button:hover { opacity: 0.9; }
+button[data-action="delete"] { background: var(--danger); }
+#cancel-edit { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+
+.data-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+.data-table th, .data-table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+.data-table th { color: var(--muted); font-weight: 500; }
+
+.state-pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  background: var(--border);
+}
+
+.status-ok { background: #17402a; color: #7ee2a8; }
+.status-error { background: #402020; color: #ff9b9b; }
+.status-unknown { background: var(--border); color: var(--muted); }
+
+.readonly-notice {
+  background: #10202f;
+  color: #8fd1ff;
+  border: 1px solid #1e3a52;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 0.85rem;
+  margin-bottom: 16px;
+}
+
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 40px 16px;
+  overflow-y: auto;
+}
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+  width: 100%;
+  max-width: 720px;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.modal-header h2 { margin: 0; font-size: 1.1rem; }
+
+.toast {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 10px 16px;
+  border-radius: 8px;
+  max-width: 320px;
+}
+
+@media (max-width: 600px) {
+  .topbar { flex-direction: column; align-items: flex-start; }
+}
