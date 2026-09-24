@@ -1,3 +1,6 @@
+from app.persistence.migrations import MIGRATIONS
+
+
 def test_health_ok(client):
     resp = client.get("/health")
     assert resp.status_code == 200
@@ -9,7 +12,7 @@ def test_health_ok(client):
 def test_health_reports_schema_version_without_connection_details(client):
     resp = client.get("/health")
     data = resp.get_json()
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == MIGRATIONS[-1].version
     body = resp.get_data(as_text=True)
     for leaked in ("host", "password", "user="):
         assert leaked not in body.lower()
@@ -28,7 +31,7 @@ def test_status_reports_db_and_counts(client):
 def test_status_reports_schema_version_without_connection_details(client):
     resp = client.get("/api/v1/status")
     data = resp.get_json()
-    assert data["database"]["schema_version"] == 1
+    assert data["database"]["schema_version"] == MIGRATIONS[-1].version
     body = resp.get_data(as_text=True)
     for leaked in ("host", "password", "user="):
         assert leaked not in body.lower()

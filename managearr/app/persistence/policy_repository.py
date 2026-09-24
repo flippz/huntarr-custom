@@ -28,38 +28,40 @@ class PolicyRepository:
     def __init__(self, db: Database):
         self.db = db
 
-    def get(self) -> AutomationPolicy:
-        with self.db.connect() as conn:
+    def get(self, *, conn=None) -> AutomationPolicy:
+        if conn is None:
+            with self.db.connect() as owned_conn:
+                return self.get(conn=owned_conn)
+        row = conn.execute(
+            "SELECT * FROM automation_policy WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            now = _now()
+            defaults = BALANCED_DEFAULTS
+            conn.execute(
+                """
+                INSERT INTO automation_policy (
+                    id, missing_enabled, upgrades_enabled, cycle_interval_minutes,
+                    hourly_api_cap, successful_grab_target, dispatch_interval_seconds,
+                    queue_target, cooldown_minutes, search_order, updated_at
+                ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    defaults["missing_enabled"],
+                    defaults["upgrades_enabled"],
+                    defaults["cycle_interval_minutes"],
+                    defaults["hourly_api_cap"],
+                    defaults["successful_grab_target"],
+                    defaults["dispatch_interval_seconds"],
+                    defaults["queue_target"],
+                    defaults["cooldown_minutes"],
+                    defaults["search_order"],
+                    now,
+                ),
+            )
             row = conn.execute(
                 "SELECT * FROM automation_policy WHERE id = 1"
             ).fetchone()
-            if row is None:
-                now = _now()
-                defaults = BALANCED_DEFAULTS
-                conn.execute(
-                    """
-                    INSERT INTO automation_policy (
-                        id, missing_enabled, upgrades_enabled, cycle_interval_minutes,
-                        hourly_api_cap, successful_grab_target, dispatch_interval_seconds,
-                        queue_target, cooldown_minutes, search_order, updated_at
-                    ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        defaults["missing_enabled"],
-                        defaults["upgrades_enabled"],
-                        defaults["cycle_interval_minutes"],
-                        defaults["hourly_api_cap"],
-                        defaults["successful_grab_target"],
-                        defaults["dispatch_interval_seconds"],
-                        defaults["queue_target"],
-                        defaults["cooldown_minutes"],
-                        defaults["search_order"],
-                        now,
-                    ),
-                )
-                row = conn.execute(
-                    "SELECT * FROM automation_policy WHERE id = 1"
-                ).fetchone()
         return _row_to_policy(row)
 
     def update(self, data: dict) -> AutomationPolicy:

@@ -2,8 +2,8 @@
 {% block title %}Activity{% endblock %}
 {% block content %}
 <h1>Activity</h1>
-<p class="muted">Read-only history of jobs. Legacy hunting jobs are never seeded here; Sonarr scan jobs appear after you click Scan on a library.</p>
-<p class="readonly-notice">Read-only scan preview: Sonarr scan jobs only read series/episode data. No searches are sent and nothing in Sonarr is changed.</p>
+<p class="muted">Durable scan history and controlled manual Sonarr dispatch audit.</p>
+<p class="readonly-notice">Candidate scans only read Sonarr. A search is sent only from a completed scan after selecting candidates, previewing the plan, checking the explicit confirmation, and pressing the red Send button.</p>
 
 <section class="card">
   <label>Filter by state
@@ -14,36 +14,77 @@
       {% endfor %}
     </select>
   </label>
-  <table class="data-table">
-    <thead>
-      <tr><th>ID</th><th>Library</th><th>Type</th><th>Title</th><th>State</th><th>Candidates</th><th>Updated</th><th></th></tr>
-    </thead>
-    <tbody id="activity-rows">
-      <tr><td colspan="8">Loading...</td></tr>
-    </tbody>
-  </table>
+  <div class="table-scroll">
+    <table class="data-table">
+      <thead>
+        <tr><th>ID</th><th>Library</th><th>Type</th><th>Title</th><th>State</th><th>Candidates</th><th>Updated</th><th></th></tr>
+      </thead>
+      <tbody id="activity-rows">
+        <tr><td colspan="8">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
 </section>
 
 <div id="job-modal" class="modal-backdrop" hidden>
-  <div class="modal">
+  <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="job-modal-title">
     <div class="modal-header">
       <h2 id="job-modal-title">Job detail</h2>
-      <button type="button" id="job-modal-close">Close</button>
+      <button type="button" id="job-modal-close" class="button-secondary">Close</button>
     </div>
     <p id="job-modal-details" class="muted"></p>
-    <table class="data-table">
-      <thead>
-        <tr><th>Series</th><th>Season</th><th>Episode</th><th>Air date</th><th>Reason</th></tr>
-      </thead>
-      <tbody id="job-modal-candidates">
-        <tr><td colspan="5">Loading...</td></tr>
-      </tbody>
-    </table>
+
+    <section id="dispatch-controls" class="dispatch-controls" hidden>
+      <div class="dispatch-toolbar">
+        <strong>Controlled Sonarr episode search</strong>
+        <span id="selection-count" class="muted">0 selected (maximum 25)</span>
+        <button type="button" id="select-all-candidates" class="button-secondary">Select up to 25</button>
+        <button type="button" id="preview-dispatch">Preview selection</button>
+      </div>
+      <p class="muted">Previewing writes a dry-run audit record but sends no Sonarr request. Any selection change clears the preview.</p>
+      <div id="dispatch-preview" class="dispatch-preview" hidden>
+        <div class="dispatch-toolbar">
+          <strong>Preview</strong>
+          <button type="button" id="clear-dispatch-preview" class="button-secondary">Clear preview</button>
+        </div>
+        <p id="dispatch-preview-summary"></p>
+        <ul id="dispatch-preview-exclusions"></ul>
+        <label class="danger-confirm">
+          <input type="checkbox" id="dispatch-confirm">
+          I understand this sends one EpisodeSearch command to Sonarr for the currently previewed candidates.
+        </label>
+        <button type="button" id="send-dispatch" class="button-danger" disabled>Send searches to Sonarr</button>
+      </div>
+    </section>
+
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
+          <tr><th class="candidate-select-column"></th><th>Series</th><th>Season</th><th>Episode</th><th>Air date</th><th>Reason</th></tr>
+        </thead>
+        <tbody id="job-modal-candidates">
+          <tr><td colspan="6">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <section class="audit-section">
+      <h3>Dispatch audit</h3>
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead><tr><th>ID</th><th>Mode</th><th>State</th><th>Requested</th><th>Selected</th><th>Dispatched</th><th>Command</th><th>Created</th><th>Result</th></tr></thead>
+          <tbody id="dispatch-audit"><tr><td colspan="9">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </section>
   </div>
 </div>
 {% endblock %}
 {% block scripts %}
 <script>
+let currentJobId = null;
+let previewCandidateIds = [];
+
 async function loadActivity() {
   const state = document.getElementById('state-filter').value;
   const qs = state ? `?state=${encodeURIComponent(state)}` : '';
@@ -61,7 +102,7 @@ async function loadActivity() {
       <td>${escapeHtml(job.library_name)}</td>
       <td>${escapeHtml(job.job_type)}</td>
       <td>${escapeHtml(job.title)}</td>
-      <td><span class="state-pill state-${job.state}">${job.state}</span></td>
+      <td><span class="state-pill state-${escapeHtml(job.state)}">${escapeHtml(job.state)}</span></td>
       <td>${job.job_type === 'sonarr_scan' ? job.candidate_count : '-'}</td>
       <td>${escapeHtml(job.updated_at)}</td>
       <td>${job.job_type === 'sonarr_scan' ? `<button data-action="detail" data-id="${job.id}">Details</button>` : ''}</td>
@@ -70,49 +111,164 @@ async function loadActivity() {
   });
 }
 
-document.getElementById('state-filter').addEventListener('change', () => {
-  loadActivity().catch(err => toast('Failed to load activity: ' + err.message));
-});
+function selectedCandidateIds() {
+  return Array.from(document.querySelectorAll('.candidate-checkbox:checked')).map(el => Number(el.value));
+}
 
-const modal = document.getElementById('job-modal');
-document.getElementById('job-modal-close').addEventListener('click', () => { modal.hidden = true; });
+function updateSelectionCount() {
+  const count = selectedCandidateIds().length;
+  document.getElementById('selection-count').textContent = `${count} selected (maximum 25)`;
+}
 
-document.getElementById('activity-rows').addEventListener('click', async (ev) => {
-  const btn = ev.target.closest('button[data-action="detail"]');
-  if (!btn) return;
-  const jobId = btn.dataset.id;
+function clearPreview() {
+  previewCandidateIds = [];
+  document.getElementById('dispatch-preview').hidden = true;
+  document.getElementById('dispatch-preview-summary').textContent = '';
+  document.getElementById('dispatch-preview-exclusions').innerHTML = '';
+  document.getElementById('dispatch-confirm').checked = false;
+  document.getElementById('send-dispatch').disabled = true;
+}
 
+async function loadDispatchAudit(jobId) {
+  const data = await api(`/api/v1/activity/${jobId}/dispatch-batches`);
+  const tbody = document.getElementById('dispatch-audit');
+  tbody.innerHTML = '';
+  if (data.batches.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9">No previews or dispatch attempts yet.</td></tr>';
+    return;
+  }
+  data.batches.forEach(batch => {
+    const tr = document.createElement('tr');
+    const command = batch.sonarr_command_id ? `#${batch.sonarr_command_id} ${batch.sonarr_command_status || ''}` : '-';
+    tr.innerHTML = `
+      <td>${batch.id}</td><td>${escapeHtml(batch.mode)}</td>
+      <td><span class="state-pill state-${escapeHtml(batch.state)}">${escapeHtml(batch.state)}</span></td>
+      <td>${batch.requested_count}</td><td>${batch.selected_count}</td><td>${batch.dispatched_count}</td>
+      <td>${escapeHtml(command)}</td><td>${escapeHtml(batch.created_at)}</td>
+      <td>${escapeHtml(batch.error_summary || '')}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function openJob(jobId) {
+  currentJobId = Number(jobId);
+  clearPreview();
   document.getElementById('job-modal-title').textContent = `Job #${jobId}`;
   document.getElementById('job-modal-details').textContent = 'Loading...';
-  document.getElementById('job-modal-candidates').innerHTML = '<tr><td colspan="5">Loading...</td></tr>';
-  modal.hidden = false;
+  document.getElementById('job-modal-candidates').innerHTML = '<tr><td colspan="6">Loading...</td></tr>';
+  document.getElementById('dispatch-audit').innerHTML = '<tr><td colspan="9">Loading...</td></tr>';
+  document.getElementById('dispatch-controls').hidden = true;
+  document.getElementById('job-modal').hidden = false;
 
   try {
-    const jobData = await api(`/api/v1/activity/${jobId}`);
-    const candidatesData = await api(`/api/v1/activity/${jobId}/candidates`);
-    document.getElementById('job-modal-title').textContent = `${jobData.job.title} (${jobData.job.state})`;
-    document.getElementById('job-modal-details').textContent = jobData.job.details;
+    const [jobData, candidatesData] = await Promise.all([
+      api(`/api/v1/activity/${jobId}`),
+      api(`/api/v1/activity/${jobId}/candidates`),
+      loadDispatchAudit(jobId),
+    ]);
+    const job = jobData.job;
+    const canDispatch = job.job_type === 'sonarr_scan' && job.state === 'completed';
+    document.getElementById('job-modal-title').textContent = `${job.title} (${job.state})`;
+    document.getElementById('job-modal-details').textContent = job.details;
+    document.getElementById('dispatch-controls').hidden = !canDispatch;
 
     const tbody = document.getElementById('job-modal-candidates');
     tbody.innerHTML = '';
     if (candidatesData.candidates.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="5">No candidates.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6">No candidates.</td></tr>';
       return;
     }
     candidatesData.candidates.forEach(c => {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${escapeHtml(c.series_title)}</td>
-        <td>${c.season_number}</td>
-        <td>${c.episode_number}</td>
-        <td>${escapeHtml(c.air_date || '')}</td>
-        <td>${escapeHtml(c.reason)}</td>
-      `;
+        <td>${canDispatch ? `<input class="candidate-checkbox" type="checkbox" value="${c.id}" aria-label="Select ${escapeHtml(c.series_title)} season ${c.season_number} episode ${c.episode_number}">` : ''}</td>
+        <td>${escapeHtml(c.series_title)}</td><td>${c.season_number}</td><td>${c.episode_number}</td>
+        <td>${escapeHtml(c.air_date || '')}</td><td>${escapeHtml(c.reason)}</td>`;
       tbody.appendChild(tr);
     });
+    updateSelectionCount();
   } catch (err) {
     document.getElementById('job-modal-details').textContent = 'Failed to load: ' + err.message;
     document.getElementById('job-modal-candidates').innerHTML = '';
+  }
+}
+
+document.getElementById('state-filter').addEventListener('change', () => {
+  loadActivity().catch(err => toast('Failed to load activity: ' + err.message));
+});
+document.getElementById('job-modal-close').addEventListener('click', () => {
+  document.getElementById('job-modal').hidden = true;
+  currentJobId = null;
+  clearPreview();
+});
+document.getElementById('activity-rows').addEventListener('click', ev => {
+  const btn = ev.target.closest('button[data-action="detail"]');
+  if (btn) openJob(btn.dataset.id);
+});
+document.getElementById('job-modal-candidates').addEventListener('change', ev => {
+  if (!ev.target.classList.contains('candidate-checkbox')) return;
+  if (selectedCandidateIds().length > 25) {
+    ev.target.checked = false;
+    toast('You can select at most 25 candidates.');
+  }
+  updateSelectionCount();
+  clearPreview();
+});
+document.getElementById('select-all-candidates').addEventListener('click', () => {
+  document.querySelectorAll('.candidate-checkbox').forEach((checkbox, index) => {
+    checkbox.checked = index < 25;
+  });
+  updateSelectionCount();
+  clearPreview();
+});
+document.getElementById('clear-dispatch-preview').addEventListener('click', clearPreview);
+document.getElementById('dispatch-confirm').addEventListener('change', ev => {
+  document.getElementById('send-dispatch').disabled = !(ev.target.checked && previewCandidateIds.length);
+});
+
+document.getElementById('preview-dispatch').addEventListener('click', async () => {
+  const candidateIds = selectedCandidateIds();
+  if (!candidateIds.length) {
+    toast('Select at least one candidate first.');
+    return;
+  }
+  clearPreview();
+  try {
+    const data = await api(`/api/v1/activity/${currentJobId}/dispatch/preview`, {
+      method: 'POST', body: {candidate_ids: candidateIds},
+    });
+    previewCandidateIds = candidateIds.slice();
+    const plan = data.plan;
+    document.getElementById('dispatch-preview-summary').textContent =
+      `Dry-run audit #${data.batch.id}: ${plan.selected.length} selected; ${plan.remaining_capacity} hourly slot(s) were available before this preview. Previewing sent nothing to Sonarr.`;
+    const exclusions = document.getElementById('dispatch-preview-exclusions');
+    exclusions.innerHTML = '';
+    plan.excluded.forEach(item => {
+      const li = document.createElement('li');
+      li.textContent = `Candidate #${item.candidate_id}: ${item.reason}`;
+      exclusions.appendChild(li);
+    });
+    document.getElementById('dispatch-preview').hidden = false;
+    await loadDispatchAudit(currentJobId);
+  } catch (err) {
+    toast('Preview failed: ' + err.message);
+  }
+});
+
+document.getElementById('send-dispatch').addEventListener('click', async () => {
+  if (!document.getElementById('dispatch-confirm').checked || !previewCandidateIds.length) return;
+  const button = document.getElementById('send-dispatch');
+  button.disabled = true;
+  try {
+    const data = await api(`/api/v1/activity/${currentJobId}/dispatch`, {
+      method: 'POST', body: {candidate_ids: previewCandidateIds, confirm: true},
+    });
+    toast(`Dispatch #${data.batch.id} finished with state ${data.batch.state}; ${data.batch.dispatched_count} episode(s) sent.`);
+    clearPreview();
+    await loadDispatchAudit(currentJobId);
+  } catch (err) {
+    toast('Dispatch failed: ' + err.message);
+    button.disabled = false;
   }
 });
 

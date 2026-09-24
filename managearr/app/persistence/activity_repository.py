@@ -46,9 +46,14 @@ class ActivityRepository:
             rows = conn.execute(query, params).fetchall()
         return [_row_to_job(row) for row in rows]
 
-    def get(self, job_id: int) -> ActivityJob | None:
-        with self.db.connect() as conn:
+    def get(self, job_id: int, *, conn=None) -> ActivityJob | None:
+        if conn is not None:
             row = conn.execute(
+                "SELECT * FROM activity_jobs WHERE id = %s", (job_id,)
+            ).fetchone()
+            return _row_to_job(row) if row else None
+        with self.db.connect() as owned_conn:
+            row = owned_conn.execute(
                 "SELECT * FROM activity_jobs WHERE id = %s", (job_id,)
             ).fetchone()
         return _row_to_job(row) if row else None

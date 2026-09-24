@@ -12,6 +12,9 @@ from app.persistence.library_repository import LibraryRepository
 from app.persistence.policy_repository import PolicyRepository
 from app.persistence.activity_repository import ActivityRepository
 from app.persistence.scan_candidate_repository import ScanCandidateRepository
+from app.persistence.dispatch_repository import DispatchRepository
+from app.services.dispatch_planning_service import DispatchPlanningService
+from app.services.dispatch_service import DispatchService
 
 # Tests run against a real PostgreSQL instance - no SQLite/mock DB layer.
 # Point MANAGEARR_TEST_DB_* at a disposable database; the suite truncates
@@ -24,7 +27,10 @@ TEST_DB_CONFIG = dict(
     password=os.environ.get("MANAGEARR_TEST_DB_PASSWORD", "testpass123"),
 )
 
-_DATA_TABLES = "arr_libraries, automation_policy, activity_jobs, scan_candidates"
+_DATA_TABLES = (
+    "arr_libraries, automation_policy, activity_jobs, scan_candidates, "
+    "dispatch_batches, dispatch_batch_items"
+)
 
 
 @pytest.fixture(scope="session")
@@ -100,3 +106,18 @@ def activity_repo(database):
 @pytest.fixture
 def candidate_repo(database):
     return ScanCandidateRepository(database)
+
+
+@pytest.fixture
+def dispatch_repo(database):
+    return DispatchRepository(database)
+
+
+@pytest.fixture
+def dispatch_planning_service(activity_repo, candidate_repo, library_repo, policy_repo, dispatch_repo):
+    return DispatchPlanningService(activity_repo, candidate_repo, library_repo, policy_repo, dispatch_repo)
+
+
+@pytest.fixture
+def dispatch_service(dispatch_planning_service, dispatch_repo, library_repo):
+    return DispatchService(dispatch_planning_service, dispatch_repo, library_repo)

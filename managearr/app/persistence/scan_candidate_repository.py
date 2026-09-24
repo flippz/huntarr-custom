@@ -78,6 +78,24 @@ class ScanCandidateRepository:
             ).fetchall()
         return [_row_to_candidate(row) for row in rows]
 
+    def get_many(self, candidate_ids: list[int], *, conn=None) -> list[ScanCandidate]:
+        """Fetch candidate rows by id, in no particular order, regardless
+        of which job they belong to - callers that need to validate a
+        candidate belongs to a specific job (e.g. dispatch planning) must
+        check ``job_id`` on the returned rows themselves."""
+        if not candidate_ids:
+            return []
+        if conn is not None:
+            rows = conn.execute(
+                "SELECT * FROM scan_candidates WHERE id = ANY(%s)", (list(candidate_ids),)
+            ).fetchall()
+            return [_row_to_candidate(row) for row in rows]
+        with self.db.connect() as owned_conn:
+            rows = owned_conn.execute(
+                "SELECT * FROM scan_candidates WHERE id = ANY(%s)", (list(candidate_ids),)
+            ).fetchall()
+        return [_row_to_candidate(row) for row in rows]
+
     def count_for_job(self, job_id: int) -> int:
         with self.db.connect() as conn:
             row = conn.execute(

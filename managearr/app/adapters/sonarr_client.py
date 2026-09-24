@@ -1,8 +1,12 @@
-"""Read-only Sonarr API v3 adapter.
+"""Sonarr API v3 adapter.
 
-This client only ever issues GET requests against read-only endpoints
-(system status, series, episode). It never sends a Sonarr command (no
-``/api/v3/command`` calls) and never mutates Sonarr state in any way.
+Mostly a read-only client (system status, series, episode - all GETs),
+plus exactly one write operation: ``search_episodes``, which issues
+``POST /api/v3/command`` with command ``EpisodeSearch``. That is the
+*only* way anything in this codebase can make Sonarr do something - see
+``app/services/dispatch_service.py``, the only caller. No series/season
+search, delete, file-change, or override endpoint exists here or
+anywhere else in the adapter.
 
 All raised exceptions carry static, safe messages - never the
 configured base URL or API key - so callers can surface them directly
@@ -11,6 +15,8 @@ to a UI or log line without leaking secrets.
 from urllib.parse import urljoin
 
 import requests
+
+from ..domain.dispatch import MAX_SELECTION_PER_REQUEST
 
 DEFAULT_TIMEOUT_SECONDS = 10
 
@@ -63,11 +69,12 @@ class SonarrClient:
         self._timeout = timeout
         self._session = session or requests.Session()
 
-    def _get(self, path: str, *, params: dict | None = None):
-        url = _safe_join(self._base_url, path)
-        headers = {"X-Api-Key": self._api_key}
+    def _send(self, request_fn, *args, **kwargs):
+        """Shared timeout/connection/auth/status/JSON handling for both
+        the read-only GET path and the single write POST path - see
+        ``_get``/``_post`` below."""
         try:
-            response = self._session.get(url, headers=headers, params=params, timeout=self._timeout)
+            response = request_fn(*args, **kwargs)
         except requests.exceptions.Timeout as exc:
             raise SonarrConnectionError("Sonarr request timed out") from exc
         except requests.exceptions.ConnectionError as exc:
@@ -84,6 +91,16 @@ class SonarrClient:
             return response.json()
         except ValueError as exc:
             raise SonarrDataError("Sonarr returned a non-JSON response") from exc
+
+    def _get(self, path: str, *, params: dict | None = None):
+        url = _safe_join(self._base_url, path)
+        headers = {"X-Api-Key": self._api_key}
+        return self._send(self._session.get, url, headers=headers, params=params, timeout=self._timeout)
+
+    def _post(self, path: str, json_body: dict):
+        url = _safe_join(self._base_url, path)
+        headers = {"X-Api-Key": self._api_key}
+        return self._send(self._session.post, url, headers=headers, json=json_body, timeout=self._timeout)
 
     def system_status(self) -> dict:
         """Read-only connectivity/version check. Never mutates Sonarr."""
@@ -108,3 +125,40 @@ class SonarrClient:
         if not isinstance(data, list):
             raise SonarrDataError("Sonarr episode response was not a list")
         return data
+
+    def search_episodes(self, episode_ids: list[int]) -> dict:
+        """The only write operation this adapter exposes: dispatch one
+        Sonarr ``EpisodeSearch`` command for the given episode ids.
+
+        Issues exactly one ``POST /api/v3/command``. Sonarr queues a
+        single search job covering every id in ``episode_ids`` and
+        returns one command; there is no per-episode success/failure in
+        this response, only a command id/name/status to track it by.
+        Callers (``DispatchService``) never hold a database transaction
+        across this call.
+        """
+        if (
+            not isinstance(episode_ids, list)
+            or not episode_ids
+            or len(episode_ids) > MAX_SELECTION_PER_REQUEST
+            or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in episode_ids)
+            or len(set(episode_ids)) != len(episode_ids)
+        ):
+            raise ValueError(
+                f"episode_ids must contain 1-{MAX_SELECTION_PER_REQUEST} unique positive integers"
+            )
+        data = self._post("/api/v3/command", {"name": "EpisodeSearch", "episodeIds": list(episode_ids)})
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("id"), int)
+            or isinstance(data.get("id"), bool)
+            or data["id"] <= 0
+            or ("name" in data and data["name"] != "EpisodeSearch")
+            or (data.get("status") is not None and not isinstance(data.get("status"), str))
+        ):
+            raise SonarrDataError("Sonarr command response was missing expected fields")
+        return {
+            "id": data.get("id"),
+            "name": data.get("name", "EpisodeSearch"),
+            "status": data.get("status"),
+        }

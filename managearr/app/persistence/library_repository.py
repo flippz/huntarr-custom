@@ -33,9 +33,14 @@ class LibraryRepository:
             ).fetchall()
         return [_row_to_library(row) for row in rows]
 
-    def get(self, library_id: int) -> ArrLibrary | None:
-        with self.db.connect() as conn:
+    def get(self, library_id: int, *, conn=None) -> ArrLibrary | None:
+        if conn is not None:
             row = conn.execute(
+                "SELECT * FROM arr_libraries WHERE id = %s", (library_id,)
+            ).fetchone()
+            return _row_to_library(row) if row else None
+        with self.db.connect() as owned_conn:
+            row = owned_conn.execute(
                 "SELECT * FROM arr_libraries WHERE id = %s", (library_id,)
             ).fetchone()
         return _row_to_library(row) if row else None

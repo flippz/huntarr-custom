@@ -12,25 +12,31 @@ from ..domain.scan_candidate import derive_missing_candidate
 from ..persistence.activity_repository import ActivityRepository
 from ..persistence.library_repository import LibraryRepository
 from ..persistence.scan_candidate_repository import ScanCandidateRepository
+from .library_readiness import (
+    LIBRARY_DISABLED_ERROR,
+    LIBRARY_NOT_FOUND_ERROR,
+    MISSING_API_KEY_ERROR,
+    UNSUPPORTED_LIBRARY_TYPE_ERROR,
+    VALIDATION_ERRORS,
+    ready_sonarr_library,
+)
 
 # Hard cap on candidate rows persisted per scan job. Large libraries are
 # truncated rather than unbounded; the job's ``details`` text says so
 # when it happens (see ``run_scan`` below).
 MAX_CANDIDATES_PER_SCAN = 500
 
-UNSUPPORTED_LIBRARY_TYPE_ERROR = "unsupported library type: only sonarr libraries support scanning"
-LIBRARY_NOT_FOUND_ERROR = "library not found"
-LIBRARY_DISABLED_ERROR = "library is disabled"
-MISSING_API_KEY_ERROR = "library is missing an API key"
-
-# Validation-style errors (as opposed to upstream Sonarr errors) that
-# the API layer maps to 4xx instead of 502.
-VALIDATION_ERRORS = {
-    LIBRARY_NOT_FOUND_ERROR,
-    UNSUPPORTED_LIBRARY_TYPE_ERROR,
-    LIBRARY_DISABLED_ERROR,
-    MISSING_API_KEY_ERROR,
-}
+# Re-exported here (rather than only in library_readiness) so existing
+# imports of these names from this module keep working unchanged.
+__all__ = [
+    "MAX_CANDIDATES_PER_SCAN",
+    "UNSUPPORTED_LIBRARY_TYPE_ERROR",
+    "LIBRARY_NOT_FOUND_ERROR",
+    "LIBRARY_DISABLED_ERROR",
+    "MISSING_API_KEY_ERROR",
+    "VALIDATION_ERRORS",
+    "SonarrScanService",
+]
 
 
 class SonarrScanService:
@@ -56,16 +62,7 @@ class SonarrScanService:
 
     def _ready_sonarr_library(self, library_id: int):
         """Return ``(library, None)`` or ``(None, error_message)``."""
-        library = self.library_repo.get(library_id)
-        if library is None:
-            return None, LIBRARY_NOT_FOUND_ERROR
-        if library.type != "sonarr":
-            return None, UNSUPPORTED_LIBRARY_TYPE_ERROR
-        if not library.enabled:
-            return None, LIBRARY_DISABLED_ERROR
-        if not library.api_key or not library.api_key.strip():
-            return None, MISSING_API_KEY_ERROR
-        return library, None
+        return ready_sonarr_library(self.library_repo, library_id)
 
     def test_connection(self, library_id: int) -> tuple[dict | None, str | None]:
         """Read-only connectivity/version check. Never mutates Sonarr."""

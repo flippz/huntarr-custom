@@ -3,6 +3,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from ..adapters.redaction import redact_libraries, redact_library
 from ..services.sonarr_scan_service import VALIDATION_ERRORS
+from ..services.dispatch_planning_service import JOB_NOT_FOUND_ERROR
 
 api_bp = Blueprint("api_v1", __name__, url_prefix="/api/v1")
 
@@ -19,6 +20,17 @@ def _sonarr_error_status(error: str) -> int:
     # Anything else is an upstream Sonarr failure (unreachable, timeout,
     # auth rejected, malformed data) - not the caller's fault.
     return 502
+
+
+def _dispatch_error_status(error: str) -> int:
+    if error in (JOB_NOT_FOUND_ERROR, "library not found"):
+        return 404
+    # Every other error this layer can return (bad job state, bad
+    # selection shape, missing confirm, cap exceeded) is a caller
+    # mistake, not an upstream failure - dispatch/preview never call
+    # Sonarr except via the one confirmed EpisodeSearch POST, whose
+    # failures are recorded on the batch, not raised as an API error.
+    return 400
 
 
 @api_bp.get("/status")
@@ -137,3 +149,56 @@ def scan_library(library_id: int):
     if error:
         return jsonify({"errors": [error]}), _sonarr_error_status(error)
     return jsonify({"job": job.to_dict()}), 201
+
+
+# --- Manual Sonarr search dispatch ----------------------------------------
+#
+# preview/plan never calls Sonarr - see DispatchPlanningService. dispatch
+# is the only endpoint in this codebase that can make Sonarr do
+# something, and only when the request body explicitly sets
+# confirm: true with a non-empty candidate_ids list - see DispatchService.
+
+@api_bp.post("/activity/<int:job_id>/dispatch/preview")
+def preview_dispatch(job_id: int):
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    candidate_ids = payload.get("candidate_ids")
+    result, error = _services()["dispatch_planning"].preview(job_id, candidate_ids)
+    if error:
+        return jsonify({"errors": [error]}), _dispatch_error_status(error)
+    batch = _services()["dispatch_repo"].get_batch(result.audit_batch_id)
+    return jsonify({"plan": result.to_dict(), "batch": batch.to_dict()}), 201
+
+
+@api_bp.post("/activity/<int:job_id>/dispatch")
+def dispatch_searches(job_id: int):
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    candidate_ids = payload.get("candidate_ids")
+    confirm = payload.get("confirm")
+    outcome, error = _services()["dispatch"].dispatch(job_id, candidate_ids, confirm)
+    if error:
+        return jsonify({"errors": [error]}), _dispatch_error_status(error)
+    response = {"batch": outcome.batch.to_dict()}
+    if outcome.plan is not None:
+        response["plan"] = outcome.plan.to_dict()
+    return jsonify(response), 201
+
+
+@api_bp.get("/activity/<int:job_id>/dispatch-batches")
+def list_dispatch_batches(job_id: int):
+    job = _services()["activity"].get_job(job_id)
+    if job is None:
+        return jsonify({"errors": ["activity job not found"]}), 404
+    batches = _services()["dispatch_repo"].list_for_job(job_id)
+    return jsonify({"batches": [b.to_dict() for b in batches]})
+
+
+@api_bp.get("/dispatch-batches/<int:batch_id>")
+def get_dispatch_batch(batch_id: int):
+    batch = _services()["dispatch_repo"].get_batch(batch_id)
+    if batch is None:
+        return jsonify({"errors": ["dispatch batch not found"]}), 404
+    return jsonify({"batch": batch.to_dict()})
