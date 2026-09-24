@@ -186,6 +186,18 @@ class LiveRepository:
                 """,
                 (actor[:255], reason[:500], ttl_minutes),
             ).fetchone()
+            # Arming must create an opportunity to dispatch within the arm
+            # window. Without this, a short arm TTL can expire before the
+            # scheduler's normal hourly next_due_at, making Live appear inert.
+            # The worker still performs every mode/generation/expiry gate
+            # before any Sonarr command.
+            conn.execute(
+                """
+                UPDATE scheduler_settings
+                SET next_due_at = now(), updated_at = now()
+                WHERE id = 1 AND mode = 'live'
+                """
+            )
             conn.execute(
                 """
                 INSERT INTO live_control_audit (event_type, new_mode, reason, actor, arm_generation)

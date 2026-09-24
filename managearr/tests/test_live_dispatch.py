@@ -242,6 +242,27 @@ def test_arm_confirm_succeeds_and_sets_bounded_expiry(live_control_service):
     assert control["armed_reason"] == "on-call fix"
 
 
+def test_arm_confirm_makes_live_cycle_due_within_arm_window(
+    database, live_control_service,
+):
+    _enable_live(live_control_service)
+    with database.connect() as conn:
+        conn.execute("UPDATE scheduler_settings SET next_due_at = now() + interval '1 hour' WHERE id = 1")
+    challenge, errors = live_control_service.request_arm_challenge({"reason": "test now", "ttl_minutes": 5})
+    assert errors == []
+    control, errors = live_control_service.confirm_arm_challenge(
+        {"challenge_id": challenge["challenge_id"], "token": challenge["token"], "phrase": ARM_LIVE_DISPATCH_PHRASE},
+        actor="operator",
+    )
+    assert errors == []
+    with database.connect() as conn:
+        due = conn.execute(
+            "SELECT next_due_at <= now() AS due FROM scheduler_settings WHERE id = 1"
+        ).fetchone()
+    assert due["due"] is True
+    assert datetime.fromisoformat(control["expires_at"]) > datetime.now(timezone.utc)
+
+
 def test_arm_confirm_rejects_wrong_phrase(live_control_service):
     _enable_live(live_control_service)
     challenge, _ = live_control_service.request_arm_challenge({"reason": "x", "ttl_minutes": 5})
