@@ -671,3 +671,21 @@ def test_ui_exposes_danger_zone_two_step_flow(client):
     overview_html = client.get("/").get_data(as_text=True)
     assert 'id="ov-live-banner"' in overview_html
     assert 'id="ov-live-emergency-stop"' in overview_html
+
+
+def test_live_dispatch_makes_reconciliation_due_immediately(database, live_repo):
+    with database.connect() as conn:
+        conn.execute("UPDATE refresh_settings SET next_reconcile_due_at = now() + interval '1 hour' WHERE id = 1")
+    live_repo.record_dispatch_attempt("test dispatch")
+    with database.connect() as conn:
+        row = conn.execute("SELECT next_reconcile_due_at <= now() AS due FROM refresh_settings WHERE id = 1").fetchone()
+    assert row["due"] is True
+
+
+def test_activity_recent_dispatches_api_and_ui(client, dispatch_repo):
+    response = client.get("/api/v1/activity/dispatches")
+    assert response.status_code == 200
+    assert "batches" in response.get_json()
+    html = client.get("/activity").get_data(as_text=True)
+    assert "Recent dispatches and outcomes" in html
+    assert "loadRecentDispatches" in html

@@ -310,6 +310,12 @@ class LiveRepository:
                 "UPDATE live_control SET last_dispatch_at = now(), last_dispatch_summary = %s, updated_at = now() WHERE id = 1",
                 (summary[:1000],),
             )
+            # A new command should be observed promptly instead of waiting
+            # for a reconcile deadline that may have been advanced just
+            # before this dispatch existed.
+            conn.execute(
+                "UPDATE refresh_settings SET next_reconcile_due_at = now(), updated_at = now() WHERE id = 1"
+            )
 
     def expire_stale_arm(self) -> bool:
         """Best-effort housekeeping: flips armed to FALSE once the TTL has

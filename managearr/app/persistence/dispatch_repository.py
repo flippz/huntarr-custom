@@ -419,6 +419,6 @@ class DispatchRepository:
     def list_recent(self, *, limit: int = 50) -> list[DispatchBatch]:
         with self.db.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM dispatch_batches ORDER BY created_at DESC LIMIT %s", (limit,)
+                "SELECT id FROM dispatch_batches ORDER BY created_at DESC LIMIT %s", (limit,)
             ).fetchall()
-        return [_row_to_batch(row) for row in rows]
+        return [self.get_batch(row["id"], with_items=True) for row in rows]

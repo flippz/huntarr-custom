@@ -2,9 +2,19 @@
 {% block title %}Activity{% endblock %}
 {% block content %}
 <h1>Activity</h1>
-<p class="muted">Durable scan history and controlled manual Sonarr dispatch audit.</p>
-<p class="readonly-notice">Candidate scans only read Sonarr. A search is sent only from a completed scan after selecting candidates, previewing the plan, checking the explicit confirmation, and pressing the red Send button.</p>
-<p class="readonly-notice">Outcome reconciliation is manual and read-only: it sends no search. A completed EpisodeSearch command is not proof that Sonarr grabbed, downloaded, or imported an episode.</p>
+<p class="muted">Durable scan, scheduled/manual dispatch, and Sonarr outcome history.</p>
+<p class="readonly-notice">Candidate scans only read Sonarr. Live or confirmed manual dispatch may send an EpisodeSearch command.</p>
+<p class="readonly-notice">Outcome reconciliation is manual and read-only: it sends no search. A completed EpisodeSearch command is not proof that Sonarr grabbed, downloaded, or imported an episode. Live dispatches are queued for prompt automatic read-only reconciliation.</p>
+
+<section class="card">
+  <h2>Recent dispatches and outcomes</h2>
+  <div class="table-scroll">
+    <table class="data-table">
+      <thead><tr><th>Time</th><th>Series / episode</th><th>Dispatch</th><th>Command</th><th>Outcome</th><th>Last checked</th></tr></thead>
+      <tbody id="recent-dispatches"><tr><td colspan="6">Loading...</td></tr></tbody>
+    </table>
+  </div>
+</section>
 
 <section class="card">
   <label>Filter by state
@@ -90,6 +100,30 @@
 <script>
 let currentJobId = null;
 let previewCandidateIds = [];
+
+async function loadRecentDispatches() {
+  const data = await api('/api/v1/activity/dispatches?limit=50');
+  const tbody = document.getElementById('recent-dispatches');
+  tbody.innerHTML = '';
+  const batches = data.batches.filter(batch => batch.mode !== 'dry_run');
+  if (batches.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6">No dispatches yet.</td></tr>';
+    return;
+  }
+  batches.forEach(batch => {
+    const item = (batch.items || []).find(entry => entry.state !== 'excluded');
+    const subject = item ? `${escapeHtml(item.series_title)} S${item.season_number}E${item.episode_number}` : `Batch #${batch.id}`;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${escapeHtml(batch.created_at)}</td>
+      <td>${subject}</td>
+      <td><span class="state-pill state-${escapeHtml(batch.state)}">${escapeHtml(batch.state)}</span></td>
+      <td>${batch.sonarr_command_id ? `#${batch.sonarr_command_id} ${escapeHtml(batch.command_observed_state || batch.sonarr_command_status || '')}` : '-'}</td>
+      <td><strong>${escapeHtml(batch.reconciliation_state)}</strong><br><span class="muted">${escapeHtml(batch.reconciliation_summary || batch.error_summary || 'Awaiting read-only reconciliation')}</span></td>
+      <td>${escapeHtml(batch.last_reconciled_at || 'pending')}</td>`;
+    tbody.appendChild(tr);
+  });
+}
 
 async function loadActivity() {
   const state = document.getElementById('state-filter').value;
@@ -318,6 +352,6 @@ document.getElementById('send-dispatch').addEventListener('click', async () => {
   }
 });
 
-loadActivity().catch(err => toast('Failed to load activity: ' + err.message));
+Promise.all([loadActivity(), loadRecentDispatches()]).catch(err => toast('Failed to load activity: ' + err.message));
 </script>
 {% endblock %}

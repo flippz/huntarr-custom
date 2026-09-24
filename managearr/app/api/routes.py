@@ -268,6 +268,13 @@ def list_activity():
     return jsonify({"jobs": [job.to_dict() for job in jobs]})
 
 
+@api_bp.get("/activity/dispatches")
+def list_recent_dispatches():
+    limit = max(1, min(request.args.get("limit", default=50, type=int), 100))
+    batches = _services()["dispatch_repo"].list_recent(limit=limit)
+    return jsonify({"batches": [batch.to_dict() for batch in batches]})
+
+
 @api_bp.get("/activity/<int:job_id>")
 def get_activity(job_id: int):
     job = _services()["activity"].get_job(job_id)
