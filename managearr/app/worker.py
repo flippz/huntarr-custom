@@ -84,8 +84,11 @@ class SchedulerWorker:
         # cooldown-gated reconciliation pass. At most one refresh run is
         # started per iteration - never a tight per-batch loop.
         self.refresh_repository.claim_manual_scan_requests(self.owner_id)
-        self.refresh_service.ensure_freshness()
-        self.refresh_service.enqueue_reconcile_if_due()
+        # Automatic network reads are disabled with the scheduler. Explicit
+        # operator refresh requests still work while mode is off.
+        if self.repository.current_mode() == "simulate":
+            self.refresh_service.ensure_freshness()
+            self.refresh_service.enqueue_reconcile_if_due()
         refresh_run = self.refresh_repository.start_next_run(self.owner_id)
         if refresh_run is not None:
             if not self._heartbeat():

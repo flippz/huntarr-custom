@@ -486,6 +486,35 @@ def test_cycle_uses_fresh_snapshot_and_records_snapshot_age(
 
 # --- full worker iteration: zero writes proof -------------------------------
 
+def test_off_mode_runs_only_explicit_refresh_requests(
+    scheduler_repo, refresh_repo, policy_repo, library_repo, activity_repo, candidate_repo, monkeypatch,
+):
+    library, job = _library_scan(library_repo, activity_repo, candidate_repo)
+    backdate_job(refresh_repo.db, job.id, age_minutes=120)
+    calls = []
+
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="off-proof")
+    monkeypatch.setattr(worker.refresh_service, "ensure_freshness", lambda: calls.append("automatic-scan"))
+    monkeypatch.setattr(worker.refresh_service, "enqueue_reconcile_if_due", lambda: calls.append("automatic-reconcile"))
+
+    worker.run_once()
+    assert scheduler_repo.current_mode() == "off"
+    assert calls == []
+    assert refresh_repo.list_runs() == []
+
+    refresh_repo.queue_manual_scans(library.id)
+    monkeypatch.setattr(
+        worker.refresh_service, "execute_run",
+        lambda run, heartbeat=None: refresh_repo.finish_run(
+            run["id"], "completed", {"target_count": 1, "succeeded_count": 1},
+            "Explicit read-only refresh completed; no Sonarr command was sent.",
+        ),
+    )
+    worker.run_once()
+    assert refresh_repo.list_runs(kind="scan")
+    assert calls == []
+
+
 def test_worker_iteration_runs_refresh_and_scheduler_without_any_sonarr_write(
     database, scheduler_repo, refresh_repo, policy_repo, library_repo, activity_repo,
     candidate_repo, dispatch_repo, monkeypatch,
@@ -520,6 +549,7 @@ def test_worker_iteration_runs_refresh_and_scheduler_without_any_sonarr_write(
         lambda self, *, page, page_size: {"page": page, "page_size": page_size, "total_records": 0, "records": []},
     )
 
+    scheduler_repo.update_mode("simulate", policy_repo.get().cycle_interval_minutes)
     worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="proof")
     # Bounded number of iterations: one to queue+run the scan/reconcile,
     # one more to let the scheduler cycle observe the fresh snapshot.
