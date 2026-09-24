@@ -141,6 +141,56 @@ def get_scheduler_cycle(cycle_id: int):
     return jsonify({"cycle": cycle})
 
 
+# --- Read-only scheduled refresh/reconciliation (M5) ---------------------
+#
+# These endpoints only ever queue durable work for the worker in
+# app/worker.py; nothing here calls Sonarr. See RefreshService for the
+# read-only scan/reconciliation execution and its ReadOnlySonarrClient guard.
+
+@api_bp.get("/refresh")
+@api_bp.get("/refresh/settings")
+def get_refresh_settings():
+    return jsonify({"refresh": _services()["refresh"].status()})
+
+
+@api_bp.patch("/refresh")
+@api_bp.patch("/refresh/settings")
+def update_refresh_settings():
+    payload = request.get_json(silent=True)
+    settings, errors = _services()["refresh"].update_settings(payload)
+    if errors:
+        return jsonify({"errors": errors}), 400
+    return jsonify({"settings": settings, "refresh": _services()["refresh"].status()})
+
+
+@api_bp.post("/refresh/run-now")
+def run_refresh_now():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    library_id = payload.get("library_id")
+    if library_id is not None and (not isinstance(library_id, int) or isinstance(library_id, bool)):
+        return jsonify({"errors": ["library_id must be an integer"]}), 400
+    results, error = _services()["refresh"].queue_manual_scan(library_id)
+    if error:
+        return jsonify({"errors": [error]}), 404
+    return jsonify({"requests": results}), 202
+
+
+@api_bp.get("/refresh/runs")
+def list_refresh_runs():
+    limit = request.args.get("limit", default=50, type=int)
+    return jsonify({"runs": _services()["refresh"].list_runs(limit)})
+
+
+@api_bp.get("/refresh/runs/<int:run_id>")
+def get_refresh_run(run_id: int):
+    run = _services()["refresh"].run_detail(run_id)
+    if run is None:
+        return jsonify({"errors": ["refresh run not found"]}), 404
+    return jsonify({"run": run})
+
+
 # --- Activity (read-only) ------------------------------------------------
 
 @api_bp.get("/activity")

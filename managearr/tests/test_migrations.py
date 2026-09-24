@@ -322,6 +322,137 @@ def test_dispatch_audit_identity_and_rows_are_immutable(
     assert surviving_audit.library_name == lib.name
 
 
+# --- read-only refresh automation (v5) -----------------------------------
+
+def test_refresh_tables_and_columns_exist(database):
+    with database.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT table_name, column_name FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name IN (
+                  'refresh_settings', 'refresh_requests', 'refresh_runs',
+                  'refresh_run_reconciled_batches'
+              )
+            """
+        ).fetchall()
+    columns_by_table: dict[str, set[str]] = {}
+    for row in rows:
+        columns_by_table.setdefault(row["table_name"], set()).add(row["column_name"])
+
+    assert columns_by_table["refresh_settings"] == {
+        "id", "scan_max_age_minutes", "reconcile_min_interval_minutes",
+        "reconcile_max_per_cycle", "next_reconcile_due_at", "updated_at",
+    }
+    assert columns_by_table["refresh_requests"] == {
+        "id", "kind", "library_id", "library_name", "state", "requested_at",
+        "claimed_at", "finished_at", "claim_owner", "safe_summary",
+    }
+    assert columns_by_table["refresh_runs"] == {
+        "id", "request_id", "kind", "trigger", "state", "library_id", "library_name",
+        "scan_job_id", "worker_owner", "attempt", "queued_at", "started_at",
+        "finished_at", "target_count", "succeeded_count", "failed_count",
+        "skipped_count", "safe_summary",
+    }
+    assert columns_by_table["refresh_run_reconciled_batches"] == {
+        "id", "refresh_run_id", "dispatch_batch_id", "result", "reason", "created_at",
+    }
+
+
+def test_scheduler_library_results_gained_snapshot_columns(database):
+    with database.connect() as conn:
+        columns = {
+            row["column_name"]
+            for row in conn.execute(
+                """SELECT column_name FROM information_schema.columns
+                   WHERE table_schema='public' AND table_name='scheduler_library_results'"""
+            ).fetchall()
+        }
+    assert {"snapshot_taken_at", "snapshot_age_seconds"} <= columns
+
+
+def test_refresh_settings_seeded_with_conservative_defaults(database):
+    with database.connect() as conn:
+        row = conn.execute("SELECT * FROM refresh_settings WHERE id = 1").fetchone()
+    assert row["scan_max_age_minutes"] == 60
+    assert row["reconcile_min_interval_minutes"] == 15
+    assert row["reconcile_max_per_cycle"] == 10
+    assert row["next_reconcile_due_at"] is None
+
+
+def test_refresh_settings_rejects_out_of_range_values(database):
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with database.connect() as conn:
+            conn.execute("UPDATE refresh_settings SET scan_max_age_minutes = 0 WHERE id = 1")
+
+
+def test_refresh_runs_kind_library_shape_is_enforced(database):
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with database.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO refresh_runs (kind, trigger, state)
+                VALUES ('scan', 'scheduled', 'queued')
+                """
+            )
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with database.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO refresh_runs (kind, trigger, state, library_id, library_name)
+                VALUES ('reconcile', 'scheduled', 'queued', 1, 'x')
+                """
+            )
+
+
+def test_refresh_run_reconciled_batches_are_append_only(
+    database, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    lib = library_repo.create(
+        {"name": "Sonarr", "type": "sonarr", "url": "http://sonarr:8989", "api_key": "k", "enabled": True}
+    )
+    job = activity_repo.create({
+        "library_id": lib.id, "library_name": lib.name, "job_type": "sonarr_scan",
+        "state": "completed", "title": "scan",
+    })
+    with database.connect() as conn:
+        batch_id = dispatch_repo.create_batch(conn, {
+            "scan_job_id": job.id, "library_id": lib.id, "library_name": lib.name,
+            "mode": "manual", "state": "completed", "requested_count": 1,
+            "selected_count": 1, "dispatched_count": 1, "sonarr_command_id": 5,
+        })
+        run_id = conn.execute(
+            "INSERT INTO refresh_runs (kind, trigger, state) VALUES ('reconcile','scheduled','queued') RETURNING id"
+        ).fetchone()["id"]
+        conn.execute(
+            """
+            INSERT INTO refresh_run_reconciled_batches (refresh_run_id, dispatch_batch_id, result)
+            VALUES (%s, %s, 'resolved')
+            """,
+            (run_id, batch_id),
+        )
+    with pytest.raises(psycopg.errors.RaiseException):
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE refresh_run_reconciled_batches SET result = 'error' WHERE refresh_run_id = %s",
+                (run_id,),
+            )
+
+
+def test_refresh_run_state_transitions_are_controlled(database):
+    with database.connect() as conn:
+        run_id = conn.execute(
+            "INSERT INTO refresh_runs (kind, trigger, state) VALUES ('reconcile','scheduled','queued') RETURNING id"
+        ).fetchone()["id"]
+    with pytest.raises(psycopg.errors.RaiseException):
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE refresh_runs SET state='completed', started_at=now(), finished_at=now(), "
+                "worker_owner='w' WHERE id=%s",
+                (run_id,),
+            )
+
+
 def test_failed_pending_migration_rolls_back_ddl_and_bookkeeping(database, monkeypatch):
     bad = Migration(
         version=999,

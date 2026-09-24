@@ -744,6 +744,181 @@ MIGRATIONS: list[Migration] = [
                 FOR EACH ROW EXECUTE FUNCTION protect_scheduler_run_request();
         """,
     ),
+    Migration(
+        version=5,
+        name="readonly_refresh_automation",
+        sql="""
+            ALTER TABLE scheduler_library_results
+                ADD COLUMN snapshot_taken_at TIMESTAMPTZ,
+                ADD COLUMN snapshot_age_seconds INTEGER
+                    CHECK (snapshot_age_seconds IS NULL OR snapshot_age_seconds >= 0);
+
+            CREATE TABLE refresh_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                scan_max_age_minutes INTEGER NOT NULL DEFAULT 60
+                    CHECK (scan_max_age_minutes BETWEEN 5 AND 10080),
+                reconcile_min_interval_minutes INTEGER NOT NULL DEFAULT 15
+                    CHECK (reconcile_min_interval_minutes BETWEEN 5 AND 1440),
+                reconcile_max_per_cycle INTEGER NOT NULL DEFAULT 10
+                    CHECK (reconcile_max_per_cycle BETWEEN 1 AND 50),
+                next_reconcile_due_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            INSERT INTO refresh_settings (id) VALUES (1);
+
+            CREATE TABLE refresh_requests (
+                id BIGSERIAL PRIMARY KEY,
+                kind TEXT NOT NULL DEFAULT 'scan' CHECK (kind = 'scan'),
+                library_id BIGINT REFERENCES arr_libraries (id) ON DELETE SET NULL,
+                library_name VARCHAR(255) NOT NULL,
+                state TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (state IN ('queued', 'claimed', 'completed', 'failed')),
+                requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                claimed_at TIMESTAMPTZ,
+                finished_at TIMESTAMPTZ,
+                claim_owner VARCHAR(100),
+                safe_summary VARCHAR(1000) NOT NULL DEFAULT '',
+                CHECK (
+                    (state = 'queued' AND claimed_at IS NULL AND finished_at IS NULL AND claim_owner IS NULL)
+                    OR (state = 'claimed' AND claimed_at IS NOT NULL AND finished_at IS NULL AND claim_owner IS NOT NULL)
+                    OR (state IN ('completed', 'failed') AND claimed_at IS NOT NULL
+                        AND finished_at IS NOT NULL AND claim_owner IS NOT NULL)
+                )
+            );
+            CREATE UNIQUE INDEX uq_refresh_requests_active_library
+                ON refresh_requests (library_id)
+                WHERE state IN ('queued', 'claimed') AND library_id IS NOT NULL;
+            CREATE INDEX idx_refresh_requests_state_requested
+                ON refresh_requests (state, requested_at);
+
+            CREATE TABLE refresh_runs (
+                id BIGSERIAL PRIMARY KEY,
+                request_id BIGINT UNIQUE REFERENCES refresh_requests (id) ON DELETE RESTRICT,
+                kind TEXT NOT NULL CHECK (kind IN ('scan', 'reconcile')),
+                trigger TEXT NOT NULL CHECK (trigger IN ('scheduled', 'manual')),
+                state TEXT NOT NULL CHECK (
+                    state IN ('queued', 'running', 'completed', 'partial', 'failed', 'skipped')
+                ),
+                library_id BIGINT REFERENCES arr_libraries (id) ON DELETE SET NULL,
+                library_name VARCHAR(255) NOT NULL DEFAULT '',
+                scan_job_id BIGINT REFERENCES activity_jobs (id) ON DELETE RESTRICT,
+                worker_owner VARCHAR(100),
+                attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+                queued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                started_at TIMESTAMPTZ,
+                finished_at TIMESTAMPTZ,
+                target_count INTEGER NOT NULL DEFAULT 0 CHECK (target_count >= 0),
+                succeeded_count INTEGER NOT NULL DEFAULT 0 CHECK (succeeded_count >= 0),
+                failed_count INTEGER NOT NULL DEFAULT 0 CHECK (failed_count >= 0),
+                skipped_count INTEGER NOT NULL DEFAULT 0 CHECK (skipped_count >= 0),
+                safe_summary VARCHAR(1000) NOT NULL DEFAULT '',
+                CHECK (
+                    (kind = 'scan' AND (library_id IS NOT NULL OR state NOT IN ('queued', 'running')))
+                    OR (kind = 'reconcile' AND library_id IS NULL AND scan_job_id IS NULL)
+                ),
+                CHECK (
+                    (state = 'queued' AND started_at IS NULL AND finished_at IS NULL AND worker_owner IS NULL)
+                    OR (state = 'running' AND started_at IS NOT NULL AND finished_at IS NULL AND worker_owner IS NOT NULL)
+                    OR (state IN ('completed', 'partial', 'failed', 'skipped')
+                        AND started_at IS NOT NULL AND finished_at IS NOT NULL AND worker_owner IS NOT NULL)
+                ),
+                CHECK ((trigger = 'manual' AND request_id IS NOT NULL)
+                    OR (trigger = 'scheduled' AND request_id IS NULL))
+            );
+            CREATE UNIQUE INDEX uq_refresh_runs_active_scan_library
+                ON refresh_runs (library_id)
+                WHERE kind = 'scan' AND state IN ('queued', 'running');
+            CREATE UNIQUE INDEX uq_refresh_runs_active_reconcile
+                ON refresh_runs ((1))
+                WHERE kind = 'reconcile' AND state IN ('queued', 'running');
+            CREATE INDEX idx_refresh_runs_state_queued
+                ON refresh_runs (state, queued_at);
+            CREATE INDEX idx_refresh_runs_kind_library
+                ON refresh_runs (kind, library_id, finished_at DESC NULLS LAST, id DESC);
+            CREATE INDEX idx_refresh_runs_finished
+                ON refresh_runs (finished_at DESC NULLS LAST, id DESC);
+
+            CREATE TABLE refresh_run_reconciled_batches (
+                id BIGSERIAL PRIMARY KEY,
+                refresh_run_id BIGINT NOT NULL REFERENCES refresh_runs (id) ON DELETE RESTRICT,
+                dispatch_batch_id BIGINT NOT NULL REFERENCES dispatch_batches (id) ON DELETE RESTRICT,
+                result TEXT NOT NULL CHECK (
+                    result IN ('resolved', 'partial', 'unresolved', 'error', 'skipped')
+                ),
+                reason VARCHAR(500),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (refresh_run_id, dispatch_batch_id)
+            );
+            CREATE INDEX idx_refresh_run_reconciled_batches_run
+                ON refresh_run_reconciled_batches (refresh_run_id, id);
+            CREATE INDEX idx_refresh_run_reconciled_batches_batch
+                ON refresh_run_reconciled_batches (dispatch_batch_id, created_at DESC);
+
+            CREATE FUNCTION protect_refresh_append_only() RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'refresh audit rows are append-only';
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER protect_refresh_run_reconciled_batch
+                BEFORE UPDATE OR DELETE ON refresh_run_reconciled_batches
+                FOR EACH ROW EXECUTE FUNCTION protect_refresh_append_only();
+
+            CREATE FUNCTION protect_refresh_request() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    RAISE EXCEPTION 'refresh request audit rows cannot be deleted';
+                END IF;
+                IF NEW.kind IS DISTINCT FROM OLD.kind
+                   OR NEW.library_name IS DISTINCT FROM OLD.library_name
+                   OR NEW.requested_at IS DISTINCT FROM OLD.requested_at THEN
+                    RAISE EXCEPTION 'refresh request identity is immutable';
+                END IF;
+                IF OLD.library_id IS NOT NULL AND NEW.library_id IS NULL
+                   AND NEW.state IS NOT DISTINCT FROM OLD.state
+                   AND NEW.claimed_at IS NOT DISTINCT FROM OLD.claimed_at
+                   AND NEW.finished_at IS NOT DISTINCT FROM OLD.finished_at
+                   AND NEW.claim_owner IS NOT DISTINCT FROM OLD.claim_owner
+                   AND NEW.safe_summary IS NOT DISTINCT FROM OLD.safe_summary THEN
+                    RETURN NEW;
+                END IF;
+                IF OLD.state = 'queued' AND NEW.state = 'claimed' THEN RETURN NEW; END IF;
+                IF OLD.state = 'claimed' AND NEW.state IN ('completed', 'failed') THEN RETURN NEW; END IF;
+                RAISE EXCEPTION 'invalid refresh request state transition';
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER protect_refresh_request_row
+                BEFORE UPDATE OR DELETE ON refresh_requests
+                FOR EACH ROW EXECUTE FUNCTION protect_refresh_request();
+
+            CREATE FUNCTION protect_refresh_run() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    RAISE EXCEPTION 'refresh run audit rows cannot be deleted';
+                END IF;
+                IF NEW.request_id IS DISTINCT FROM OLD.request_id
+                   OR NEW.kind IS DISTINCT FROM OLD.kind
+                   OR NEW.trigger IS DISTINCT FROM OLD.trigger
+                   OR NEW.queued_at IS DISTINCT FROM OLD.queued_at THEN
+                    RAISE EXCEPTION 'refresh run identity is immutable';
+                END IF;
+                IF OLD.library_id IS NOT NULL AND NEW.library_id IS NULL
+                   AND NEW.state IS NOT DISTINCT FROM OLD.state
+                   AND NEW.started_at IS NOT DISTINCT FROM OLD.started_at
+                   AND NEW.finished_at IS NOT DISTINCT FROM OLD.finished_at
+                   AND NEW.worker_owner IS NOT DISTINCT FROM OLD.worker_owner THEN
+                    RETURN NEW;
+                END IF;
+                IF OLD.state = 'queued' AND NEW.state = 'running' THEN RETURN NEW; END IF;
+                IF OLD.state = 'running'
+                   AND NEW.state IN ('completed', 'partial', 'failed', 'skipped') THEN RETURN NEW; END IF;
+                RAISE EXCEPTION 'invalid refresh run state transition';
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER protect_refresh_run_row
+                BEFORE UPDATE OR DELETE ON refresh_runs
+                FOR EACH ROW EXECUTE FUNCTION protect_refresh_run();
+        """,
+    ),
 ]
 
 

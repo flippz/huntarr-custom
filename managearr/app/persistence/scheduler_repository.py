@@ -434,8 +434,9 @@ class SchedulerRepository:
                 INSERT INTO scheduler_library_results (
                     cycle_run_id, library_id, library_name, scan_job_id, state,
                     considered_count, selected_count, excluded_count, effective_cap,
-                    queue_occupancy, recent_success_count, upgrades_state, safe_summary
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+                    queue_occupancy, recent_success_count, upgrades_state, safe_summary,
+                    snapshot_taken_at, snapshot_age_seconds
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
                 """,
                 (
                     cycle_id, data.get("library_id"), data["library_name"], data.get("scan_job_id"),
@@ -443,6 +444,7 @@ class SchedulerRepository:
                     data.get("excluded_count", 0), data.get("effective_cap", 0),
                     data.get("queue_occupancy", 0), data.get("recent_success_count", 0),
                     data.get("upgrades_state", "unsupported"), data["safe_summary"][:1000],
+                    data.get("snapshot_taken_at"), data.get("snapshot_age_seconds"),
                 ),
             ).fetchone()
             result_id = row["id"]
@@ -492,6 +494,7 @@ class SchedulerRepository:
         for lib in libraries:
             item = dict(lib)
             item["created_at"] = _iso(item["created_at"])
+            item["snapshot_taken_at"] = _iso(item["snapshot_taken_at"])
             item["candidates"] = []
             by_library[item["id"]] = item
             result["libraries"].append(item)

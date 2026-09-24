@@ -4,7 +4,177 @@ Managearr is a standalone Flask/PostgreSQL rewrite beside the legacy Huntarr
 application (`main.py`, `src/`). It has its own image, database, port, API, and
 UI. Nothing in this application changes the legacy runtime.
 
-## Current milestone: restart-safe simulation scheduler (M4)
+## Current milestone: scheduled read-only refresh/reconciliation (M5)
+
+M5 adds a bounded, restart-safe read-only refresh/reconciliation facility to
+the same worker process introduced in M4. It keeps scheduler simulations
+working from fresh, auditable Sonarr snapshots and automatically follows up
+on already-dispatched manual searches, **without adding any new way to reach
+Sonarr's write endpoint**. There is still no `live` mode, no live-enable
+control, and no automatic dispatch, retry, delete, search, grab, or command
+POST anywhere in this milestone. The M3 manual dispatch endpoint remains the
+only write path in the whole application; M5 never imports
+`DispatchService` and never calls `SonarrClient.search_episodes`.
+
+### What M5 runs
+
+Two kinds of durable, read-only work, both executed by the same
+`managearr-worker` process and lease as the M4 scheduler:
+
+- **`scan`**: one read-only Sonarr candidate scan for one library, via the
+  existing `SonarrScanService` (see M1). Triggered either by an operator's
+  "refresh now" request or automatically when a library's latest completed
+  scan is missing or older than the configured freshness window.
+- **`reconcile`**: one bounded, GET-only pass of the existing
+  `ReconciliationService` (see M3) over dispatch batches that already have a
+  recorded Sonarr command id and a nonterminal/incomplete outcome. Triggered
+  automatically on a cooldown; there is no manual "reconcile now" endpoint in
+  this milestone (the per-batch manual `.../reconcile` endpoint from M3 is
+  unaffected and still exists separately).
+
+Both paths reach Sonarr only through `ReadOnlySonarrClient`
+(`app/adapters/read_only_sonarr_client.py`), a structural guard that exposes
+just the six GET-based methods those services use (`system_status`,
+`get_series`, `get_episodes`, `get_command`, `get_history`,
+`get_queue_details`) and raises `ReadOnlySonarrAdapterError` for anything
+else, including `search_episodes`. This is defense in depth on top of the
+fact that neither service ever calls a write method.
+
+### Schema v5 and durable audit
+
+Migration v5 adds:
+
+- `refresh_settings`: a singleton row holding `scan_max_age_minutes`
+  (default 60), `reconcile_min_interval_minutes` (default 15),
+  `reconcile_max_per_cycle` (default 10), and the next cooldown-gated
+  reconcile due time. There is no `live` field and no way to add one through
+  the validated update path.
+- `refresh_requests`: durable manual "refresh now" requests, one row per
+  targeted library, coalesced by a partial unique index so concurrent/
+  repeated requests for the same library return the same queued/claimed row.
+- `refresh_runs`: queued/running/completed/partial/failed/skipped execution
+  records for both kinds, with trigger (`scheduled`/`manual`), library,
+  resulting `scan_job_id` when applicable, attempt count, target/succeeded/
+  failed/skipped counts, worker owner, timestamps, and a static safe
+  summary. A partial unique index guarantees at most one active (queued or
+  running) scan run per library and at most one active reconcile run
+  globally - scans are never executed concurrently for the same library.
+- `refresh_run_reconciled_batches`: an append-only join recording, per
+  reconcile run, which dispatch batch it touched and the resulting
+  `resolved`/`partial`/`unresolved`/`error`/`skipped` outcome - the
+  association between a reconcile run and the reconciliation evidence it
+  produced.
+- `scheduler_library_results` gained `snapshot_taken_at` and
+  `snapshot_age_seconds`, so every M4 cycle library result also records the
+  age of the scan snapshot it planned from (or `NULL` when it was skipped).
+
+Controlled transitions, append-only rows, foreign keys, count/length checks,
+and indexes follow the same patterns as the M2-M4 ledgers. Only normalized
+ids, counts, and static summaries are stored - never library URLs, API keys,
+exception text, or raw Sonarr payloads. Deleting a library sets `library_id`
+to `NULL` on its historical `refresh_requests`/`refresh_runs` rows (like
+every other audit table in this app) rather than blocking the delete or
+breaking the row's own constraints.
+
+### Worker orchestration
+
+Each `run_once()` iteration of the existing single-lease-owning worker now
+also, in order: recovers any `refresh_runs` left `running` by an expired
+lease owner (terminalized `failed`, never retried, mirroring M4's cycle
+recovery); claims queued manual scan requests into queued runs (skipping a
+library that already has an active scan run rather than duplicating it, and
+explicitly failing a request whose library was deleted); queues one scan run
+per enabled Sonarr library whose latest completed scan is missing or stale;
+queues one reconciliation run when the cooldown has elapsed and at least one
+dispatch batch is eligible; and finally executes **at most one** queued
+refresh run (manual requests and scans before reconciliation) before moving
+on to the M4 scheduler cycle claim/execute step it already had. Nothing
+sleeps inside a transaction, and a 429/5xx/timeout from Sonarr is recorded as
+a failed/error run/batch outcome - never retried in a tight loop, only
+picked up again on the worker's normal poll cadence or the reconcile
+cooldown.
+
+Because the freshness sweep runs before the scheduler cycle claim in the same
+iteration, a library whose scan finishes synchronously within that iteration
+is already fresh by the time the cycle plans it. If it isn't (still queued,
+running, or genuinely stale), `SchedulerService._plan_library` skips that
+library with an explicit reason ("no snapshot", "past the freshness window",
+and whether a refresh is already queued/running) and records `NULL`
+snapshot age - it never silently plans from a stale snapshot. A later cycle
+picks the library up once its scan completes.
+
+Automatic reconciliation only ever selects manual dispatch batches with a
+recorded Sonarr command id in `completed`/`partial`/`ambiguous` state whose
+`reconciliation_state` isn't already `resolved`, bounded by
+`reconcile_max_per_cycle` and ordered oldest-first. Dry-run batches and
+batches without a command id are excluded by that query before any Sonarr
+read; if one is ever reached anyway, `ReconciliationService`'s own
+validation still rejects it with a safe reason, recorded as a `skipped`
+per-batch outcome and never retried. `RefreshService.execute_run` counts a
+successful GET-based reconciliation attempt as "succeeded" for the run's own
+lifecycle regardless of whether the business outcome was itself
+resolved/partial/unresolved - that detail lives in
+`refresh_run_reconciled_batches`; a completed search command is still never
+treated as proof of a grab or import (unchanged from M3).
+
+### API and UI
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET/PATCH | `/api/v1/refresh/settings` (alias `/api/v1/refresh`) | Read freshness/reconcile settings, active runs, and latest scan/reconcile; change the three bounded settings |
+| POST | `/api/v1/refresh/run-now` | Idempotently queue a read-only scan for one library (`library_id`) or every enabled Sonarr library (no body) |
+| GET | `/api/v1/refresh/runs` | Recent refresh run summaries |
+| GET | `/api/v1/refresh/runs/<id>` | Run detail, including reconciled-batch outcomes |
+
+Overview and Settings both show the latest scan, latest reconciliation, and
+the count of queued/running refreshes, with prominent **"Read-only refresh
+automation never sends Sonarr commands"** text next to the existing M4
+simulation notice. There is no live-mode control anywhere in this UI.
+
+### Safety proof and limitations
+
+Real-PostgreSQL tests (`managearr/tests/test_refresh.py`, plus v5 coverage in
+`test_migrations.py`) cover: migration v5 idempotence/rollback/constraints;
+manual scan request coalescing under concurrent callers and bounded claiming;
+exactly-one-active-scan-per-library enforcement; scheduled stale-vs-fresh
+planning (a stale/missing snapshot is skipped with an explicit reason, never
+silently used); bounded, oldest-first reconciliation selection that excludes
+dry-run/resolved/no-command batches; a dry-run batch reaching the reconcile
+step regardless is skipped with a reason rather than retried; restart
+recovery terminalizing interrupted runs and requests without duplication;
+429/timeout-shaped Sonarr errors recorded as failed/error outcomes with no
+secret or URL leakage; a full worker iteration proving zero calls to
+`SonarrClient.search_episodes` and `DispatchService.dispatch` while still
+exercising every read method; and the settings/run-now/runs API plus UI
+wiring and redaction.
+
+M5 limitations are intentional: no manual "reconcile now" endpoint (only the
+automatic cooldown-gated sweep, plus the existing separate M3 per-batch
+manual reconcile), no cross-library batching of reconciliation beyond the
+configured per-cycle cap, no upgrade-aware refresh, and no change to M4's
+"no live dispatch" boundary. A stale snapshot delays that library's next
+planned cycle by at most one worker iteration once its refresh scan
+completes; it is never used unknowingly.
+
+### Deployment and rollback
+
+No Compose changes are required: `managearr-worker` already runs
+`python -m app.worker` and picks up the new refresh loop automatically.
+Deploy the same way as M4:
+
+```bash
+docker compose -f compose.managearr.yml up -d --build managearr managearr-worker
+```
+
+Migration v5 only adds new tables and two new nullable/defaulted columns on
+`scheduler_library_results`; it does not alter or drop any M1-M4 data. There
+is no down-migration (consistent with v1-v4): rolling the application code
+back to a pre-M5 build still works against a v5 database because the older
+code never reads the new tables/columns. Freshness/reconcile settings start
+at conservative defaults (60/15/10) on every fresh install and require no
+manual backfill.
+
+## Previous milestone: restart-safe simulation scheduler (M4)
 
 M4 adds a dedicated scheduler worker and durable PostgreSQL planning ledger.
 It is **simulation-only**: production defaults to scheduler mode `off`, the only
@@ -198,12 +368,14 @@ managearr/
       dispatch.py    dispatch batch/item model and limits
     adapters/
       sonarr_client.py   bounded Sonarr v3 GETs plus the single allowed POST
+      read_only_sonarr_client.py   GET-only guard used by the refresh worker
       redaction.py
     persistence/
       database.py
-      migrations.py      PostgreSQL schema v1 + dispatch v2 + outcomes v3 + scheduler v4
+      migrations.py      PostgreSQL schema v1 + dispatch v2 + outcomes v3 + scheduler v4 + refresh v5
       dispatch_repository.py
       scheduler_repository.py
+      refresh_repository.py
       outcome_repository.py
       *_repository.py
     services/
@@ -212,8 +384,10 @@ managearr/
       dispatch_service.py
       reconciliation_service.py
       scheduler_service.py    simulation-only planner
+      refresh_service.py      read-only scan/reconcile execution (worker-only)
+      refresh_settings_service.py
       library_readiness.py
-    worker.py              dedicated lease-owning process
+    worker.py              dedicated lease-owning process; scheduler + refresh
     api/routes.py
     web/             Jinja templates and vanilla JS/CSS
   tools/import_sqlite.py
@@ -448,13 +622,17 @@ cover command queued/completed/failed/aborted normalization, no false success,
 grab/download/import/failure mapping, unrelated-event exclusion, pagination
 bounds, crash ambiguity, cross-library rejection, idempotent reruns, append-only
 evidence, safe errors, and no secret/raw-payload leakage. Sonarr remains mocked.
+M4/M5 coverage (`test_scheduler.py`, `test_refresh.py`, and the v4/v5 sections
+of `test_migrations.py`) is summarized in their own sections above.
 
 ## Current limitations
 
 - Sonarr only; other Arr types remain CRUD-only.
-- Dispatch and reconciliation are manual only; no scheduler, worker, polling,
-  automatic retry/search, download-client API, grab, download, or import
-  pipeline exists.
+- Dispatch itself is manual only. Reconciliation runs both on explicit
+  operator request (M3) and on a bounded automatic cooldown (M5); neither
+  path ever dispatches, retries, or sends a search - see M4/M5 above for the
+  read-only scheduler/refresh worker. No download-client API, grab,
+  download, or import pipeline exists.
 - Managearr has no authentication/authorization yet; protect the service at the
   network/reverse-proxy layer.
 - A process crash after Sonarr accepts a command but before local finalization

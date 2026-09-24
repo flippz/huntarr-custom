@@ -15,10 +15,13 @@ from app.persistence.scan_candidate_repository import ScanCandidateRepository
 from app.persistence.dispatch_repository import DispatchRepository
 from app.persistence.outcome_repository import OutcomeRepository
 from app.persistence.scheduler_repository import SchedulerRepository
+from app.persistence.refresh_repository import RefreshRepository
 from app.services.dispatch_planning_service import DispatchPlanningService
 from app.services.dispatch_service import DispatchService
 from app.services.reconciliation_service import ReconciliationService
 from app.services.scheduler_service import SchedulerService
+from app.services.refresh_service import RefreshService
+from app.services.refresh_settings_service import RefreshSettingsService
 
 # Tests run against a real PostgreSQL instance - no SQLite/mock DB layer.
 # Point MANAGEARR_TEST_DB_* at a disposable database; the suite truncates
@@ -35,7 +38,8 @@ _DATA_TABLES = (
     "arr_libraries, automation_policy, activity_jobs, scan_candidates, "
     "dispatch_batches, dispatch_batch_items, dispatch_reconciliation_attempts, dispatch_outcome_events, "
     "scheduler_candidate_results, scheduler_library_results, scheduler_cycle_runs, "
-    "scheduler_run_requests, scheduler_mode_audit"
+    "scheduler_run_requests, scheduler_mode_audit, "
+    "refresh_run_reconciled_batches, refresh_runs, refresh_requests"
 )
 
 
@@ -77,6 +81,11 @@ def _app(_migrated_db):
 def _reset_tables(_migrated_db):
     with _migrated_db.connect() as conn:
         conn.execute("UPDATE scheduler_settings SET mode = 'off', next_due_at = NULL, updated_at = now()")
+        conn.execute(
+            "UPDATE refresh_settings SET scan_max_age_minutes = 60, "
+            "reconcile_min_interval_minutes = 15, reconcile_max_per_cycle = 10, "
+            "next_reconcile_due_at = NULL, updated_at = now()"
+        )
         conn.execute(f"TRUNCATE {_DATA_TABLES} RESTART IDENTITY CASCADE")
         conn.execute(
             "UPDATE scheduler_leases SET owner_id = NULL, acquired_at = NULL, "
@@ -145,8 +154,13 @@ def scheduler_repo(database):
 
 
 @pytest.fixture
-def scheduler_service(scheduler_repo, policy_repo):
-    return SchedulerService(scheduler_repo, policy_repo)
+def refresh_repo(database):
+    return RefreshRepository(database)
+
+
+@pytest.fixture
+def scheduler_service(scheduler_repo, policy_repo, refresh_repo):
+    return SchedulerService(scheduler_repo, policy_repo, refresh_repo)
 
 
 @pytest.fixture
@@ -154,3 +168,13 @@ def reconciliation_service(dispatch_repo, outcome_repo, library_repo, activity_r
     return ReconciliationService(
         dispatch_repo, outcome_repo, library_repo, activity_repo, candidate_repo
     )
+
+
+@pytest.fixture
+def refresh_settings_service(refresh_repo):
+    return RefreshSettingsService(refresh_repo)
+
+
+@pytest.fixture
+def refresh_service(refresh_repo, library_repo, activity_repo, candidate_repo, dispatch_repo, outcome_repo):
+    return RefreshService(refresh_repo, library_repo, activity_repo, candidate_repo, dispatch_repo, outcome_repo)

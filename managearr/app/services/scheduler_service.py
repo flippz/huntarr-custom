@@ -1,17 +1,25 @@
 """Restart-safe simulation planning. This module has no Sonarr adapter dependency."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from random import Random
 
 from ..domain.scheduler import MAX_SIMULATION_SELECTION, validate_scheduler_settings
 from ..persistence.policy_repository import PolicyRepository
+from ..persistence.refresh_repository import RefreshRepository
 from ..persistence.scheduler_repository import SchedulerRepository
 
 
 class SchedulerService:
-    def __init__(self, scheduler_repo: SchedulerRepository, policy_repo: PolicyRepository):
+    def __init__(
+        self,
+        scheduler_repo: SchedulerRepository,
+        policy_repo: PolicyRepository,
+        refresh_repo: RefreshRepository | None = None,
+    ):
         self.scheduler_repo = scheduler_repo
         self.policy_repo = policy_repo
+        self.refresh_repo = refresh_repo or RefreshRepository(scheduler_repo.db)
 
     def settings(self) -> dict:
         return self.scheduler_repo.status()
@@ -136,10 +144,27 @@ class SchedulerService:
             if policy["upgrades_enabled"] else "Upgrade planning is disabled."
         )
         scan = self.scheduler_repo.latest_completed_scan(library["id"])
-        if scan is None:
+        max_age_minutes = self.refresh_repo.get_settings().scan_max_age_minutes
+        now = datetime.now(timezone.utc)
+        age_seconds = int((now - scan["updated_at"]).total_seconds()) if scan is not None else None
+        stale = scan is None or age_seconds > max_age_minutes * 60
+        if stale:
+            active_refresh = self.refresh_repo.has_active_scan(library["id"])
+            refresh_note = (
+                "a read-only refresh scan is already queued or running."
+                if active_refresh else
+                "a read-only refresh scan will be queued for the next iteration."
+            )
+            if scan is None:
+                reason = f"No completed Sonarr scan snapshot; {refresh_note}"
+            else:
+                reason = (
+                    f"Latest scan snapshot is {age_seconds // 60} minute(s) old, past the "
+                    f"{max_age_minutes} minute freshness window; {refresh_note}"
+                )
             return ({
                 "library_id": library["id"], "library_name": library["name"], "state": "skipped",
-                "safe_summary": f"No completed Sonarr scan snapshot. {upgrade_note}",
+                "safe_summary": f"{reason} {upgrade_note}",
                 "upgrades_state": upgrades_state, "considered_count": 0, "selected_count": 0,
                 "excluded_count": 0, "effective_cap": 0,
             }, [])
@@ -195,17 +220,21 @@ class SchedulerService:
         considered = len(candidates)
         state = "completed" if policy["missing_enabled"] else "skipped"
         summary = (
-            f"Latest completed scan {scan['id']}: selected {selected_count} of {considered}; "
+            f"Latest completed scan {scan['id']} ({age_seconds // 60} minute(s) old): "
+            f"selected {selected_count} of {considered}; "
             f"effective cap {effective_cap} = min(safety {MAX_SIMULATION_SELECTION}, "
             f"hourly remaining {hourly_remaining}, queue remaining {queue_remaining}, "
             f"successful-grab remaining {success_remaining}). {upgrade_note}"
         )
+        if "truncated" in (scan.get("details") or ""):
+            summary += " The source scan snapshot was truncated at its candidate cap."
         return ({
             "library_id": library["id"], "library_name": library["name"], "scan_job_id": scan["id"],
             "state": state, "considered_count": considered, "selected_count": selected_count,
             "excluded_count": considered - selected_count, "effective_cap": effective_cap,
             "queue_occupancy": facts["queue_occupancy"],
             "recent_success_count": facts["recent_success_count"],
+            "snapshot_taken_at": scan["updated_at"], "snapshot_age_seconds": age_seconds,
             "upgrades_state": upgrades_state, "safe_summary": summary,
         }, results)
 

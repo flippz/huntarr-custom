@@ -37,7 +37,7 @@ def _run_manual(worker, scheduler_repo):
 
 
 def test_v4_schema_constraints_and_indexes(database):
-    assert MIGRATIONS[-1].version == 4
+    assert MIGRATIONS[3].version == 4
     with database.connect() as conn:
         tables = {r["table_name"] for r in conn.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"

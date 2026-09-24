@@ -19,6 +19,17 @@
   <p class="muted" id="scheduler-latest">Latest cycle: none</p>
 </section>
 <section class="card">
+  <h2>Read-only refresh automation</h2>
+  <p class="simulation-notice"><strong>Read-only refresh automation never sends Sonarr commands.</strong> It only runs scans and reconciliation reads.</p>
+  <p>Scan freshness window: <strong id="refresh-scan-age">-</strong> minute(s) · Reconcile every <strong id="refresh-reconcile-interval">-</strong> minute(s), up to <strong id="refresh-reconcile-max">-</strong> per pass</p>
+  <p>Latest scan: <span id="refresh-latest-scan">none</span></p>
+  <p>Latest reconciliation: <span id="refresh-latest-reconcile">none</span></p>
+  <p>Queued/running refreshes: <span id="refresh-active">0</span></p>
+  <div class="form-actions">
+    <button type="button" id="refresh-run-now" class="button-secondary">Run scan refresh now (all enabled libraries)</button>
+  </div>
+</section>
+<section class="card">
   <h2>Automation policy</h2>
   <p id="policy-summary" class="muted">Loading...</p>
   <form id="policy-form" class="form-grid">
@@ -83,6 +94,29 @@ async function loadScheduler() {
   const latest = scheduler.latest_cycle;
   setText('scheduler-latest', latest ? `Latest cycle: #${latest.id} ${latest.state} (${latest.trigger})` : 'Latest cycle: none');
 }
+
+async function loadRefresh() {
+  const refresh = (await api('/api/v1/refresh')).refresh;
+  setText('refresh-scan-age', refresh.settings.scan_max_age_minutes);
+  setText('refresh-reconcile-interval', refresh.settings.reconcile_min_interval_minutes);
+  setText('refresh-reconcile-max', refresh.settings.reconcile_max_per_cycle);
+  const scan = refresh.latest_scan;
+  const reconcile = refresh.latest_reconcile;
+  setText('refresh-latest-scan', scan ? `#${scan.id} ${scan.state} (${scan.library_name})` : 'none');
+  setText('refresh-latest-reconcile', reconcile ? `#${reconcile.id} ${reconcile.state}` : 'none');
+  setText('refresh-active', refresh.active_runs.length);
+}
+
+document.getElementById('refresh-run-now').addEventListener('click', async () => {
+  try {
+    const data = await api('/api/v1/refresh/run-now', { method: 'POST', body: {} });
+    const created = data.requests.filter(r => r.created).length;
+    toast(created ? `Queued ${created} read-only scan refresh(es)` : 'A scan refresh is already queued for every enabled library');
+    await loadRefresh();
+  } catch (err) { toast('Refresh queue failed: ' + err.message); }
+});
+
+loadRefresh().catch(err => toast('Failed to load refresh automation: ' + err.message));
 
 async function loadPolicy() {
   const data = await api('/api/v1/policy');
