@@ -514,6 +514,236 @@ MIGRATIONS: list[Migration] = [
             $$ LANGUAGE plpgsql;
         """,
     ),
+    Migration(
+        version=4,
+        name="simulation_scheduler",
+        sql="""
+            CREATE TABLE scheduler_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                mode TEXT NOT NULL DEFAULT 'off' CHECK (mode IN ('off', 'simulate')),
+                next_due_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            INSERT INTO scheduler_settings (id, mode, next_due_at, updated_at)
+            VALUES (1, 'off', NULL, now());
+
+            CREATE TABLE scheduler_mode_audit (
+                id BIGSERIAL PRIMARY KEY,
+                previous_mode TEXT NOT NULL CHECK (previous_mode IN ('off', 'simulate')),
+                new_mode TEXT NOT NULL CHECK (new_mode IN ('off', 'simulate')),
+                changed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                source TEXT NOT NULL DEFAULT 'application'
+                    CHECK (source IN ('application', 'migration')),
+                CHECK (previous_mode <> new_mode)
+            );
+
+            CREATE TABLE scheduler_leases (
+                lease_name TEXT PRIMARY KEY CHECK (lease_name = 'cycle-worker'),
+                owner_id VARCHAR(100),
+                acquired_at TIMESTAMPTZ,
+                heartbeat_at TIMESTAMPTZ,
+                expires_at TIMESTAMPTZ,
+                CHECK (
+                    (owner_id IS NULL AND acquired_at IS NULL AND heartbeat_at IS NULL AND expires_at IS NULL)
+                    OR (owner_id IS NOT NULL AND acquired_at IS NOT NULL
+                        AND heartbeat_at IS NOT NULL AND expires_at IS NOT NULL
+                        AND expires_at > heartbeat_at)
+                )
+            );
+            INSERT INTO scheduler_leases (lease_name) VALUES ('cycle-worker');
+
+            CREATE TABLE scheduler_run_requests (
+                id BIGSERIAL PRIMARY KEY,
+                request_kind TEXT NOT NULL DEFAULT 'simulation'
+                    CHECK (request_kind = 'simulation'),
+                state TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (state IN ('queued', 'claimed', 'completed', 'failed')),
+                requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                claimed_at TIMESTAMPTZ,
+                finished_at TIMESTAMPTZ,
+                claim_owner VARCHAR(100),
+                safe_summary VARCHAR(1000) NOT NULL DEFAULT '',
+                CHECK (
+                    (state = 'queued' AND claimed_at IS NULL AND finished_at IS NULL AND claim_owner IS NULL)
+                    OR (state = 'claimed' AND claimed_at IS NOT NULL AND finished_at IS NULL AND claim_owner IS NOT NULL)
+                    OR (state IN ('completed', 'failed') AND claimed_at IS NOT NULL
+                        AND finished_at IS NOT NULL AND claim_owner IS NOT NULL)
+                )
+            );
+            CREATE UNIQUE INDEX uq_scheduler_one_active_manual_request
+                ON scheduler_run_requests (request_kind)
+                WHERE state IN ('queued', 'claimed');
+            CREATE INDEX idx_scheduler_run_requests_state_requested
+                ON scheduler_run_requests (state, requested_at);
+
+            CREATE TABLE scheduler_cycle_runs (
+                id BIGSERIAL PRIMARY KEY,
+                request_id BIGINT UNIQUE REFERENCES scheduler_run_requests (id) ON DELETE RESTRICT,
+                trigger TEXT NOT NULL CHECK (trigger IN ('scheduled', 'manual')),
+                state TEXT NOT NULL CHECK (
+                    state IN ('queued', 'running', 'completed', 'partial', 'failed', 'skipped')
+                ),
+                mode_snapshot TEXT NOT NULL CHECK (mode_snapshot = 'simulate'),
+                policy_snapshot JSONB NOT NULL CHECK (jsonb_typeof(policy_snapshot) = 'object'),
+                random_seed BIGINT,
+                worker_owner VARCHAR(100),
+                queued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                started_at TIMESTAMPTZ,
+                finished_at TIMESTAMPTZ,
+                library_count INTEGER NOT NULL DEFAULT 0 CHECK (library_count >= 0),
+                completed_library_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                    completed_library_count >= 0 AND completed_library_count <= library_count
+                ),
+                failed_library_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                    failed_library_count >= 0 AND failed_library_count <= library_count
+                ),
+                considered_count INTEGER NOT NULL DEFAULT 0 CHECK (considered_count >= 0),
+                selected_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                    selected_count >= 0 AND selected_count <= considered_count
+                ),
+                excluded_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                    excluded_count >= 0 AND excluded_count <= considered_count
+                ),
+                safe_summary VARCHAR(1000) NOT NULL DEFAULT '',
+                CHECK (selected_count + excluded_count <= considered_count),
+                CHECK (
+                    (state = 'queued' AND started_at IS NULL AND finished_at IS NULL AND worker_owner IS NULL)
+                    OR (state = 'running' AND started_at IS NOT NULL AND finished_at IS NULL AND worker_owner IS NOT NULL)
+                    OR (state IN ('completed', 'partial', 'failed', 'skipped')
+                        AND started_at IS NOT NULL AND finished_at IS NOT NULL AND worker_owner IS NOT NULL)
+                ),
+                CHECK ((trigger = 'manual' AND request_id IS NOT NULL)
+                    OR (trigger = 'scheduled' AND request_id IS NULL))
+            );
+            CREATE INDEX idx_scheduler_cycle_runs_state_queued
+                ON scheduler_cycle_runs (state, queued_at);
+            CREATE INDEX idx_scheduler_cycle_runs_finished
+                ON scheduler_cycle_runs (finished_at DESC NULLS LAST, id DESC);
+
+            CREATE TABLE scheduler_library_results (
+                id BIGSERIAL PRIMARY KEY,
+                cycle_run_id BIGINT NOT NULL REFERENCES scheduler_cycle_runs (id) ON DELETE RESTRICT,
+                library_id BIGINT REFERENCES arr_libraries (id) ON DELETE SET NULL,
+                library_name VARCHAR(255) NOT NULL,
+                scan_job_id BIGINT REFERENCES activity_jobs (id) ON DELETE RESTRICT,
+                state TEXT NOT NULL CHECK (state IN ('completed', 'skipped', 'failed')),
+                considered_count INTEGER NOT NULL DEFAULT 0 CHECK (considered_count >= 0),
+                selected_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                    selected_count >= 0 AND selected_count <= considered_count
+                ),
+                excluded_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                    excluded_count >= 0 AND excluded_count <= considered_count
+                ),
+                effective_cap INTEGER NOT NULL DEFAULT 0 CHECK (effective_cap BETWEEN 0 AND 25),
+                queue_occupancy INTEGER NOT NULL DEFAULT 0 CHECK (queue_occupancy >= 0),
+                recent_success_count INTEGER NOT NULL DEFAULT 0 CHECK (recent_success_count >= 0),
+                upgrades_state TEXT NOT NULL DEFAULT 'unsupported'
+                    CHECK (upgrades_state IN ('disabled', 'unsupported')),
+                safe_summary VARCHAR(1000) NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                CHECK (selected_count + excluded_count <= considered_count),
+                UNIQUE (cycle_run_id, library_id)
+            );
+            CREATE INDEX idx_scheduler_library_results_cycle
+                ON scheduler_library_results (cycle_run_id, id);
+            CREATE INDEX idx_scheduler_library_results_library
+                ON scheduler_library_results (library_id, created_at DESC);
+
+            CREATE TABLE scheduler_candidate_results (
+                id BIGSERIAL PRIMARY KEY,
+                cycle_run_id BIGINT NOT NULL REFERENCES scheduler_cycle_runs (id) ON DELETE RESTRICT,
+                library_result_id BIGINT NOT NULL REFERENCES scheduler_library_results (id) ON DELETE RESTRICT,
+                candidate_id BIGINT NOT NULL REFERENCES scan_candidates (id) ON DELETE RESTRICT,
+                episode_id INTEGER NOT NULL CHECK (episode_id > 0),
+                series_id INTEGER NOT NULL CHECK (series_id > 0),
+                series_title VARCHAR(500) NOT NULL,
+                season_number INTEGER NOT NULL CHECK (season_number >= 0),
+                episode_number INTEGER NOT NULL CHECK (episode_number >= 0),
+                air_date VARCHAR(50),
+                candidate_reason VARCHAR(100) NOT NULL,
+                selected BOOLEAN NOT NULL,
+                exclusion_reason VARCHAR(500),
+                order_position INTEGER CHECK (order_position IS NULL OR order_position > 0),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                CHECK ((selected AND exclusion_reason IS NULL AND order_position IS NOT NULL)
+                    OR (NOT selected AND exclusion_reason IS NOT NULL)),
+                UNIQUE (cycle_run_id, candidate_id)
+            );
+            CREATE INDEX idx_scheduler_candidate_results_cycle_selected
+                ON scheduler_candidate_results (cycle_run_id, selected, order_position);
+            CREATE INDEX idx_scheduler_candidate_results_library
+                ON scheduler_candidate_results (library_result_id, id);
+
+            CREATE FUNCTION audit_scheduler_mode_change() RETURNS trigger AS $$
+            BEGIN
+                IF NEW.mode IS DISTINCT FROM OLD.mode THEN
+                    INSERT INTO scheduler_mode_audit (previous_mode, new_mode, changed_at, source)
+                    VALUES (OLD.mode, NEW.mode, now(), 'application');
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER audit_scheduler_mode_change_row
+                AFTER UPDATE ON scheduler_settings
+                FOR EACH ROW EXECUTE FUNCTION audit_scheduler_mode_change();
+
+            CREATE FUNCTION protect_scheduler_append_only() RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'scheduler audit rows are append-only';
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER protect_scheduler_mode_audit
+                BEFORE UPDATE OR DELETE ON scheduler_mode_audit
+                FOR EACH ROW EXECUTE FUNCTION protect_scheduler_append_only();
+            CREATE TRIGGER protect_scheduler_library_result
+                BEFORE UPDATE OR DELETE ON scheduler_library_results
+                FOR EACH ROW EXECUTE FUNCTION protect_scheduler_append_only();
+            CREATE TRIGGER protect_scheduler_candidate_result
+                BEFORE UPDATE OR DELETE ON scheduler_candidate_results
+                FOR EACH ROW EXECUTE FUNCTION protect_scheduler_append_only();
+
+            CREATE FUNCTION protect_scheduler_cycle_run() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    RAISE EXCEPTION 'scheduler cycle audit rows cannot be deleted';
+                END IF;
+                IF NEW.request_id IS DISTINCT FROM OLD.request_id
+                   OR NEW.trigger IS DISTINCT FROM OLD.trigger
+                   OR NEW.mode_snapshot IS DISTINCT FROM OLD.mode_snapshot
+                   OR NEW.policy_snapshot IS DISTINCT FROM OLD.policy_snapshot
+                   OR NEW.random_seed IS DISTINCT FROM OLD.random_seed
+                   OR NEW.queued_at IS DISTINCT FROM OLD.queued_at THEN
+                    RAISE EXCEPTION 'scheduler cycle identity is immutable';
+                END IF;
+                IF OLD.state = 'queued' AND NEW.state = 'running' THEN RETURN NEW; END IF;
+                IF OLD.state = 'running'
+                   AND NEW.state IN ('completed', 'partial', 'failed', 'skipped') THEN RETURN NEW; END IF;
+                RAISE EXCEPTION 'invalid scheduler cycle state transition';
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER protect_scheduler_cycle_run_row
+                BEFORE UPDATE OR DELETE ON scheduler_cycle_runs
+                FOR EACH ROW EXECUTE FUNCTION protect_scheduler_cycle_run();
+
+            CREATE FUNCTION protect_scheduler_run_request() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    RAISE EXCEPTION 'scheduler request audit rows cannot be deleted';
+                END IF;
+                IF NEW.request_kind IS DISTINCT FROM OLD.request_kind
+                   OR NEW.requested_at IS DISTINCT FROM OLD.requested_at THEN
+                    RAISE EXCEPTION 'scheduler request identity is immutable';
+                END IF;
+                IF OLD.state = 'queued' AND NEW.state = 'claimed' THEN RETURN NEW; END IF;
+                IF OLD.state = 'claimed' AND NEW.state IN ('completed', 'failed') THEN RETURN NEW; END IF;
+                RAISE EXCEPTION 'invalid scheduler request state transition';
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER protect_scheduler_run_request_row
+                BEFORE UPDATE OR DELETE ON scheduler_run_requests
+                FOR EACH ROW EXECUTE FUNCTION protect_scheduler_run_request();
+        """,
+    ),
 ]
 
 

@@ -45,6 +45,7 @@ class PolicyRepository:
                     hourly_api_cap, successful_grab_target, dispatch_interval_seconds,
                     queue_target, cooldown_minutes, search_order, updated_at
                 ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO NOTHING
                 """,
                 (
                     defaults["missing_enabled"],

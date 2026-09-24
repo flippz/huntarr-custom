@@ -14,9 +14,11 @@ from app.persistence.activity_repository import ActivityRepository
 from app.persistence.scan_candidate_repository import ScanCandidateRepository
 from app.persistence.dispatch_repository import DispatchRepository
 from app.persistence.outcome_repository import OutcomeRepository
+from app.persistence.scheduler_repository import SchedulerRepository
 from app.services.dispatch_planning_service import DispatchPlanningService
 from app.services.dispatch_service import DispatchService
 from app.services.reconciliation_service import ReconciliationService
+from app.services.scheduler_service import SchedulerService
 
 # Tests run against a real PostgreSQL instance - no SQLite/mock DB layer.
 # Point MANAGEARR_TEST_DB_* at a disposable database; the suite truncates
@@ -31,7 +33,9 @@ TEST_DB_CONFIG = dict(
 
 _DATA_TABLES = (
     "arr_libraries, automation_policy, activity_jobs, scan_candidates, "
-    "dispatch_batches, dispatch_batch_items, dispatch_reconciliation_attempts, dispatch_outcome_events"
+    "dispatch_batches, dispatch_batch_items, dispatch_reconciliation_attempts, dispatch_outcome_events, "
+    "scheduler_candidate_results, scheduler_library_results, scheduler_cycle_runs, "
+    "scheduler_run_requests, scheduler_mode_audit"
 )
 
 
@@ -72,7 +76,12 @@ def _app(_migrated_db):
 @pytest.fixture
 def _reset_tables(_migrated_db):
     with _migrated_db.connect() as conn:
+        conn.execute("UPDATE scheduler_settings SET mode = 'off', next_due_at = NULL, updated_at = now()")
         conn.execute(f"TRUNCATE {_DATA_TABLES} RESTART IDENTITY CASCADE")
+        conn.execute(
+            "UPDATE scheduler_leases SET owner_id = NULL, acquired_at = NULL, "
+            "heartbeat_at = NULL, expires_at = NULL"
+        )
 
 
 @pytest.fixture
@@ -128,6 +137,16 @@ def dispatch_planning_service(activity_repo, candidate_repo, library_repo, polic
 @pytest.fixture
 def dispatch_service(dispatch_planning_service, dispatch_repo, library_repo):
     return DispatchService(dispatch_planning_service, dispatch_repo, library_repo)
+
+
+@pytest.fixture
+def scheduler_repo(database):
+    return SchedulerRepository(database)
+
+
+@pytest.fixture
+def scheduler_service(scheduler_repo, policy_repo):
+    return SchedulerService(scheduler_repo, policy_repo)
 
 
 @pytest.fixture

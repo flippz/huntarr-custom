@@ -18,6 +18,7 @@ from .persistence.activity_repository import ActivityRepository
 from .persistence.scan_candidate_repository import ScanCandidateRepository
 from .persistence.dispatch_repository import DispatchRepository
 from .persistence.outcome_repository import OutcomeRepository
+from .persistence.scheduler_repository import SchedulerRepository
 from .services.library_service import LibraryService
 from .services.policy_service import PolicyService
 from .services.activity_service import ActivityService
@@ -27,6 +28,7 @@ from .services.scan_candidate_service import ScanCandidateService
 from .services.dispatch_planning_service import DispatchPlanningService
 from .services.dispatch_service import DispatchService
 from .services.reconciliation_service import ReconciliationService
+from .services.scheduler_service import SchedulerService
 from .api import api_bp
 from .web import web_bp
 
@@ -59,6 +61,7 @@ def create_app(config: dict | None = None) -> Flask:
     candidate_repo = ScanCandidateRepository(db)
     dispatch_repo = DispatchRepository(db)
     outcome_repo = OutcomeRepository(db)
+    scheduler_repo = SchedulerRepository(db)
 
     sonarr_timeout = app.config.get("SONARR_TIMEOUT_SECONDS")
 
@@ -78,6 +81,8 @@ def create_app(config: dict | None = None) -> Flask:
         "scan_candidate": ScanCandidateService(candidate_repo),
         "dispatch_repo": dispatch_repo,
         "outcome_repo": outcome_repo,
+        "scheduler_repo": scheduler_repo,
+        "scheduler": SchedulerService(scheduler_repo, policy_repo),
         "dispatch_planning": dispatch_planning,
         "dispatch": DispatchService(
             dispatch_planning, dispatch_repo, library_repo, timeout=sonarr_timeout

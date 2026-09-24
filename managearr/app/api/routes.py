@@ -103,6 +103,44 @@ def update_policy():
     return jsonify({"policy": policy.to_dict(), "summary": policy_service.summary(policy)})
 
 
+# --- Simulation scheduler -----------------------------------------------
+
+@api_bp.get("/scheduler")
+@api_bp.get("/scheduler/settings")
+def get_scheduler_settings():
+    return jsonify({"scheduler": _services()["scheduler"].settings()})
+
+
+@api_bp.patch("/scheduler")
+@api_bp.patch("/scheduler/settings")
+def update_scheduler_settings():
+    payload = request.get_json(silent=True)
+    settings, errors = _services()["scheduler"].update_settings(payload)
+    if errors:
+        return jsonify({"errors": errors}), 400
+    return jsonify({"settings": settings, "scheduler": _services()["scheduler"].settings()})
+
+
+@api_bp.post("/scheduler/run-simulation-now")
+def run_simulation_now():
+    queued, created = _services()["scheduler"].queue_manual()
+    return jsonify({"request": queued, "created": created}), 202
+
+
+@api_bp.get("/scheduler/cycles")
+def list_scheduler_cycles():
+    limit = request.args.get("limit", default=50, type=int)
+    return jsonify({"cycles": _services()["scheduler"].list_cycles(limit)})
+
+
+@api_bp.get("/scheduler/cycles/<int:cycle_id>")
+def get_scheduler_cycle(cycle_id: int):
+    cycle = _services()["scheduler"].cycle_detail(cycle_id)
+    if cycle is None:
+        return jsonify({"errors": ["scheduler cycle not found"]}), 404
+    return jsonify({"cycle": cycle})
+
+
 # --- Activity (read-only) ------------------------------------------------
 
 @api_bp.get("/activity")

@@ -2,6 +2,22 @@
 {% block title %}Settings{% endblock %}
 {% block content %}
 <h1>Settings</h1>
+<p class="simulation-notice"><strong>Simulation sends no Sonarr commands.</strong> Live automation is not available.</p>
+<section class="card">
+  <h2>Simulation scheduler</h2>
+  <p>Mode: <strong id="scheduler-mode">-</strong> · Worker lease: <strong id="scheduler-lease">-</strong></p>
+  <p>Next due: <span id="scheduler-next-due">-</span></p>
+  <label class="danger-confirm">
+    <input type="checkbox" id="scheduler-confirm">
+    I understand that enabling simulate records plans only and sends no Sonarr commands.
+  </label>
+  <div class="form-actions">
+    <button type="button" id="scheduler-enable" disabled>Enable simulate</button>
+    <button type="button" id="scheduler-off" class="button-secondary">Turn off</button>
+    <button type="button" id="scheduler-run" class="button-secondary">Run simulation now</button>
+  </div>
+  <p class="muted" id="scheduler-latest">Latest cycle: none</p>
+</section>
 <section class="card">
   <h2>Automation policy</h2>
   <p id="policy-summary" class="muted">Loading...</p>
@@ -59,6 +75,15 @@ function fillForm(policy) {
   document.getElementById('p-order').value = policy.search_order;
 }
 
+async function loadScheduler() {
+  const scheduler = (await api('/api/v1/scheduler')).scheduler;
+  setText('scheduler-mode', scheduler.settings.mode);
+  setText('scheduler-lease', scheduler.lease.healthy ? 'healthy' : 'stale / absent');
+  setText('scheduler-next-due', scheduler.settings.next_due_at || 'not scheduled');
+  const latest = scheduler.latest_cycle;
+  setText('scheduler-latest', latest ? `Latest cycle: #${latest.id} ${latest.state} (${latest.trigger})` : 'Latest cycle: none');
+}
+
 async function loadPolicy() {
   const data = await api('/api/v1/policy');
   fillForm(data.policy);
@@ -89,5 +114,34 @@ document.getElementById('policy-form').addEventListener('submit', async (ev) => 
 });
 
 loadPolicy().catch(err => toast('Failed to load policy: ' + err.message));
+loadScheduler().catch(err => toast('Failed to load scheduler: ' + err.message));
+
+document.getElementById('scheduler-confirm').addEventListener('change', (ev) => {
+  document.getElementById('scheduler-enable').disabled = !ev.target.checked;
+});
+document.getElementById('scheduler-enable').addEventListener('click', async () => {
+  if (!document.getElementById('scheduler-confirm').checked) return;
+  try {
+    await api('/api/v1/scheduler/settings', { method: 'PATCH', body: { mode: 'simulate' } });
+    document.getElementById('scheduler-confirm').checked = false;
+    document.getElementById('scheduler-enable').disabled = true;
+    await loadScheduler();
+    toast('Simulation scheduling enabled; no Sonarr commands will be sent');
+  } catch (err) { toast('Scheduler update failed: ' + err.message); }
+});
+document.getElementById('scheduler-off').addEventListener('click', async () => {
+  try {
+    await api('/api/v1/scheduler/settings', { method: 'PATCH', body: { mode: 'off' } });
+    await loadScheduler();
+    toast('Scheduler turned off');
+  } catch (err) { toast('Scheduler update failed: ' + err.message); }
+});
+document.getElementById('scheduler-run').addEventListener('click', async () => {
+  try {
+    const data = await api('/api/v1/scheduler/run-simulation-now', { method: 'POST', body: {} });
+    toast(data.created ? 'Simulation request queued' : 'A simulation request is already queued');
+    await loadScheduler();
+  } catch (err) { toast('Queue failed: ' + err.message); }
+});
 </script>
 {% endblock %}

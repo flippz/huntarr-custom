@@ -131,6 +131,15 @@ button[data-action="delete"] { background: var(--danger); }
 .status-error { background: #402020; color: #ff9b9b; }
 .status-unknown { background: var(--border); color: var(--muted); }
 
+.simulation-notice {
+  background: #17351f;
+  color: #9cf0b4;
+  border: 2px solid #2b7040;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+}
+
 .readonly-notice {
   background: #10202f;
   color: #8fd1ff;

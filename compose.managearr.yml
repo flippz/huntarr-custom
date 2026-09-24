@@ -52,6 +52,35 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  # Dedicated simulation-only scheduler. It shares the application image and
+  # PostgreSQL database, but has no HTTP listener or host port. The web process
+  # never starts a scheduler thread.
+  managearr-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.managearr
+    image: managearr:preview
+    container_name: managearr-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "app.worker"]
+    environment:
+      - TZ=${TZ:-Europe/Oslo}
+      - MANAGEARR_DB_HOST=postgres
+      - MANAGEARR_DB_PORT=5432
+      - MANAGEARR_DB_NAME=managearr
+      - MANAGEARR_DB_USER=managearr
+      - MANAGEARR_DB_PASSWORD_FILE=/run/secrets/managearr_db_password
+      - MANAGEARR_DB_SSLMODE=disable
+      - MANAGEARR_SCHEDULER_LEASE_SECONDS=${MANAGEARR_SCHEDULER_LEASE_SECONDS:-30}
+      - MANAGEARR_SCHEDULER_POLL_SECONDS=${MANAGEARR_SCHEDULER_POLL_SECONDS:-5}
+    secrets:
+      - managearr_db_password
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
   # One-shot SQLite -> PostgreSQL importer. Not started by `up`; run
   # explicitly with the `tools` profile, e.g.:
   #   docker compose -f compose.managearr.yml --profile tools run --rm \

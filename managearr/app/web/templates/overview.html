@@ -2,6 +2,7 @@
 {% block title %}Overview{% endblock %}
 {% block content %}
 <h1>Overview</h1>
+<p class="simulation-notice"><strong>Simulation sends no Sonarr commands.</strong> M4 has no live scheduler mode.</p>
 <section class="card-grid" id="overview-cards">
   <div class="card">
     <h2>Status</h2>
@@ -19,10 +20,23 @@
     <h2>Libraries enabled</h2>
     <p class="metric" id="ov-enabled">-</p>
   </div>
+  <div class="card">
+    <h2>Scheduler mode</h2>
+    <p class="metric" id="ov-scheduler-mode">-</p>
+  </div>
+  <div class="card">
+    <h2>Worker lease</h2>
+    <p class="metric" id="ov-worker-lease">-</p>
+  </div>
 </section>
 <section class="card">
   <h2>Automation policy</h2>
   <p id="ov-policy-summary">Loading...</p>
+</section>
+<section class="card">
+  <h2>Simulation scheduler</h2>
+  <p><strong>Next due:</strong> <span id="ov-next-due">-</span></p>
+  <p><strong>Latest cycle:</strong> <span id="ov-latest-cycle">none</span></p>
 </section>
 {% endblock %}
 {% block scripts %}
@@ -36,6 +50,12 @@ async function loadOverview() {
 
   const policy = await api('/api/v1/policy');
   setText('ov-policy-summary', policy.summary);
+  const scheduler = (await api('/api/v1/scheduler')).scheduler;
+  setText('ov-scheduler-mode', scheduler.settings.mode);
+  setText('ov-worker-lease', scheduler.lease.healthy ? 'healthy' : 'stale / absent');
+  setText('ov-next-due', scheduler.settings.next_due_at || 'not scheduled');
+  const latest = scheduler.latest_cycle;
+  setText('ov-latest-cycle', latest ? `#${latest.id} ${latest.state} (${latest.trigger})` : 'none');
 }
 loadOverview().catch(err => toast('Failed to load overview: ' + err.message));
 </script>

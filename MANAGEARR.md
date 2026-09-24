@@ -4,16 +4,152 @@ Managearr is a standalone Flask/PostgreSQL rewrite beside the legacy Huntarr
 application (`main.py`, `src/`). It has its own image, database, port, API, and
 UI. Nothing in this application changes the legacy runtime.
 
-## Current milestone: manual Sonarr outcome reconciliation (M3)
+## Current milestone: restart-safe simulation scheduler (M4)
 
-A completed Sonarr candidate scan can now be previewed and, only after an
-explicit confirmation, sent to Sonarr as one `EpisodeSearch` command. This is
-not automated hunting: no scheduler or background worker dispatches searches.
-After Sonarr accepts that command, an operator can manually run a read-only
-reconciliation to inspect its command state and bounded related history/queue
-evidence. Reconciliation never sends or retries a search.
+M4 adds a dedicated scheduler worker and durable PostgreSQL planning ledger.
+It is **simulation-only**: production defaults to scheduler mode `off`, the only
+other accepted mode is `simulate`, and there is no `live` enum value, API
+option, UI option, or worker path. **Simulation sends no Sonarr commands.**
+The earlier explicitly confirmed manual dispatch endpoint remains available,
+but the scheduler neither calls it nor imports its service.
 
-Safety properties:
+### Architecture and process isolation
+
+`managearr-worker` is a second Compose service using the same image and
+PostgreSQL database as the web app. It runs `python -m app.worker`, publishes no
+port, and disables the image's HTTP healthcheck. Waitress runs only the Flask
+web process; it has no scheduler thread. The worker module does not import
+`SonarrClient` or `DispatchService`.
+
+Migration v4 adds:
+
+- singleton scheduler settings constrained to `off|simulate`, with an automatic
+  append-only mode-change audit;
+- one expiring `cycle-worker` lease using PostgreSQL server time;
+- idempotent durable manual simulation requests and atomic claims;
+- queued/running/terminal cycle runs with trigger, safe policy snapshot, random
+  seed, timestamps, counts, and static safe summaries;
+- per-library results tied to the exact completed scan snapshot; and
+- immutable per-candidate snapshots recording deterministic position or an
+  explicit exclusion reason.
+
+Cycle and request triggers permit only controlled forward transitions. Mode,
+library, and candidate audit rows are protected from update/delete. Foreign
+keys, count/length checks, partial uniqueness, and query indexes protect the
+ledger. It stores normalized IDs, policy values, bounded snapshots, and static
+summaries--never library URLs, API keys, exception strings, or raw Sonarr
+payloads.
+
+### Operational behavior and restart safety
+
+The worker acquires and heartbeats a database lease before claiming work. A
+second worker remains idle until expiry; takeover uses an atomic conditional
+update. It sleeps outside transactions and applies bounded exponential backoff
+after database errors. SIGTERM stops new work, releases the lease when still
+owned, and exits cleanly.
+
+A takeover marks a previous owner's `running` cycle failed with an interrupted,
+not-retried summary. Claimed work that never started remains one durable queued
+cycle and may be started once by the new owner. Work that did start is never
+automatically retried. Scheduled due time is stored in `scheduler_settings` and
+advanced atomically with insertion of exactly one scheduled cycle, so restart
+does not silently duplicate a due cycle. Mode `off` creates no scheduled work;
+an explicit `POST /api/v1/scheduler/run-simulation-now` request may still run a
+simulation while off. Concurrent/repeated run-now calls coalesce to the one
+queued/claimed request and return promptly.
+
+Enabling `simulate` sets the first due time to current database time plus the
+existing `cycle_interval_minutes`; later due cycles advance it the same way.
+Disabling scheduling clears next due. Lease staleness is shown in the UI but
+does not make the web app health endpoint fail.
+
+### Simulation planning rules
+
+For each enabled Sonarr library, a cycle reads only its latest completed
+`sonarr_scan` activity/candidate snapshot. It never launches a scan. Candidate
+ordering is deterministic:
+
+- `sequential`: case-insensitive series title, season, episode, candidate ID;
+- `oldest_first` / `newest_first`: ISO air date with deterministic tie breaks;
+- `random`: a stored cycle seed combined with library ID, making the shuffle
+  reproducible from the audit row.
+
+Missing candidates are excluded when `missing_enabled` is false. Every cycle
+explicitly records upgrades as `unsupported` when `upgrades_enabled` is true
+(or `disabled` otherwise); M4 never pretends to plan upgrades.
+
+The planner conservatively reads the durable manual dispatch/outcome ledger to
+exclude duplicate episodes, imported outcomes, live reservations, and episodes
+inside cooldown. It calculates each library's effective selection cap as:
+
+```
+min(25, hourly capacity remaining, queue slots remaining,
+    successful-grab target remaining in the policy cycle window)
+```
+
+`25` is the existing `MAX_SELECTION_PER_REQUEST` Sonarr command safety maximum.
+Hourly usage includes completed dispatches and live reservations. Queue
+occupancy treats dispatched items without terminal release evidence as active.
+Recent distinct `grabbed`/`imported` evidence reduces the successful-grab
+allowance. Candidates beyond the effective cap receive a cap/queue/target
+explanation. The selected rows are only “would dispatch” audit records:
+**no dispatch batch, reservation, command, retry, or reconcile is created.**
+
+Libraries explain no-scan, policy-disabled, cap, queue, cooldown, in-flight,
+already-imported, duplicate, and safe planning-failure skips. Cycle summaries
+contain counts only and never include exception text.
+
+### Scheduler API and UI
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET/PATCH | `/api/v1/scheduler/settings` | Read settings/health or change mode to `off|simulate` |
+| POST | `/api/v1/scheduler/run-simulation-now` | Idempotently queue one manual simulation |
+| GET | `/api/v1/scheduler/cycles` | Recent cycle summaries |
+| GET | `/api/v1/scheduler/cycles/<id>` | Per-library/candidate audit detail |
+
+`GET/PATCH /api/v1/scheduler` is also supported as a concise settings alias.
+Overview and Settings display mode, next due, worker lease health, and latest
+cycle, with prominent **Simulation sends no Sonarr commands** text. Enabling
+simulate requires a warning checkbox; no live option exists.
+
+### Safety proof and limitations
+
+The scheduler path is proven by real-PostgreSQL tests covering v4 migration
+idempotence/transaction rollback/constraints, lease exclusivity and takeover,
+heartbeat, off-mode inactivity, due-cycle uniqueness, manual-off execution,
+concurrent request/claim idempotence, interrupted-run terminalization,
+deterministic ordering/caps/cooldown/in-flight/queue/outcome rules, API/UI
+wiring and redaction, and Compose process isolation. Tests monkeypatch every
+Sonarr adapter method plus `DispatchService.dispatch` to fail if called during
+a simulation.
+
+M4 limitations are intentional: no scheduler auto-scan, no live scheduler
+dispatch, no automatic retry, no automatic reconciliation, and no upgrade
+planning. A current completed scan must already exist. Queue/success knowledge
+is conservative and limited to durable Managearr dispatch/outcome evidence; the
+worker does not query live Sonarr state.
+
+### Deployment
+
+Build/start both application services after PostgreSQL is healthy:
+
+```bash
+docker compose -f compose.managearr.yml up -d --build managearr managearr-worker
+```
+
+After migration, scheduling remains off until an operator explicitly enables
+simulate in Settings or via the PATCH API. Existing M3 manual dispatch remains
+operator-confirmed and separate from the worker.
+
+## Previous milestone: manual Sonarr outcome reconciliation (M3)
+
+A completed Sonarr candidate scan can be previewed and, only after an explicit
+confirmation, sent to Sonarr as one `EpisodeSearch` command. After acceptance,
+an operator can manually run read-only reconciliation. The M4 scheduler never
+uses either path.
+
+M3 safety properties:
 
 - scans and previews do not call a Sonarr write endpoint;
 - the manual endpoint requires a non-empty `candidate_ids` list and the JSON
@@ -65,8 +201,9 @@ managearr/
       redaction.py
     persistence/
       database.py
-      migrations.py      PostgreSQL schema v1 + dispatch v2 + outcomes v3
+      migrations.py      PostgreSQL schema v1 + dispatch v2 + outcomes v3 + scheduler v4
       dispatch_repository.py
+      scheduler_repository.py
       outcome_repository.py
       *_repository.py
     services/
@@ -74,7 +211,9 @@ managearr/
       dispatch_planning_service.py
       dispatch_service.py
       reconciliation_service.py
+      scheduler_service.py    simulation-only planner
       library_readiness.py
+    worker.py              dedicated lease-owning process
     api/routes.py
     web/             Jinja templates and vanilla JS/CSS
   tools/import_sqlite.py

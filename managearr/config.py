@@ -26,6 +26,8 @@ class Config:
     PORT = int(os.environ.get("MANAGEARR_PORT", "9706"))
     DEBUG = os.environ.get("MANAGEARR_DEBUG", "false").lower() == "true"
     SONARR_TIMEOUT_SECONDS = int(os.environ.get("MANAGEARR_SONARR_TIMEOUT_SECONDS", "10"))
+    SCHEDULER_LEASE_SECONDS = int(os.environ.get("MANAGEARR_SCHEDULER_LEASE_SECONDS", "30"))
+    SCHEDULER_POLL_SECONDS = float(os.environ.get("MANAGEARR_SCHEDULER_POLL_SECONDS", "5"))
 
     # PostgreSQL is the only runtime database - see app/persistence/database.py.
     DB_HOST = os.environ.get("MANAGEARR_DB_HOST", "postgres")
