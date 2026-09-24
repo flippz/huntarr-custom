@@ -247,6 +247,9 @@ data/
 *.sqlite
 *.sqlite3
 huntarr.db
+
+# Huntarr v2 local development data
+data-v2/
 /config/
 /logs/
 /settings/

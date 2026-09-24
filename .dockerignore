@@ -1,0 +1,8 @@
+.git
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+v2/.venv
+v2/data-v2
+data
+data-v2

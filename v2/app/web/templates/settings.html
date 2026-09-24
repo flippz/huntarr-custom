@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+<section class="card">
+  <h2>Automation policy</h2>
+  <p id="policy-summary" class="muted">Loading...</p>
+  <form id="policy-form" class="form-grid">
+    <label class="checkbox">
+      <input type="checkbox" id="p-missing">
+      Search missing items
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" id="p-upgrades">
+      Search upgrades
+    </label>
+    <label>Cycle interval (minutes)
+      <input type="number" id="p-cycle" min="5" max="1440" required>
+    </label>
+    <label>Hourly API cap
+      <input type="number" id="p-cap" min="1" max="1000" required>
+    </label>
+    <label>Successful grab target
+      <input type="number" id="p-grab-target" min="1" max="100" required>
+    </label>
+    <label>Dispatch interval (seconds)
+      <input type="number" id="p-dispatch" min="5" max="3600" required>
+    </label>
+    <label>Queue target
+      <input type="number" id="p-queue" min="1" max="100" required>
+    </label>
+    <label>Cooldown (minutes)
+      <input type="number" id="p-cooldown" min="0" max="1440" required>
+    </label>
+    <label>Search order
+      <select id="p-order">
+        {% for o in search_orders %}
+        <option value="{{ o }}">{{ o }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <div class="form-actions">
+      <button type="submit">Save policy</button>
+    </div>
+  </form>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+function fillForm(policy) {
+  document.getElementById('p-missing').checked = policy.missing_enabled;
+  document.getElementById('p-upgrades').checked = policy.upgrades_enabled;
+  document.getElementById('p-cycle').value = policy.cycle_interval_minutes;
+  document.getElementById('p-cap').value = policy.hourly_api_cap;
+  document.getElementById('p-grab-target').value = policy.successful_grab_target;
+  document.getElementById('p-dispatch').value = policy.dispatch_interval_seconds;
+  document.getElementById('p-queue').value = policy.queue_target;
+  document.getElementById('p-cooldown').value = policy.cooldown_minutes;
+  document.getElementById('p-order').value = policy.search_order;
+}
+
+async function loadPolicy() {
+  const data = await api('/api/v2/policy');
+  fillForm(data.policy);
+  setText('policy-summary', data.summary);
+}
+
+document.getElementById('policy-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const payload = {
+    missing_enabled: document.getElementById('p-missing').checked,
+    upgrades_enabled: document.getElementById('p-upgrades').checked,
+    cycle_interval_minutes: parseInt(document.getElementById('p-cycle').value, 10),
+    hourly_api_cap: parseInt(document.getElementById('p-cap').value, 10),
+    successful_grab_target: parseInt(document.getElementById('p-grab-target').value, 10),
+    dispatch_interval_seconds: parseInt(document.getElementById('p-dispatch').value, 10),
+    queue_target: parseInt(document.getElementById('p-queue').value, 10),
+    cooldown_minutes: parseInt(document.getElementById('p-cooldown').value, 10),
+    search_order: document.getElementById('p-order').value,
+  };
+  try {
+    const data = await api('/api/v2/policy', { method: 'PUT', body: payload });
+    fillForm(data.policy);
+    setText('policy-summary', data.summary);
+    toast('Policy saved');
+  } catch (err) {
+    toast('Save failed: ' + err.message);
+  }
+});
+
+loadPolicy().catch(err => toast('Failed to load policy: ' + err.message));
+</script>
+{% endblock %}

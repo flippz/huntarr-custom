@@ -1,0 +1,15 @@
+services:
+  huntarr-v2:
+    build:
+      context: .
+      dockerfile: Dockerfile.v2
+    image: huntarr-v2:preview
+    container_name: huntarr-v2
+    ports:
+      - "9706:9706"
+    volumes:
+      - ./data-v2:/data-v2   # v2 SQLite database only - never mount v1's ./data
+    environment:
+      - TZ=Europe/Amsterdam  # change to your timezone
+      - HUNTARR_V2_DB_PATH=/data-v2/huntarr_v2.db
+    restart: unless-stopped
