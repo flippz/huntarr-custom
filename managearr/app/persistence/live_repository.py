@@ -368,6 +368,34 @@ class LiveRepository:
             ).fetchone()
         return row["id"] if row else None
 
+    def recent_ledger(self, limit: int = 100) -> list[dict]:
+        limit = max(1, min(int(limit), 200))
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT l.*, c.series_title, c.season_number, c.episode_number,
+                       r.queued_at AS cycle_queued_at, r.mode_snapshot
+                FROM live_dispatch_ledger l
+                JOIN scheduler_candidate_results c ON c.id = l.candidate_result_id
+                JOIN scheduler_cycle_runs r ON r.id = l.cycle_run_id
+                ORDER BY l.created_at DESC, l.id DESC LIMIT %s
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"], "cycle_run_id": r["cycle_run_id"],
+                "candidate_id": r["candidate_id"], "series_title": r["series_title"],
+                "season_number": r["season_number"], "episode_number": r["episode_number"],
+                "state": r["state"], "terminal_reason": r["terminal_reason"],
+                "dispatch_batch_id": r["dispatch_batch_id"], "arm_generation": r["arm_generation"],
+                "sonarr_command_id": r["sonarr_command_id"],
+                "sonarr_command_status": r["sonarr_command_status"],
+                "cycle_queued_at": _iso(r["cycle_queued_at"]), "created_at": _iso(r["created_at"]),
+            }
+            for r in rows
+        ]
+
     def ledger_for_cycle(self, cycle_run_id: int) -> list[dict]:
         with self.db.connect() as conn:
             rows = conn.execute(

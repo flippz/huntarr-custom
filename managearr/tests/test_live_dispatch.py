@@ -689,3 +689,13 @@ def test_activity_recent_dispatches_api_and_ui(client, dispatch_repo):
     html = client.get("/activity").get_data(as_text=True)
     assert "Recent dispatches and outcomes" in html
     assert "loadRecentDispatches" in html
+
+
+def test_activity_live_attempts_api_and_ui(client):
+    response = client.get("/api/v1/activity/live-attempts")
+    assert response.status_code == 200
+    assert "attempts" in response.get_json()
+    html = client.get("/activity").get_data(as_text=True)
+    assert "Live automation attempts" in html
+    assert "including safety blocks" in html
+    assert "loadLiveAttempts" in html

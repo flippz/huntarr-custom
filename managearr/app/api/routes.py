@@ -268,6 +268,12 @@ def list_activity():
     return jsonify({"jobs": [job.to_dict() for job in jobs]})
 
 
+@api_bp.get("/activity/live-attempts")
+def list_recent_live_attempts():
+    limit = max(1, min(request.args.get("limit", default=100, type=int), 200))
+    return jsonify({"attempts": _services()["live_repo"].recent_ledger(limit=limit)})
+
+
 @api_bp.get("/activity/dispatches")
 def list_recent_dispatches():
     limit = max(1, min(request.args.get("limit", default=50, type=int), 100))
