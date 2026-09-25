@@ -284,18 +284,23 @@ class LiveRepository:
         return _control_dict(row)
 
     def check_dispatch_delay_elapsed(self, min_delay_seconds: int) -> bool:
+        return self.dispatch_delay_remaining_seconds(min_delay_seconds) <= 0
+
+    def dispatch_delay_remaining_seconds(self, min_delay_seconds: int) -> float:
+        """Return the global delay remaining after the latest write attempt."""
         with self.db.connect() as conn:
             row = conn.execute(
                 """
-                SELECT (
-                    last_dispatch_at IS NULL
-                    OR last_dispatch_at <= now() - (%s * interval '1 second')
-                ) AS ok
+                SELECT CASE WHEN last_dispatch_at IS NULL THEN 0
+                            ELSE GREATEST(0, EXTRACT(EPOCH FROM (
+                                last_dispatch_at + (%s * interval '1 second') - now()
+                            )))
+                       END AS remaining
                 FROM live_control WHERE id = 1
                 """,
                 (min_delay_seconds,),
             ).fetchone()
-        return bool(row["ok"])
+        return float(row["remaining"])
 
     def record_dispatch_attempt(self, summary: str) -> None:
         with self.db.connect() as conn:

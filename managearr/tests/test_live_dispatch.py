@@ -448,6 +448,35 @@ def test_live_respects_max_dispatches_per_cycle(
     assert len(stub.calls) == 2
 
 
+def test_live_waits_for_persisted_delay_before_first_dispatch(
+    database, scheduler_repo, policy_repo, live_repo, library_repo, activity_repo,
+    candidate_repo, dispatch_repo, dispatch_planning_service,
+):
+    _library_scan(library_repo, activity_repo, candidate_repo, count=1)
+    live_repo.enable_live_mode(actor="t", reason="t")
+    live_repo.arm(actor="t", reason="t", ttl_minutes=15)
+    stub = StubSonarrClient()
+    worker = _make_worker(
+        scheduler_repo, policy_repo, live_repo,
+        _dispatch_service_with_stub(dispatch_planning_service, dispatch_repo, library_repo, stub),
+    )
+    coordinator = worker._ensure_live_coordinator()
+    coordinator.live_repo.dispatch_delay_remaining_seconds = lambda _seconds: 12.5
+    call_times = []
+    original_search = stub.search_episodes
+
+    def timed_search(episode_ids):
+        call_times.append(coordinator.test_clock.now)
+        return original_search(episode_ids)
+
+    stub.search_episodes = timed_search
+    _queue_live_cycle(database, scheduler_repo, policy_repo)
+    _plan_and_dispatch(worker, scheduler_repo)
+
+    assert call_times == [12.5]
+    assert sum(coordinator.test_clock.sleeps) == 12.5
+
+
 def test_live_spaces_multiple_dispatches_without_real_sleep(
     database, scheduler_repo, policy_repo, live_repo, library_repo, activity_repo, candidate_repo,
     dispatch_repo, dispatch_planning_service,

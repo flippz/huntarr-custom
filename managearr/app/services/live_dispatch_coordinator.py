@@ -90,6 +90,7 @@ class LiveDispatchCoordinator:
 
         dispatched_or_attempted = 0
         last_dispatch_time = None  # monotonic start time of the last write attempt
+        initial_global_delay_checked = False
         for library in detail["libraries"]:
             if dispatched_or_attempted >= max_dispatches:
                 break
@@ -106,7 +107,18 @@ class LiveDispatchCoordinator:
                 if heartbeat is not None and not heartbeat():
                     return
 
-                # If we have made at least one network call in this cycle, wait for the delay since the last one
+                # Enforce the persisted delay before the first write too, so
+                # adjacent cycles (or a resume-triggered cycle) cannot burst.
+                if not initial_global_delay_checked:
+                    remaining = self.live_repo.dispatch_delay_remaining_seconds(min_delay_seconds)
+                    initial_global_delay_checked = True
+                    if remaining > 0 and not self._wait_for_next_dispatch(
+                        remaining, heartbeat, expected_generation
+                    ):
+                        return
+
+                # Within this cycle, use monotonic time so wall-clock changes
+                # cannot shorten the interval between write attempts.
                 if last_dispatch_time is not None:
                     elapsed = self.monotonic() - last_dispatch_time
                     if elapsed < min_delay_seconds:
