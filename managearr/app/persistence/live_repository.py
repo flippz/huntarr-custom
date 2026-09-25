@@ -399,6 +399,19 @@ class LiveRepository:
         limit = max(1, min(int(limit), 500))
         with self.db.connect() as conn:
             rows = conn.execute("""
+                WITH effective_outcomes AS (
+                  SELECT DISTINCT ON (e.dispatch_item_id)
+                    e.id, e.dispatch_item_id, e.observed_at, e.event_type,
+                    e.safe_summary, e.batch_id, e.sonarr_command_id
+                  FROM dispatch_outcome_events e
+                  WHERE e.dispatch_item_id IS NOT NULL
+                    AND e.event_type IN ('grabbed','imported','download_failed',
+                                         'import_failed','command_failed','command_aborted')
+                  ORDER BY e.dispatch_item_id,
+                    CASE WHEN e.event_type IN ('imported','download_failed','import_failed',
+                                               'command_failed','command_aborted') THEN 1 ELSE 0 END DESC,
+                    e.sonarr_event_id DESC NULLS LAST, e.id DESC
+                )
                 SELECT * FROM (
                   SELECT ('live:'||l.id)::text event_key, l.created_at occurred_at,
                     CASE
@@ -434,10 +447,8 @@ class LiveRepository:
                     e.safe_summary details, i.series_title, i.season_number,
                     i.episode_number, e.batch_id AS dispatch_batch_id,
                     e.sonarr_command_id
-                  FROM dispatch_outcome_events e
+                  FROM effective_outcomes e
                   JOIN dispatch_batch_items i ON i.id=e.dispatch_item_id
-                  WHERE e.event_type IN ('grabbed','imported','download_failed',
-                                         'import_failed','command_failed','command_aborted')
                 ) timeline
                 ORDER BY occurred_at DESC, event_key DESC LIMIT %s
             """, (limit,)).fetchall()
