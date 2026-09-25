@@ -18,7 +18,9 @@ BALANCED_DEFAULTS = {
     "successful_grab_target": 5,
     "dispatch_interval_seconds": 30,
     "queue_target": 10,
-    "cooldown_minutes": 15,
+    # Avoid repeatedly feeding Sonarr the same bad release loop. Operators
+    # can still shorten this explicitly for controlled testing.
+    "cooldown_minutes": 1440,
     "search_order": "sequential",
 }
 
@@ -81,8 +83,8 @@ class AutomationPolicy:
             f"up to {min(self.successful_grab_target, 5)} eligible search(es) per cycle "
             f"(hard maximum 5), at least {self.dispatch_interval_seconds} "
             f"second(s) apart, while keeping the queue at up to {self.queue_target} "
-            f"item(s). Waits {self.cooldown_minutes} minute(s) of cooldown "
-            f"before retrying the same item, processing items in "
+            f"item(s). Waits {self.cooldown_minutes} minute(s) before "
+            f"retrying an episode that was already searched or definitively failed, processing items in "
             f"{order_text} order."
         )
 

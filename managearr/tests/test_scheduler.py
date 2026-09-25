@@ -311,6 +311,7 @@ def test_terminal_failure_starts_cooldown_from_durable_outcome(
 def test_episode_becomes_eligible_after_definitive_failure_cooldown(
     database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
 ):
+    policy_repo.update({"cooldown_minutes": 60})
     library, job, candidates = _library_scan(library_repo, activity_repo, candidate_repo, count=1)
     with database.connect() as conn:
         old = datetime.now(timezone.utc) - timedelta(hours=2)

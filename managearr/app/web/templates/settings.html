@@ -79,8 +79,9 @@
     <label>Queue target
       <input type="number" id="p-queue" min="1" max="100" required>
     </label>
-    <label>Cooldown (minutes)
+    <label>Episode retry cooldown (minutes)
       <input type="number" id="p-cooldown" min="0" max="1440" required>
+      <span class="muted">Use 1440 (24 hours) for normal Live operation. Lower values may repeatedly search episodes whose downloads fail.</span>
     </label>
     <label>Search order
       <select id="p-order">
