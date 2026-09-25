@@ -7,11 +7,11 @@
 <p class="readonly-notice">Outcome reconciliation is manual and read-only: it sends no search. A completed EpisodeSearch command is not proof that Sonarr grabbed, downloaded, or imported an episode. Live dispatches are queued for prompt automatic read-only reconciliation.</p>
 
 <section class="card">
-  <h2>Automation timeline</h2>
-  <p class="muted">Plans, blocked attempts, commands, and read-only Sonarr evidence in one chronology.</p>
+  <h2>Episode history</h2>
+  <p class="muted">Searches and their real download or import results. Newest activity appears first.</p>
   <div class="table-scroll"><table class="data-table">
-    <thead><tr><th>Time</th><th>Episode</th><th>Type</th><th>State</th><th>Evidence / reason</th><th>Command</th></tr></thead>
-    <tbody id="activity-timeline"><tr><td colspan="6">Loading...</td></tr></tbody>
+    <thead><tr><th>Time</th><th>Episode</th><th>Activity</th><th>Result</th><th>Details</th></tr></thead>
+    <tbody id="activity-timeline"><tr><td colspan="5">Loading...</td></tr></tbody>
   </table></div>
 </section>
 
@@ -100,11 +100,36 @@
 let currentJobId = null;
 let previewCandidateIds = [];
 
+function formatLocalTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value || '-';
+  const pad = number => String(number).padStart(2, '0');
+  return `${pad(date.getDate())}-${pad(date.getMonth() + 1)}-${String(date.getFullYear()).slice(-2)} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function resultClass(result) {
+  return String(result || '').toLowerCase().replaceAll(' ', '-');
+}
+
 async function loadTimeline() {
-  const data=await api('/api/v1/activity/timeline?limit=200');
-  const tbody=document.getElementById('activity-timeline'); tbody.innerHTML='';
-  if(!data.events.length){tbody.innerHTML='<tr><td colspan="6">No automation activity yet.</td></tr>';return;}
-  data.events.forEach(event=>{const tr=document.createElement('tr'); const subject=event.series_title ? `${escapeHtml(event.series_title)} S${event.season_number}E${event.episode_number}` : 'Batch-level evidence'; tr.innerHTML=`<td>${escapeHtml(event.occurred_at)}</td><td>${subject}</td><td>${escapeHtml(event.kind)}</td><td><span class="state-pill state-${escapeHtml(event.state)}">${escapeHtml(event.state)}</span></td><td>${escapeHtml(event.summary)}${event.source_endpoint ? `<br><span class="muted">Source: ${escapeHtml(event.source_endpoint)}</span>`:''}</td><td>${event.sonarr_command_id ? '#'+event.sonarr_command_id : '-'}</td>`;tbody.appendChild(tr);});
+  const data = await api('/api/v1/activity/timeline?limit=200');
+  const tbody = document.getElementById('activity-timeline');
+  tbody.innerHTML = '';
+  if (!data.events.length) {
+    tbody.innerHTML = '<tr><td colspan="5">No episode activity yet.</td></tr>';
+    return;
+  }
+  data.events.forEach(event => {
+    const tr = document.createElement('tr');
+    const episode = `${escapeHtml(event.series_title)} · S${String(event.season_number).padStart(2, '0')}E${String(event.episode_number).padStart(2, '0')}`;
+    tr.innerHTML = `
+      <td class="activity-time">${escapeHtml(formatLocalTime(event.occurred_at))}</td>
+      <td><strong>${episode}</strong></td>
+      <td>${escapeHtml(event.activity)}</td>
+      <td><span class="state-pill state-${escapeHtml(resultClass(event.result))}">${escapeHtml(event.result)}</span></td>
+      <td>${escapeHtml(event.details || '')}</td>`;
+    tbody.appendChild(tr);
+  });
 }
 
 async function loadActivity() {

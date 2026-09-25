@@ -667,7 +667,8 @@ def test_activity_recent_dispatches_api_and_ui(client, dispatch_repo):
     assert response.status_code == 200
     assert "batches" in response.get_json()
     html = client.get("/activity").get_data(as_text=True)
-    assert "Automation timeline" in html
+    assert "Episode history" in html
+    assert "formatLocalTime" in html
     assert "loadTimeline" in html
 
 
@@ -679,6 +680,7 @@ def test_activity_live_attempts_api_and_ui(client):
     assert timeline.status_code == 200
     assert "events" in timeline.get_json()
     html = client.get("/activity").get_data(as_text=True)
-    assert "Automation timeline" in html
-    assert "blocked attempts" in html
+    assert "Episode history" in html
+    assert "Searches and their real download or import results" in html
+    assert "Batch-level evidence" not in html
     assert "loadTimeline" in html

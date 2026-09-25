@@ -390,31 +390,56 @@ class LiveRepository:
         ]
 
     def activity_timeline(self, limit: int = 200) -> list[dict]:
-        """Unified chronology; planned rows disappear once a definitive
-        ledger row exists, avoiding duplicate/conflicting summaries."""
+        """Return user-meaningful episode events, not internal worker audit noise.
+
+        Planning rows and command polling transitions remain available in the
+        detailed audit APIs. The main feed contains only an attempted search
+        or evidence of a real download/import outcome.
+        """
         limit = max(1, min(int(limit), 500))
         with self.db.connect() as conn:
             rows = conn.execute("""
                 SELECT * FROM (
-                  SELECT ('live:'||l.id)::text event_key,l.created_at occurred_at,'live_attempt'::text kind,
-                    l.state,l.terminal_reason summary,c.series_title,c.season_number,c.episode_number,
-                    l.dispatch_batch_id,l.sonarr_command_id,NULL::text source_endpoint
-                  FROM live_dispatch_ledger l JOIN scheduler_candidate_results c ON c.id=l.candidate_result_id
+                  SELECT ('live:'||l.id)::text event_key, l.created_at occurred_at,
+                    CASE
+                      WHEN l.state='dispatched' THEN 'Search sent'
+                      WHEN l.state IN ('blocked','skipped') THEN 'Search skipped'
+                      WHEN l.state='ambiguous' THEN 'Search needs review'
+                      ELSE 'Search failed'
+                    END activity,
+                    CASE
+                      WHEN l.state='dispatched' THEN 'In progress'
+                      WHEN l.state IN ('blocked','skipped') THEN 'Blocked'
+                      WHEN l.state='ambiguous' THEN 'Needs review'
+                      ELSE 'Failed'
+                    END result,
+                    l.terminal_reason details, c.series_title, c.season_number,
+                    c.episode_number, l.dispatch_batch_id, l.sonarr_command_id
+                  FROM live_dispatch_ledger l
+                  JOIN scheduler_candidate_results c ON c.id=l.candidate_result_id
                   UNION ALL
-                  SELECT ('plan:'||c.id)::text,r.queued_at,'planned',
-                    CASE WHEN c.selected THEN 'planned' ELSE 'blocked' END,
-                    COALESCE(c.exclusion_reason,'Selected by policy for live dispatch'),
-                    c.series_title,c.season_number,c.episode_number,NULL,NULL,NULL
-                  FROM scheduler_candidate_results c
-                  JOIN scheduler_library_results lr ON lr.id=c.library_result_id
-                  JOIN scheduler_cycle_runs r ON r.id=lr.cycle_run_id
-                  WHERE r.mode_snapshot='live' AND c.selected = TRUE AND NOT EXISTS
-                    (SELECT 1 FROM live_dispatch_ledger l WHERE l.candidate_result_id=c.id)
-                  UNION ALL
-                  SELECT ('outcome:'||e.id)::text,e.observed_at,'reconciliation',e.event_type,e.safe_summary,
-                    i.series_title,i.season_number,i.episode_number,e.batch_id,e.sonarr_command_id,e.source_endpoint
-                  FROM dispatch_outcome_events e LEFT JOIN dispatch_batch_items i ON i.id=e.dispatch_item_id
-                ) timeline ORDER BY occurred_at DESC,event_key DESC LIMIT %s
+                  SELECT ('outcome:'||e.id)::text, e.observed_at,
+                    CASE e.event_type
+                      WHEN 'grabbed' THEN 'Download found'
+                      WHEN 'imported' THEN 'Imported'
+                      WHEN 'download_failed' THEN 'Download failed'
+                      WHEN 'import_failed' THEN 'Import failed'
+                      ELSE 'Search failed'
+                    END activity,
+                    CASE
+                      WHEN e.event_type='grabbed' THEN 'In progress'
+                      WHEN e.event_type='imported' THEN 'Completed'
+                      ELSE 'Failed'
+                    END result,
+                    e.safe_summary details, i.series_title, i.season_number,
+                    i.episode_number, e.batch_id AS dispatch_batch_id,
+                    e.sonarr_command_id
+                  FROM dispatch_outcome_events e
+                  JOIN dispatch_batch_items i ON i.id=e.dispatch_item_id
+                  WHERE e.event_type IN ('grabbed','imported','download_failed',
+                                         'import_failed','command_failed','command_aborted')
+                ) timeline
+                ORDER BY occurred_at DESC, event_key DESC LIMIT %s
             """, (limit,)).fetchall()
         return [{k: (_iso(v) if k == "occurred_at" else v) for k, v in dict(r).items()} for r in rows]
 
