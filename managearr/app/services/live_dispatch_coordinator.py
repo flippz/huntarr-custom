@@ -45,11 +45,16 @@ class LiveDispatchCoordinator:
             return
 
         control = self.live_repo.get_control()
-        expected_generation = control["arm_generation"]
+        expected_generation = control["authorization_generation"]
         max_dispatches = control["max_dispatches_per_cycle"]
-        min_delay_seconds = control["min_delay_seconds_between_dispatches"]
+        # Policy is snapshotted on the cycle; never dispatch faster than
+        # either that operator policy or the hard live-control floor.
+        min_delay_seconds = max(
+            control["min_delay_seconds_between_dispatches"],
+            int((cycle.get("policy_snapshot") or {}).get("dispatch_interval_seconds", 0)),
+        )
 
-        if not control["armed"] or expected_generation == 0:
+        if control["state"] != "running" or expected_generation == 0:
             # Nothing was ever attempted; planning alone (identical to
             # simulate) already ran and is fully audited by the cycle's
             # own scheduler_library_results/scheduler_candidate_results.

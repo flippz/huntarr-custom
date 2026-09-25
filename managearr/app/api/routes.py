@@ -175,29 +175,17 @@ def live_mode_confirm():
 
 @api_bp.post("/scheduler/live/arm-challenge")
 def live_arm_challenge():
-    payload = request.get_json(silent=True) or {}
-    result, errors = _services()["live_control"].request_arm_challenge(payload)
-    if errors:
-        return jsonify({"errors": errors}), 400
-    return jsonify(result), 201
+    return jsonify({"errors": ["TTL arming was removed in schema v7; use explicit resume"]}), 410
 
 
 @api_bp.post("/scheduler/live/arm-confirm")
 def live_arm_confirm():
-    payload = request.get_json(silent=True) or {}
-    actor = request.headers.get("X-Managearr-Actor", "operator")[:255]
-    result, errors = _services()["live_control"].confirm_arm_challenge(payload, actor=actor)
-    if errors:
-        return jsonify({"errors": errors}), 400
-    return jsonify({"control": result, "live": _services()["live_control"].status()})
+    return jsonify({"errors": ["TTL arming was removed in schema v7; use explicit resume"]}), 410
 
 
 @api_bp.post("/scheduler/live/disarm")
 def live_disarm():
-    payload = request.get_json(silent=True) or {}
-    actor = request.headers.get("X-Managearr-Actor", "operator")[:255]
-    control = _services()["live_control"].disarm(payload, actor=actor)
-    return jsonify({"control": control, "live": _services()["live_control"].status()})
+    return jsonify({"errors": ["Disarm was replaced by explicit pause"]}), 410
 
 
 @api_bp.post("/scheduler/live/emergency-stop")
@@ -206,6 +194,22 @@ def live_emergency_stop():
     actor = request.headers.get("X-Managearr-Actor", "operator")[:255]
     result = _services()["live_control"].emergency_stop(payload, actor=actor)
     return jsonify({"result": result, "live": _services()["live_control"].status()})
+
+@api_bp.post("/scheduler/live/pause")
+def live_pause():
+    actor = request.headers.get("X-Managearr-Actor", "operator")[:255]
+    result, errors = _services()["live_control"].pause(request.get_json(silent=True), actor=actor)
+    if errors:
+        return jsonify({"errors": errors}), 422
+    return jsonify({"control": result, "live": _services()["live_control"].status()})
+
+@api_bp.post("/scheduler/live/resume")
+def live_resume():
+    actor = request.headers.get("X-Managearr-Actor", "operator")[:255]
+    result, errors = _services()["live_control"].resume(request.get_json(silent=True), actor=actor)
+    if errors:
+        return jsonify({"errors": errors}), 422
+    return jsonify({"control": result, "live": _services()["live_control"].status()})
 
 
 # --- Read-only scheduled refresh/reconciliation (M5) ---------------------
@@ -272,6 +276,11 @@ def list_activity():
 def list_recent_live_attempts():
     limit = max(1, min(request.args.get("limit", default=100, type=int), 200))
     return jsonify({"attempts": _services()["live_repo"].recent_ledger(limit=limit)})
+
+@api_bp.get("/activity/timeline")
+def activity_timeline():
+    limit = request.args.get("limit", 200, type=int)
+    return jsonify({"events": _services()["live_repo"].activity_timeline(limit=limit)})
 
 
 @api_bp.get("/activity/dispatches")

@@ -348,7 +348,8 @@ class SchedulerRepository:
                 SELECT DISTINCT i.episode_id FROM dispatch_batch_items i
                 JOIN dispatch_batches b ON b.id = i.batch_id
                 WHERE b.library_id = %s AND b.mode = 'manual'
-                  AND b.state IN ('completed','partial') AND i.state = 'dispatched'
+                  AND ((b.state IN ('completed','partial') AND i.state = 'dispatched')
+                       OR (b.state = 'failed' AND i.state = 'failed'))
                   AND i.episode_id = ANY(%s)
                   AND i.updated_at >= now() - (%s * interval '1 minute')
                 """, (library_id, episode_ids, cooldown),
@@ -379,6 +380,8 @@ class SchedulerRepository:
                 WHERE b.library_id = %s AND b.mode = 'manual' AND (
                     (b.state IN ('completed','partial') AND i.state = 'dispatched'
                      AND i.updated_at >= now() - interval '1 hour')
+                    OR (b.state = 'failed' AND i.state = 'failed'
+                        AND i.updated_at >= now() - interval '1 hour')
                     OR (b.state = 'dispatching' AND i.state = 'reserved'
                         AND i.created_at >= now() - interval '5 minutes'))
                 """, (library_id,),

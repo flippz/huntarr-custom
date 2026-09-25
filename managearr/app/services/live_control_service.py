@@ -21,6 +21,7 @@ from ..domain.live import (
     validate_confirm_request,
     validate_disarm_request,
     validate_emergency_stop_request,
+    validate_state_change_request,
 )
 from ..persistence.live_repository import LiveRepository
 from ..persistence.policy_repository import PolicyRepository
@@ -48,15 +49,14 @@ class LiveControlService:
 
     def status(self) -> dict:
         settings = self.scheduler_repo.get_settings()
-        self.live_repo.expire_stale_arm()
         control = self.live_repo.get_control()
         blocked_reasons = []
         if settings.mode != "live":
             blocked_reasons.append(f"scheduler mode is '{settings.mode}', not live")
-        if control["emergency_stopped_at"] is not None:
+        if control["state"] == "emergency_stopped":
             blocked_reasons.append("emergency stop is active")
-        if not control["armed"]:
-            blocked_reasons.append("live dispatch is not armed")
+        elif control["state"] != "running":
+            blocked_reasons.append("live dispatch is paused")
         return {
             "mode": settings.mode,
             "control": control,
@@ -150,6 +150,21 @@ class LiveControlService:
     def disarm(self, payload, *, actor: str) -> dict:
         clean, _errors = validate_disarm_request(payload)
         return self.live_repo.disarm(actor=actor, reason=clean["reason"])
+
+    def pause(self, payload, *, actor: str) -> tuple[dict | None, list[str]]:
+        clean, errors = validate_state_change_request(payload)
+        if errors:
+            return None, errors
+        return self.live_repo.set_authorization_state("paused", actor=actor, reason=clean["reason"]), []
+
+    def resume(self, payload, *, actor: str) -> tuple[dict | None, list[str]]:
+        clean, errors = validate_state_change_request(payload)
+        if errors:
+            return None, errors
+        try:
+            return self.live_repo.set_authorization_state("running", actor=actor, reason=clean["reason"]), []
+        except ValueError as exc:
+            return None, [str(exc)]
 
     def emergency_stop(self, payload, *, actor: str) -> dict:
         clean, _errors = validate_emergency_stop_request(payload)

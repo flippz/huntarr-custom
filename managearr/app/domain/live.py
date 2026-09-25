@@ -45,8 +45,20 @@ CHALLENGE_STATES = ("pending", "confirmed", "expired", "consumed")
 LEDGER_STATES = ("dispatched", "failed", "ambiguous", "blocked", "skipped")
 AUDIT_EVENT_TYPES = (
     "mode_enabled", "mode_disabled", "armed", "disarmed",
-    "emergency_stop", "arm_expired",
+    "emergency_stop", "arm_expired", "paused", "resumed",
 )
+
+def validate_state_change_request(payload) -> tuple[dict, list[str]]:
+    if not isinstance(payload, dict):
+        return {}, ["request body must be a JSON object"]
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return {}, ["reason is required and must be a non-empty string"]
+    if len(reason) > 500:
+        return {}, ["reason must be at most 500 characters"]
+    if payload.get("confirm") is not True:
+        return {}, ["confirm must be true"]
+    return {"reason": reason.strip()}, []
 
 
 def compute_policy_digest(policy: dict, live_settings: dict, scheduler_mode: str) -> str:

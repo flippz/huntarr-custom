@@ -237,9 +237,10 @@ def test_arm_confirm_succeeds_and_sets_bounded_expiry(live_control_service):
     )
     assert errors == []
     assert control["armed"] is True
-    assert control["arm_generation"] == 1
-    assert control["armed_by"] == "operator"
-    assert control["armed_reason"] == "on-call fix"
+    assert control["authorization_generation"] > 0
+    assert control["authorized_by"] == "operator"
+    assert control["authorization_reason"] == "on-call fix"
+    assert control["expires_at"] is None
 
 
 def test_arm_confirm_makes_live_cycle_due_within_arm_window(
@@ -260,7 +261,7 @@ def test_arm_confirm_makes_live_cycle_due_within_arm_window(
             "SELECT next_due_at <= now() AS due FROM scheduler_settings WHERE id = 1"
         ).fetchone()
     assert due["due"] is True
-    assert datetime.fromisoformat(control["expires_at"]) > datetime.now(timezone.utc)
+    assert control["expires_at"] is None  # persistent across restart
 
 
 def test_arm_confirm_rejects_wrong_phrase(live_control_service):
@@ -283,9 +284,7 @@ def test_arm_ttl_is_capped_to_max(live_control_service, live_repo):
         actor="operator",
     )
     assert errors == []
-    expires = datetime.fromisoformat(control["expires_at"])
-    armed_at = datetime.fromisoformat(control["armed_at"])
-    assert (expires - armed_at) <= timedelta(minutes=61)
+    assert control["expires_at"] is None
 
 
 def test_arm_rejects_ttl_out_of_bounds(live_control_service):
@@ -400,7 +399,7 @@ def test_live_armed_dispatches_selected_candidate_and_records_ledger(
     dispatched = [row for row in ledger if row["state"] == "dispatched"]
     assert len(dispatched) == 1
     assert dispatched[0]["sonarr_command_id"] == 9001
-    assert dispatched[0]["arm_generation"] == 1
+    assert dispatched[0]["arm_generation"] > 0
     batch = dispatch_repo.get_batch(dispatched[0]["dispatch_batch_id"])
     assert batch.mode == "manual"
     assert batch.state == "completed"
@@ -455,28 +454,13 @@ def test_live_respects_minimum_delay_between_dispatches(
     assert len(skipped) == 1
 
 
-def test_live_stops_when_arm_expires_mid_cycle(
-    database, scheduler_repo, policy_repo, live_repo, library_repo, activity_repo, candidate_repo,
-    dispatch_repo, dispatch_planning_service,
-):
-    _library_scan(library_repo, activity_repo, candidate_repo, count=3)
+def test_persistent_running_ignores_legacy_ttl(database, live_control_service, live_repo):
     live_repo.enable_live_mode(actor="t", reason="t")
-    live_repo.arm(actor="t", reason="t", ttl_minutes=15)
-    with database.connect() as conn:
-        conn.execute("UPDATE live_control SET max_dispatches_per_cycle = 5, expires_at = now() - interval '1 second' WHERE id = 1")
-    stub = StubSonarrClient()
-    dispatch_service = _dispatch_service_with_stub(dispatch_planning_service, dispatch_repo, library_repo, stub)
-    worker = _make_worker(scheduler_repo, policy_repo, live_repo, dispatch_service)
-
-    cycle_id = _queue_live_cycle(database, scheduler_repo, policy_repo)
-    _plan_and_dispatch(worker, scheduler_repo)
-
-    assert stub.calls == []
-    ledger = live_repo.ledger_for_cycle(cycle_id)
-    assert len(ledger) == 1
-    assert ledger[0]["state"] == "blocked"
-    assert "expired" in ledger[0]["terminal_reason"]
-
+    control, errors = live_control_service.resume({"confirm": True, "reason": "persistent"}, actor="t")
+    assert errors == []
+    assert control["state"] == "running"
+    assert control["expires_at"] is None
+    assert live_control_service.status()["dispatch_allowed"] is True
 
 def test_live_stops_when_emergency_stopped_mid_cycle(
     database, scheduler_repo, policy_repo, live_repo, live_control_service, library_repo, activity_repo,
@@ -600,14 +584,14 @@ def test_restart_does_not_implicitly_arm(database, scheduler_repo, policy_repo, 
     assert live_repo.get_control()["armed"] is False
 
 
-def test_expired_arm_shows_as_unarmed_via_status(live_control_service, live_repo, database):
+def test_pause_blocks_persistent_authorization(live_control_service, live_repo):
     live_repo.enable_live_mode(actor="t", reason="t")
-    live_repo.arm(actor="t", reason="t", ttl_minutes=15)
-    with database.connect() as conn:
-        conn.execute("UPDATE live_control SET expires_at = now() - interval '1 second' WHERE id = 1")
-    status = live_control_service.status()
-    assert status["control"]["armed"] is False
-    assert "not armed" in "; ".join(status["blocked_reasons"])
+    live_control_service.resume({"confirm": True, "reason": "start"}, actor="t")
+    control, errors = live_control_service.pause({"confirm": True, "reason": "maintenance"}, actor="t")
+    assert errors == []
+    assert control["state"] == "paused"
+    assert live_control_service.status()["dispatch_allowed"] is False
+
 
 
 # --- API wiring --------------------------------------------------------
@@ -626,15 +610,10 @@ def test_live_api_endpoints_full_round_trip(client):
     assert confirm.status_code == 200
     assert confirm.get_json()["result"]["armed"] is False
 
-    arm_challenge = client.post(
-        "/api/v1/scheduler/live/arm-challenge", json={"reason": "verify", "ttl_minutes": 5}
-    ).get_json()
-    arm_confirm = client.post("/api/v1/scheduler/live/arm-confirm", json={
-        "challenge_id": arm_challenge["challenge_id"], "token": arm_challenge["token"],
-        "phrase": ARM_LIVE_DISPATCH_PHRASE,
-    })
-    assert arm_confirm.status_code == 200
-    assert arm_confirm.get_json()["control"]["armed"] is True
+    assert client.post("/api/v1/scheduler/live/arm-challenge", json={}).status_code == 410
+    resumed = client.post("/api/v1/scheduler/live/resume", json={"confirm": True, "reason": "verify"})
+    assert resumed.status_code == 200
+    assert resumed.get_json()["control"]["state"] == "running"
 
     stopped = client.post("/api/v1/scheduler/live/emergency-stop", json={"reason": "test"})
     assert stopped.status_code == 200
@@ -664,7 +643,8 @@ def test_live_ui_inline_scripts_have_valid_js_syntax(client, tmp_path):
 def test_ui_exposes_danger_zone_two_step_flow(client):
     settings_html = client.get("/settings").get_data(as_text=True)
     assert 'id="live-mode-request"' in settings_html
-    assert 'id="live-arm-confirm"' in settings_html
+    assert 'id="live-pause"' in settings_html
+    assert 'id="live-resume"' in settings_html
     assert 'id="live-emergency-stop"' in settings_html
     assert "button-danger" in settings_html
 
@@ -687,15 +667,18 @@ def test_activity_recent_dispatches_api_and_ui(client, dispatch_repo):
     assert response.status_code == 200
     assert "batches" in response.get_json()
     html = client.get("/activity").get_data(as_text=True)
-    assert "Recent dispatches and outcomes" in html
-    assert "loadRecentDispatches" in html
+    assert "Automation timeline" in html
+    assert "loadTimeline" in html
 
 
 def test_activity_live_attempts_api_and_ui(client):
     response = client.get("/api/v1/activity/live-attempts")
     assert response.status_code == 200
     assert "attempts" in response.get_json()
+    timeline = client.get("/api/v1/activity/timeline")
+    assert timeline.status_code == 200
+    assert "events" in timeline.get_json()
     html = client.get("/activity").get_data(as_text=True)
-    assert "Live automation attempts" in html
-    assert "including safety blocks" in html
-    assert "loadLiveAttempts" in html
+    assert "Automation timeline" in html
+    assert "blocked attempts" in html
+    assert "loadTimeline" in html

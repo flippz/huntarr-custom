@@ -25,8 +25,15 @@ def _now() -> datetime:
 
 def _control_dict(row) -> dict:
     return {
-        "armed": row["armed"],
-        "arm_generation": row["arm_generation"],
+        "state": row["authorization_state"],
+        "authorization_generation": row["authorization_generation"],
+        "authorized_at": _iso(row["authorized_at"]),
+        "authorized_by": row["authorized_by"],
+        "authorization_reason": row["authorization_reason"],
+        "state_changed_at": _iso(row["state_changed_at"]),
+        # Harmless response compatibility; these have no TTL semantics in v7.
+        "armed": row["authorization_state"] == "running",
+        "arm_generation": row["authorization_generation"],
         "armed_at": _iso(row["armed_at"]),
         "armed_by": row["armed_by"],
         "armed_reason": row["armed_reason"],
@@ -137,6 +144,9 @@ class LiveRepository:
                 """,
                 (previous["mode"], reason, actor),
             )
+            conn.execute("""UPDATE live_control SET authorization_state='paused',
+                authorization_reason='Live enabled; explicit resume required',
+                state_changed_at=now(), updated_at=now() WHERE id=1""")
         return {"mode": row["mode"]}
 
     def disarm_for_mode_change(self, *, new_mode: str, actor: str) -> None:
@@ -149,10 +159,12 @@ class LiveRepository:
             updated = conn.execute(
                 """
                 UPDATE live_control
-                SET armed = FALSE, armed_at = NULL, armed_by = NULL,
+                SET authorization_state='paused', authorization_generation=authorization_generation+1,
+                    authorization_reason='scheduler mode changed away from live', state_changed_at=now(),
+                    armed = FALSE, armed_at = NULL, armed_by = NULL,
                     armed_reason = NULL, expires_at = NULL, updated_at = now()
-                WHERE id = 1 AND armed = TRUE
-                RETURNING arm_generation
+                WHERE id = 1 AND authorization_state <> 'paused'
+                RETURNING authorization_generation AS arm_generation
                 """
             ).fetchone()
             if updated is not None:
@@ -167,65 +179,15 @@ class LiveRepository:
     # --- arm / disarm / emergency stop ----------------------------------
 
     def arm(self, *, actor: str, reason: str, ttl_minutes: int) -> tuple[dict | None, str | None]:
-        with self.db.connect() as conn:
-            settings = conn.execute("SELECT mode FROM scheduler_settings WHERE id = 1").fetchone()
-            if settings["mode"] != "live":
-                return None, "scheduler mode is not live; arming is not allowed"
-            control = conn.execute("SELECT * FROM live_control WHERE id = 1 FOR UPDATE").fetchone()
-            ttl_minutes = min(ttl_minutes, control["max_arm_ttl_minutes"])
-            row = conn.execute(
-                """
-                UPDATE live_control
-                SET armed = TRUE, arm_generation = arm_generation + 1,
-                    armed_at = now(), armed_by = %s, armed_reason = %s,
-                    expires_at = now() + (%s * interval '1 minute'),
-                    emergency_stopped_at = NULL, emergency_stop_reason = NULL,
-                    updated_at = now()
-                WHERE id = 1
-                RETURNING *
-                """,
-                (actor[:255], reason[:500], ttl_minutes),
-            ).fetchone()
-            # Arming must create an opportunity to dispatch within the arm
-            # window. Without this, a short arm TTL can expire before the
-            # scheduler's normal hourly next_due_at, making Live appear inert.
-            # The worker still performs every mode/generation/expiry gate
-            # before any Sonarr command.
-            conn.execute(
-                """
-                UPDATE scheduler_settings
-                SET next_due_at = now(), updated_at = now()
-                WHERE id = 1 AND mode = 'live'
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO live_control_audit (event_type, new_mode, reason, actor, arm_generation)
-                VALUES ('armed', 'live', %s, %s, %s)
-                """,
-                (reason[:500], actor[:255], row["arm_generation"]),
-            )
-        return _control_dict(row), None
+        # Internal compatibility shim for pre-v7 callers. TTL is deliberately
+        # ignored; the resulting authorization is the same persistent resume.
+        try:
+            return self.set_authorization_state("running", actor=actor, reason=reason), None
+        except ValueError as exc:
+            return None, str(exc)
 
     def disarm(self, *, actor: str, reason: str) -> dict:
-        with self.db.connect() as conn:
-            row = conn.execute(
-                """
-                UPDATE live_control
-                SET armed = FALSE, armed_at = NULL, armed_by = NULL,
-                    armed_reason = NULL, expires_at = NULL, updated_at = now()
-                WHERE id = 1
-                RETURNING *
-                """
-            ).fetchone()
-            conn.execute(
-                """
-                INSERT INTO live_control_audit (event_type, reason, actor, arm_generation)
-                VALUES ('disarmed', %s, %s, %s)
-                """,
-                (reason[:500], actor[:255], row["arm_generation"]),
-            )
-        return _control_dict(row)
+        return self.set_authorization_state("paused", actor=actor, reason=reason)
 
     def emergency_stop(self, *, actor: str, reason: str) -> dict:
         """Idempotent: repeated calls always converge on armed=FALSE and a
@@ -235,14 +197,15 @@ class LiveRepository:
             row = conn.execute(
                 """
                 UPDATE live_control
-                SET armed = FALSE, armed_at = NULL, armed_by = NULL, armed_reason = NULL,
+                SET authorization_state = 'emergency_stopped', authorization_reason = %s,
+                    state_changed_at = now(), armed = FALSE, armed_at = NULL, armed_by = NULL, armed_reason = NULL,
                     expires_at = NULL, emergency_stopped_at = now(),
                     emergency_stop_reason = %s, emergency_stop_generation = emergency_stop_generation + 1,
                     updated_at = now()
                 WHERE id = 1
                 RETURNING *
                 """,
-                (reason[:500],),
+                (reason[:500], reason[:500]),
             ).fetchone()
             conn.execute(
                 """
@@ -279,16 +242,46 @@ class LiveRepository:
             if settings["mode"] != "live":
                 return False, "scheduler mode is no longer live"
             control = conn.execute("SELECT * FROM live_control WHERE id = 1").fetchone()
-            if control["emergency_stopped_at"] is not None:
+            if control["authorization_state"] == "emergency_stopped":
                 return False, "emergency stop is active"
-            if not control["armed"]:
-                return False, "live dispatch is not armed"
-            if control["arm_generation"] != expected_generation:
-                return False, "arm generation changed since this cycle started"
-            now = conn.execute("SELECT now() AS now").fetchone()["now"]
-            if control["expires_at"] is None or control["expires_at"] <= now:
-                return False, "arm window has expired"
+            if control["authorization_state"] != "running":
+                return False, "live dispatch is paused"
+            if control["authorization_generation"] != expected_generation:
+                return False, "authorization generation changed since this cycle started"
         return True, ""
+
+    def set_authorization_state(self, state: str, *, actor: str, reason: str) -> dict:
+        """Persistently pause/resume and invalidate already captured work."""
+        if state not in ("running", "paused"):
+            raise ValueError("invalid authorization state")
+        with self.db.connect() as conn:
+            mode = conn.execute("SELECT mode FROM scheduler_settings WHERE id=1").fetchone()["mode"]
+            if state == "running" and mode != "live":
+                raise ValueError("scheduler mode is not live")
+            row = conn.execute(
+                """UPDATE live_control SET authorization_state=%s,
+                   authorization_generation=authorization_generation+1,
+                   authorized_at=CASE WHEN %s='running' THEN now() ELSE authorized_at END,
+                   authorized_by=CASE WHEN %s='running' THEN %s ELSE authorized_by END,
+                   authorization_reason=%s, state_changed_at=now(),
+                   emergency_stopped_at=NULL, emergency_stop_reason=NULL,
+                   armed=FALSE, armed_at=NULL, armed_by=NULL, armed_reason=NULL, expires_at=NULL,
+                   updated_at=now() WHERE id=1 RETURNING *""",
+                (state, state, state, actor[:255], reason[:500]),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO live_control_audit(event_type,new_mode,reason,actor,arm_generation) VALUES (%s,'live',%s,%s,%s)",
+                ("resumed" if state == "running" else "paused", reason[:500], actor[:255], row["authorization_generation"]),
+            )
+            if state == "running":
+                conn.execute("UPDATE scheduler_settings SET next_due_at=now(),updated_at=now() WHERE id=1 AND mode='live'")
+            else:
+                conn.execute("""UPDATE scheduler_cycle_runs SET state='skipped',
+                    started_at=COALESCE(started_at,now()),finished_at=now(),
+                    worker_owner=COALESCE(worker_owner,'pause'),
+                    safe_summary='Live dispatch paused before this queued cycle started.'
+                    WHERE state='queued' AND mode_snapshot='live'""")
+        return _control_dict(row)
 
     def check_dispatch_delay_elapsed(self, min_delay_seconds: int) -> bool:
         with self.db.connect() as conn:
@@ -395,6 +388,35 @@ class LiveRepository:
             }
             for r in rows
         ]
+
+    def activity_timeline(self, limit: int = 200) -> list[dict]:
+        """Unified chronology; planned rows disappear once a definitive
+        ledger row exists, avoiding duplicate/conflicting summaries."""
+        limit = max(1, min(int(limit), 500))
+        with self.db.connect() as conn:
+            rows = conn.execute("""
+                SELECT * FROM (
+                  SELECT ('live:'||l.id)::text event_key,l.created_at occurred_at,'live_attempt'::text kind,
+                    l.state,l.terminal_reason summary,c.series_title,c.season_number,c.episode_number,
+                    l.dispatch_batch_id,l.sonarr_command_id,NULL::text source_endpoint
+                  FROM live_dispatch_ledger l JOIN scheduler_candidate_results c ON c.id=l.candidate_result_id
+                  UNION ALL
+                  SELECT ('plan:'||c.id)::text,r.queued_at,'planned',
+                    CASE WHEN c.selected THEN 'planned' ELSE 'blocked' END,
+                    COALESCE(c.exclusion_reason,'Selected by policy for live dispatch'),
+                    c.series_title,c.season_number,c.episode_number,NULL,NULL,NULL
+                  FROM scheduler_candidate_results c
+                  JOIN scheduler_library_results lr ON lr.id=c.library_result_id
+                  JOIN scheduler_cycle_runs r ON r.id=lr.cycle_run_id
+                  WHERE r.mode_snapshot='live' AND NOT EXISTS
+                    (SELECT 1 FROM live_dispatch_ledger l WHERE l.candidate_result_id=c.id)
+                  UNION ALL
+                  SELECT ('outcome:'||e.id)::text,e.observed_at,'reconciliation',e.event_type,e.safe_summary,
+                    i.series_title,i.season_number,i.episode_number,e.batch_id,e.sonarr_command_id,e.source_endpoint
+                  FROM dispatch_outcome_events e LEFT JOIN dispatch_batch_items i ON i.id=e.dispatch_item_id
+                ) timeline ORDER BY occurred_at DESC,event_key DESC LIMIT %s
+            """, (limit,)).fetchall()
+        return [{k: (_iso(v) if k == "occurred_at" else v) for k, v in dict(r).items()} for r in rows]
 
     def ledger_for_cycle(self, cycle_run_id: int) -> list[dict]:
         with self.db.connect() as conn:

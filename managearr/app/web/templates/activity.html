@@ -7,24 +7,12 @@
 <p class="readonly-notice">Outcome reconciliation is manual and read-only: it sends no search. A completed EpisodeSearch command is not proof that Sonarr grabbed, downloaded, or imported an episode. Live dispatches are queued for prompt automatic read-only reconciliation.</p>
 
 <section class="card">
-  <h2>Live automation attempts</h2>
-  <p class="muted">Every scheduled live attempt, including safety blocks that sent no Sonarr command.</p>
-  <div class="table-scroll">
-    <table class="data-table">
-      <thead><tr><th>Time</th><th>Series / episode</th><th>State</th><th>Reason</th><th>Command</th></tr></thead>
-      <tbody id="live-attempts"><tr><td colspan="5">Loading...</td></tr></tbody>
-    </table>
-  </div>
-</section>
-
-<section class="card">
-  <h2>Recent dispatches and outcomes</h2>
-  <div class="table-scroll">
-    <table class="data-table">
-      <thead><tr><th>Time</th><th>Series / episode</th><th>Dispatch</th><th>Command</th><th>Outcome</th><th>Last checked</th></tr></thead>
-      <tbody id="recent-dispatches"><tr><td colspan="6">Loading...</td></tr></tbody>
-    </table>
-  </div>
+  <h2>Automation timeline</h2>
+  <p class="muted">Plans, blocked attempts, commands, and read-only Sonarr evidence in one chronology.</p>
+  <div class="table-scroll"><table class="data-table">
+    <thead><tr><th>Time</th><th>Episode</th><th>Type</th><th>State</th><th>Evidence / reason</th><th>Command</th></tr></thead>
+    <tbody id="activity-timeline"><tr><td colspan="6">Loading...</td></tr></tbody>
+  </table></div>
 </section>
 
 <section class="card">
@@ -112,49 +100,11 @@
 let currentJobId = null;
 let previewCandidateIds = [];
 
-async function loadLiveAttempts() {
-  const data = await api('/api/v1/activity/live-attempts?limit=100');
-  const tbody = document.getElementById('live-attempts');
-  tbody.innerHTML = '';
-  if (data.attempts.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5">No live attempts yet.</td></tr>';
-    return;
-  }
-  data.attempts.forEach(attempt => {
-    const subject = `${escapeHtml(attempt.series_title)} S${attempt.season_number}E${attempt.episode_number}`;
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${escapeHtml(attempt.created_at)}</td>
-      <td>${subject}</td>
-      <td><span class="state-pill state-${escapeHtml(attempt.state)}">${escapeHtml(attempt.state)}</span></td>
-      <td>${escapeHtml(attempt.terminal_reason)}</td>
-      <td>${attempt.sonarr_command_id ? `#${attempt.sonarr_command_id}` : 'none sent'}</td>`;
-    tbody.appendChild(tr);
-  });
-}
-
-async function loadRecentDispatches() {
-  const data = await api('/api/v1/activity/dispatches?limit=50');
-  const tbody = document.getElementById('recent-dispatches');
-  tbody.innerHTML = '';
-  const batches = data.batches.filter(batch => batch.mode !== 'dry_run');
-  if (batches.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6">No dispatches yet.</td></tr>';
-    return;
-  }
-  batches.forEach(batch => {
-    const item = (batch.items || []).find(entry => entry.state !== 'excluded');
-    const subject = item ? `${escapeHtml(item.series_title)} S${item.season_number}E${item.episode_number}` : `Batch #${batch.id}`;
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${escapeHtml(batch.created_at)}</td>
-      <td>${subject}</td>
-      <td><span class="state-pill state-${escapeHtml(batch.state)}">${escapeHtml(batch.state)}</span></td>
-      <td>${batch.sonarr_command_id ? `#${batch.sonarr_command_id} ${escapeHtml(batch.command_observed_state || batch.sonarr_command_status || '')}` : '-'}</td>
-      <td><strong>${escapeHtml(batch.reconciliation_state)}</strong><br><span class="muted">${escapeHtml(batch.reconciliation_summary || batch.error_summary || 'Awaiting read-only reconciliation')}</span></td>
-      <td>${escapeHtml(batch.last_reconciled_at || 'pending')}</td>`;
-    tbody.appendChild(tr);
-  });
+async function loadTimeline() {
+  const data=await api('/api/v1/activity/timeline?limit=200');
+  const tbody=document.getElementById('activity-timeline'); tbody.innerHTML='';
+  if(!data.events.length){tbody.innerHTML='<tr><td colspan="6">No automation activity yet.</td></tr>';return;}
+  data.events.forEach(event=>{const tr=document.createElement('tr'); const subject=event.series_title ? `${escapeHtml(event.series_title)} S${event.season_number}E${event.episode_number}` : 'Batch-level evidence'; tr.innerHTML=`<td>${escapeHtml(event.occurred_at)}</td><td>${subject}</td><td>${escapeHtml(event.kind)}</td><td><span class="state-pill state-${escapeHtml(event.state)}">${escapeHtml(event.state)}</span></td><td>${escapeHtml(event.summary)}${event.source_endpoint ? `<br><span class="muted">Source: ${escapeHtml(event.source_endpoint)}</span>`:''}</td><td>${event.sonarr_command_id ? '#'+event.sonarr_command_id : '-'}</td>`;tbody.appendChild(tr);});
 }
 
 async function loadActivity() {
@@ -384,7 +334,7 @@ document.getElementById('send-dispatch').addEventListener('click', async () => {
   }
 });
 
-Promise.all([loadActivity(), loadRecentDispatches(), loadLiveAttempts()]).catch(err => toast('Failed to load activity: ' + err.message));
-setInterval(() => Promise.all([loadRecentDispatches(), loadLiveAttempts()]).catch(() => {}), 15000);
+Promise.all([loadActivity(), loadTimeline()]).catch(err => toast('Failed to load activity: ' + err.message));
+setInterval(() => loadTimeline().catch(() => {}), 15000);
 </script>
 {% endblock %}

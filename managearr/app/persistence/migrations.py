@@ -1112,6 +1112,44 @@ MIGRATIONS: list[Migration] = [
                 FOR EACH ROW EXECUTE FUNCTION protect_live_append_only();
         """,
     ),
+    Migration(
+        version=7,
+        name="persistent_live_authorization",
+        sql="""
+            -- Fail closed on every v6 upgrade.  In particular, an armed row
+            -- (even one whose TTL has not elapsed) is never converted to a
+            -- running authorization.
+            ALTER TABLE live_control ADD COLUMN authorization_state TEXT NOT NULL DEFAULT 'paused';
+            ALTER TABLE live_control ADD COLUMN authorization_generation BIGINT NOT NULL DEFAULT 0;
+            ALTER TABLE live_control ADD COLUMN authorized_at TIMESTAMPTZ;
+            ALTER TABLE live_control ADD COLUMN authorized_by VARCHAR(255);
+            ALTER TABLE live_control ADD COLUMN authorization_reason VARCHAR(500);
+            ALTER TABLE live_control ADD COLUMN state_changed_at TIMESTAMPTZ NOT NULL DEFAULT now();
+            UPDATE live_control SET authorization_state = 'paused', authorization_generation = 0,
+                authorized_at = NULL, authorized_by = NULL,
+                authorization_reason = 'Upgrade to schema v7 requires an explicit resume',
+                armed = FALSE, armed_at = NULL, armed_by = NULL, armed_reason = NULL,
+                expires_at = NULL, emergency_stopped_at = NULL,
+                emergency_stop_reason = NULL, updated_at = now();
+            ALTER TABLE live_control ADD CONSTRAINT live_control_authorization_state_check
+                CHECK (authorization_state IN ('running', 'paused', 'emergency_stopped'));
+            ALTER TABLE live_control ADD CONSTRAINT live_control_authorization_generation_check
+                CHECK (authorization_generation >= 0);
+            ALTER TABLE live_control ADD CONSTRAINT live_control_running_identity_check CHECK (
+                authorization_state <> 'running' OR
+                (authorization_generation > 0 AND authorized_at IS NOT NULL
+                 AND authorized_by IS NOT NULL AND authorization_reason IS NOT NULL)
+            );
+
+            ALTER TABLE live_control_audit DROP CONSTRAINT live_control_audit_event_type_check;
+            ALTER TABLE live_control_audit ADD CONSTRAINT live_control_audit_event_type_check
+                CHECK (event_type IN ('mode_enabled','mode_disabled','armed','disarmed',
+                    'emergency_stop','arm_expired','paused','resumed'));
+            INSERT INTO live_control_audit (event_type, reason, actor, arm_generation)
+                SELECT 'paused', 'Schema v7 safety migration: explicit resume required',
+                       'migration-v7', authorization_generation FROM live_control WHERE id = 1;
+        """,
+    ),
 ]
 
 
