@@ -408,7 +408,7 @@ class LiveRepository:
                   FROM scheduler_candidate_results c
                   JOIN scheduler_library_results lr ON lr.id=c.library_result_id
                   JOIN scheduler_cycle_runs r ON r.id=lr.cycle_run_id
-                  WHERE r.mode_snapshot='live' AND NOT EXISTS
+                  WHERE r.mode_snapshot='live' AND c.selected = TRUE AND NOT EXISTS
                     (SELECT 1 FROM live_dispatch_ledger l WHERE l.candidate_result_id=c.id)
                   UNION ALL
                   SELECT ('outcome:'||e.id)::text,e.observed_at,'reconciliation',e.event_type,e.safe_summary,
