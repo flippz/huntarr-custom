@@ -213,6 +213,116 @@ def test_planning_applies_cooldown_and_inflight(
     assert cycle["selected_count"] == 1
 
 
+def _record_outcome(
+    conn, batch_id, item_id, candidate, event_type, event_state, evidence_key, *, observed_at=None
+):
+    conn.execute(
+        """
+        INSERT INTO dispatch_outcome_events (
+            batch_id, dispatch_item_id, candidate_id, episode_id, observed_at,
+            source_endpoint, event_type, event_state, safe_summary, evidence_key
+        ) VALUES (%s,%s,%s,%s,COALESCE(%s,now()),'history',%s,%s,'safe',%s)
+        """,
+        (batch_id, item_id, candidate.id, candidate.episode_id, observed_at,
+         event_type, event_state, evidence_key),
+    )
+
+
+def _completed_dispatch(conn, dispatch_repo, library, job, candidate, *, dispatched_at=None):
+    batch_id = dispatch_repo.create_batch(conn, {
+        "scan_job_id": job.id, "library_id": library.id, "library_name": library.name,
+        "mode": "manual", "state": "completed", "requested_count": 1,
+        "selected_count": 1, "dispatched_count": 1, "sonarr_command_id": 22,
+    })
+    if dispatched_at is None:
+        item_id = dispatch_repo.create_items(conn, batch_id, [{
+            "candidate_id": candidate.id, "episode_id": candidate.episode_id,
+            "series_id": candidate.series_id, "series_title": candidate.series_title,
+            "season_number": 1, "episode_number": 1, "state": "dispatched",
+        }])[0]
+    else:
+        item_id = conn.execute(
+            """
+            INSERT INTO dispatch_batch_items (
+                batch_id, candidate_id, episode_id, series_id, series_title,
+                season_number, episode_number, state, created_at, updated_at
+            ) VALUES (%s,%s,%s,%s,%s,1,1,'dispatched',%s,%s) RETURNING id
+            """,
+            (batch_id, candidate.id, candidate.episode_id, candidate.series_id,
+             candidate.series_title, dispatched_at, dispatched_at),
+        ).fetchone()["id"]
+    return batch_id, item_id
+
+
+def test_grabbed_without_terminal_outcome_is_excluded_and_occupies_queue(
+    database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    library, job, candidates = _library_scan(library_repo, activity_repo, candidate_repo, count=2)
+    with database.connect() as conn:
+        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        batch_id, item_id = _completed_dispatch(
+            conn, dispatch_repo, library, job, candidates[0], dispatched_at=old
+        )
+        _record_outcome(conn, batch_id, item_id, candidates[0], "grabbed", "nonterminal", "grab-active")
+        # Prove the durable outcome, not a recently updated dispatch row, is
+        # what keeps this episode out of future automatic searches.
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="grabbed-active")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    result = cycle["libraries"][0]
+    reasons = {c["candidate_id"]: c["exclusion_reason"] for c in result["candidates"]}
+    assert "active grab" in reasons[candidates[0].id]
+    assert result["queue_occupancy"] == 1
+    assert cycle["selected_count"] == 1
+
+
+def test_terminal_failure_starts_cooldown_from_durable_outcome(
+    database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    library, job, candidates = _library_scan(library_repo, activity_repo, candidate_repo, count=2)
+    with database.connect() as conn:
+        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        batch_id, item_id = _completed_dispatch(
+            conn, dispatch_repo, library, job, candidates[0], dispatched_at=old
+        )
+        _record_outcome(
+            conn, batch_id, item_id, candidates[0], "grabbed", "nonterminal",
+            "grab-before-failure", observed_at=old,
+        )
+        _record_outcome(conn, batch_id, item_id, candidates[0], "download_failed", "terminal", "recent-failure")
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="failure-cooldown")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    result = cycle["libraries"][0]
+    reasons = {c["candidate_id"]: c["exclusion_reason"] for c in result["candidates"]}
+    assert "cooldown" in reasons[candidates[0].id]
+    assert result["queue_occupancy"] == 0
+
+
+def test_episode_becomes_eligible_after_definitive_failure_cooldown(
+    database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    library, job, candidates = _library_scan(library_repo, activity_repo, candidate_repo, count=1)
+    with database.connect() as conn:
+        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        batch_id, item_id = _completed_dispatch(
+            conn, dispatch_repo, library, job, candidates[0], dispatched_at=old
+        )
+        _record_outcome(
+            conn, batch_id, item_id, candidates[0], "grabbed", "nonterminal",
+            "old-grab", observed_at=old,
+        )
+        _record_outcome(
+            conn, batch_id, item_id, candidates[0], "import_failed", "terminal",
+            "old-failure", observed_at=old + timedelta(minutes=1),
+        )
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="failure-expired")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    result = cycle["libraries"][0]
+    candidate = result["candidates"][0]
+    assert candidate["selected"] is True
+    assert candidate["exclusion_reason"] is None
+    assert result["queue_occupancy"] == 0
+
+
 def test_planning_uses_durable_queue_and_outcome_evidence(
     database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
 ):

@@ -339,7 +339,8 @@ class SchedulerRepository:
         """Read conservative durable dispatch/outcome facts; never contacts Sonarr."""
         if not episode_ids:
             return {"cooldown": set(), "in_flight": set(), "stale": set(), "imported": set(),
-                    "capacity_used": 0, "queue_occupancy": 0, "recent_success_count": 0}
+                    "active_grabbed": set(), "capacity_used": 0, "queue_occupancy": 0,
+                    "recent_success_count": 0}
         cooldown = policy["cooldown_minutes"]
         cycle_minutes = policy["cycle_interval_minutes"]
         with self.db.connect() as conn:
@@ -394,6 +395,34 @@ class SchedulerRepository:
                   AND e.event_type = 'imported'
                 """, (library_id, episode_ids),
             ).fetchall()
+            active_grabbed = conn.execute(
+                """
+                SELECT DISTINCT grabbed.episode_id
+                FROM dispatch_outcome_events grabbed
+                JOIN dispatch_batches b ON b.id = grabbed.batch_id
+                WHERE b.library_id = %s AND grabbed.episode_id = ANY(%s)
+                  AND grabbed.event_type = 'grabbed'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dispatch_outcome_events terminal
+                      WHERE terminal.dispatch_item_id = grabbed.dispatch_item_id
+                        AND terminal.event_type IN (
+                            'imported','download_failed','import_failed',
+                            'command_failed','command_aborted'
+                        )
+                  )
+                """, (library_id, episode_ids),
+            ).fetchall()
+            outcome_cooldown = conn.execute(
+                """
+                SELECT DISTINCT e.episode_id FROM dispatch_outcome_events e
+                JOIN dispatch_batches b ON b.id = e.batch_id
+                WHERE b.library_id = %s AND e.episode_id = ANY(%s)
+                  AND e.event_type IN (
+                      'download_failed','import_failed','command_failed','command_aborted'
+                  )
+                  AND e.observed_at >= now() - (%s * interval '1 minute')
+                """, (library_id, episode_ids, cooldown),
+            ).fetchall()
             queue = conn.execute(
                 """
                 WITH dispatched AS (
@@ -401,14 +430,15 @@ class SchedulerRepository:
                     JOIN dispatch_batches b ON b.id = i.batch_id
                     WHERE b.library_id = %s AND b.mode = 'manual'
                       AND b.state IN ('completed','partial') AND i.state = 'dispatched'
-                ), latest AS (
-                    SELECT DISTINCT ON (e.dispatch_item_id) e.dispatch_item_id, e.event_type
-                    FROM dispatch_outcome_events e JOIN dispatched d ON d.id = e.dispatch_item_id
-                    ORDER BY e.dispatch_item_id, e.observed_at DESC, e.id DESC
                 )
-                SELECT count(*) AS c FROM dispatched d LEFT JOIN latest l ON l.dispatch_item_id = d.id
-                WHERE l.event_type IS NULL OR l.event_type NOT IN (
-                    'imported','download_failed','import_failed','command_failed','command_aborted'
+                SELECT count(*) AS c FROM dispatched d
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM dispatch_outcome_events terminal
+                    WHERE terminal.dispatch_item_id = d.id
+                      AND terminal.event_type IN (
+                          'imported','download_failed','import_failed',
+                          'command_failed','command_aborted'
+                      )
                 )
                 """, (library_id,),
             ).fetchone()["c"]
@@ -421,10 +451,12 @@ class SchedulerRepository:
                 """, (library_id, cycle_minutes),
             ).fetchone()["c"]
         return {
-            "cooldown": {r["episode_id"] for r in cooled},
+            "cooldown": ({r["episode_id"] for r in cooled}
+                         | {r["episode_id"] for r in outcome_cooldown}),
             "in_flight": {r["episode_id"] for r in inflight},
             "stale": {r["episode_id"] for r in stale},
             "imported": {r["episode_id"] for r in imported},
+            "active_grabbed": {r["episode_id"] for r in active_grabbed},
             "capacity_used": capacity,
             "queue_occupancy": queue,
             "recent_success_count": successes,

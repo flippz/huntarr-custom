@@ -213,6 +213,8 @@ class SchedulerService:
                 reason = "duplicate Sonarr episode in scan snapshot"
             elif episode_id in facts["imported"]:
                 reason = "durable outcome already records this episode as imported"
+            elif episode_id in facts["active_grabbed"]:
+                reason = "durable outcome records an active grab without a terminal import or failure"
             elif episode_id in facts["stale"]:
                 reason = "stale or ambiguous dispatch outcome requires operator review"
             elif episode_id in facts["in_flight"]:
