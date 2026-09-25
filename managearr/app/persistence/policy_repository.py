@@ -72,6 +72,9 @@ class PolicyRepository:
         now = _now()
 
         with self.db.connect() as conn:
+            previous_interval = conn.execute(
+                "SELECT cycle_interval_minutes FROM automation_policy WHERE id = 1"
+            ).fetchone()["cycle_interval_minutes"]
             conn.execute(
                 """
                 UPDATE automation_policy
@@ -93,4 +96,18 @@ class PolicyRepository:
                     now,
                 ),
             )
+            if current["cycle_interval_minutes"] != previous_interval:
+                # Make cadence edits take effect immediately and predictably;
+                # the Settings page's displayed next run must not retain the
+                # old interval for one more cycle.
+                conn.execute(
+                    """
+                    UPDATE scheduler_settings
+                    SET next_due_at = CASE WHEN mode = 'off' THEN NULL
+                                           ELSE now() + (%s * interval '1 minute') END,
+                        updated_at = now()
+                    WHERE id = 1
+                    """,
+                    (current["cycle_interval_minutes"],),
+                )
         return self.get()

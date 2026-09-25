@@ -23,7 +23,8 @@
   <p class="simulation-notice"><strong>Live sends real Sonarr EpisodeSearch commands.</strong> Authorization is persistent until explicitly paused or stopped.</p>
   <p>Status: <strong id="live-state">-</strong> · Scheduler mode: <strong id="live-mode">-</strong></p>
   <p id="live-reason" class="muted">-</p>
-  <p class="muted">Up to <strong id="live-max-dispatches">-</strong> eligible search(es) per cycle, at least <strong id="live-min-delay">-</strong> second(s) apart.</p>
+  <p class="muted">Runs every <strong id="live-cycle-interval">-</strong> minute(s). Up to <strong id="live-max-dispatches">-</strong> eligible search(es) per cycle, at least <strong id="live-min-delay">-</strong> second(s) apart.</p>
+  <p class="muted">Changing the cycle interval below immediately recalculates Next due. Pause/Resume preserves that schedule.</p>
   <p class="muted" id="live-last-dispatch">Last dispatch: none</p>
   <div id="live-first-enable">
     <h3>Enable Live (first time)</h3>
@@ -36,6 +37,7 @@
   <div class="form-actions">
     <button type="button" id="live-pause" class="button-secondary">Pause</button>
     <button type="button" id="live-resume">Resume (confirm)</button>
+    <button type="button" id="live-run-now" class="button-secondary">Run one Live cycle now</button>
     <button type="button" id="live-emergency-stop" class="button-danger">Emergency Stop</button>
   </div>
 </section>
@@ -62,7 +64,7 @@
       <input type="checkbox" id="p-upgrades">
       Search upgrades
     </label>
-    <label>Cycle interval (minutes)
+    <label>Cycle interval / test cadence (minutes)
       <input type="number" id="p-cycle" min="5" max="1440" required>
     </label>
     <label>Hourly API cap
@@ -208,6 +210,7 @@ async function loadLive() {
   const live = liveResponse.live;
   setText('live-mode', live.mode); setText('live-state', live.control.state);
   setText('live-reason', live.dispatch_allowed ? `Running: ${live.control.authorization_reason}` : `Blocked: ${live.blocked_reasons.join('; ')}. ${live.control.authorization_reason || ''}`);
+  setText('live-cycle-interval', policy.cycle_interval_minutes);
   setText('live-max-dispatches', Math.min(5, live.control.max_dispatches_per_cycle, policy.successful_grab_target));
   setText('live-min-delay', Math.max(live.control.min_delay_seconds_between_dispatches, policy.dispatch_interval_seconds));
   setText('live-last-dispatch', live.control.last_dispatch_at ? `Last dispatch: ${live.control.last_dispatch_at} - ${live.control.last_dispatch_summary}` : 'Last dispatch: none');
@@ -229,6 +232,11 @@ async function liveAction(action, defaultReason) {
 }
 document.getElementById('live-pause').addEventListener('click',()=>liveAction('pause','operator pause'));
 document.getElementById('live-resume').addEventListener('click',()=>liveAction('resume','operator confirmed resume'));
+document.getElementById('live-run-now').addEventListener('click',async()=>{
+  if(!confirm('Queue one Live planning cycle now? Eligible items may send real Sonarr searches.')) return;
+  try { await api('/api/v1/scheduler/live/run-now',{method:'POST',body:{reason:'operator requested immediate Live test',confirm:true}}); toast('Live cycle requested'); await loadScheduler(); }
+  catch(err){ toast('Run now failed: '+err.message); }
+});
 document.getElementById('live-emergency-stop').addEventListener('click',()=>liveAction('emergency-stop','operator emergency stop'));
 loadLive().catch(err=>toast('Failed to load live status: '+err.message));
 setInterval(()=>loadLive().catch(()=>{}),5000);

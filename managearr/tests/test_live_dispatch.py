@@ -261,7 +261,7 @@ def test_arm_confirm_succeeds_and_sets_bounded_expiry(live_control_service):
     assert control["expires_at"] is None
 
 
-def test_arm_confirm_makes_live_cycle_due_within_arm_window(
+def test_legacy_arm_confirm_preserves_existing_live_schedule(
     database, live_control_service,
 ):
     _enable_live(live_control_service)
@@ -276,9 +276,9 @@ def test_arm_confirm_makes_live_cycle_due_within_arm_window(
     assert errors == []
     with database.connect() as conn:
         due = conn.execute(
-            "SELECT next_due_at <= now() AS due FROM scheduler_settings WHERE id = 1"
+            "SELECT next_due_at > now() + interval '59 minutes' AS preserved FROM scheduler_settings WHERE id = 1"
         ).fetchone()
-    assert due["due"] is True
+    assert due["preserved"] is True
     assert control["expires_at"] is None  # persistent across restart
 
 
@@ -700,6 +700,19 @@ def test_restart_does_not_implicitly_arm(database, scheduler_repo, policy_repo, 
     assert live_repo.get_control()["armed"] is False
 
 
+def test_resume_preserves_existing_next_due(database, live_control_service, live_repo):
+    live_repo.enable_live_mode(actor="t", reason="t")
+    with database.connect() as conn:
+        expected = conn.execute("SELECT now() + interval '37 minutes' AS due").fetchone()["due"]
+        conn.execute("UPDATE scheduler_settings SET next_due_at=%s WHERE id=1", (expected,))
+    control, errors = live_control_service.resume({"confirm": True, "reason": "resume"}, actor="t")
+    assert errors == []
+    assert control["state"] == "running"
+    with database.connect() as conn:
+        actual = conn.execute("SELECT next_due_at FROM scheduler_settings WHERE id=1").fetchone()["next_due_at"]
+    assert actual == expected
+
+
 def test_pause_blocks_persistent_authorization(live_control_service, live_repo):
     live_repo.enable_live_mode(actor="t", reason="t")
     live_control_service.resume({"confirm": True, "reason": "start"}, actor="t")
@@ -730,6 +743,10 @@ def test_live_api_endpoints_full_round_trip(client):
     resumed = client.post("/api/v1/scheduler/live/resume", json={"confirm": True, "reason": "verify"})
     assert resumed.status_code == 200
     assert resumed.get_json()["control"]["state"] == "running"
+
+    run_now = client.post("/api/v1/scheduler/live/run-now", json={"confirm": True, "reason": "test"})
+    assert run_now.status_code == 202
+    assert run_now.get_json()["created"] is True
 
     stopped = client.post("/api/v1/scheduler/live/emergency-stop", json={"reason": "test"})
     assert stopped.status_code == 200

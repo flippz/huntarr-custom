@@ -166,6 +166,14 @@ class LiveControlService:
         except ValueError as exc:
             return None, [str(exc)]
 
+    def run_now(self, payload) -> tuple[bool, list[str]]:
+        clean, errors = validate_state_change_request(payload)
+        if errors:
+            return False, errors
+        if not self.live_repo.make_live_cycle_due_now():
+            return False, ["Live must be running before a cycle can be requested"]
+        return True, []
+
     def emergency_stop(self, payload, *, actor: str) -> dict:
         clean, _errors = validate_emergency_stop_request(payload)
         return self.live_repo.emergency_stop(actor=actor, reason=clean["reason"])

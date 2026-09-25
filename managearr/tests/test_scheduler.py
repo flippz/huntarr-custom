@@ -88,6 +88,17 @@ def test_off_mode_has_no_scheduled_cycles(scheduler_repo, policy_repo):
     assert scheduler_repo.list_cycles() == []
 
 
+def test_policy_cadence_change_recalculates_next_due(database, scheduler_repo, policy_repo):
+    scheduler_repo.update_mode("simulate", policy_repo.get().cycle_interval_minutes)
+    policy_repo.update({"cycle_interval_minutes": 5})
+    with database.connect() as conn:
+        row = conn.execute(
+            "SELECT next_due_at BETWEEN now() + interval '4 minutes 50 seconds' "
+            "AND now() + interval '5 minutes 10 seconds' AS expected FROM scheduler_settings WHERE id=1"
+        ).fetchone()
+    assert row["expected"] is True
+
+
 def test_one_scheduled_cycle_only_when_due(database, scheduler_repo, policy_repo):
     scheduler_repo.update_mode("simulate", policy_repo.get().cycle_interval_minutes)
     assert scheduler_repo.enqueue_scheduled_if_due(policy_repo.get()) is None

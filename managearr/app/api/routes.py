@@ -188,6 +188,14 @@ def live_disarm():
     return jsonify({"errors": ["Disarm was replaced by explicit pause"]}), 410
 
 
+@api_bp.post("/scheduler/live/run-now")
+def live_run_now():
+    created, errors = _services()["live_control"].run_now(request.get_json(silent=True))
+    if errors:
+        return jsonify({"errors": errors}), 422
+    return jsonify({"created": created, "live": _services()["live_control"].status()}), 202
+
+
 @api_bp.post("/scheduler/live/emergency-stop")
 def live_emergency_stop():
     payload = request.get_json(silent=True) or {}

@@ -274,7 +274,12 @@ class LiveRepository:
                 ("resumed" if state == "running" else "paused", reason[:500], actor[:255], row["authorization_generation"]),
             )
             if state == "running":
-                conn.execute("UPDATE scheduler_settings SET next_due_at=now(),updated_at=now() WHERE id=1 AND mode='live'")
+                # Resume authorization without moving an existing cadence.
+                # Only initialize a missing schedule; an explicit Run now
+                # action is available for immediate testing.
+                conn.execute("""UPDATE scheduler_settings
+                    SET next_due_at=COALESCE(next_due_at,now()),updated_at=now()
+                    WHERE id=1 AND mode='live'""")
             else:
                 conn.execute("""UPDATE scheduler_cycle_runs SET state='skipped',
                     started_at=COALESCE(started_at,now()),finished_at=now(),
@@ -282,6 +287,21 @@ class LiveRepository:
                     safe_summary='Live dispatch paused before this queued cycle started.'
                     WHERE state='queued' AND mode_snapshot='live'""")
         return _control_dict(row)
+
+    def make_live_cycle_due_now(self) -> bool:
+        """Request a scheduler cycle without dispatching from the API process."""
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE scheduler_settings s
+                   SET next_due_at = now(), updated_at = now()
+                  FROM live_control c
+                 WHERE s.id = 1 AND c.id = 1
+                   AND s.mode = 'live' AND c.authorization_state = 'running'
+                RETURNING s.id
+                """
+            ).fetchone()
+        return row is not None
 
     def check_dispatch_delay_elapsed(self, min_delay_seconds: int) -> bool:
         return self.dispatch_delay_remaining_seconds(min_delay_seconds) <= 0
