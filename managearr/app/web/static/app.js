@@ -4,7 +4,20 @@ async function api(path, { method = 'GET', body } = {}) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(path, opts);
+
+  // A page can finish loading just as the preview container is replaced.
+  // Retry idempotent reads briefly; never retry a write automatically.
+  const attempts = method === 'GET' ? 3 : 1;
+  let res;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      res = await fetch(path, opts);
+      break;
+    } catch (error) {
+      if (attempt === attempts - 1) throw error;
+      await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
