@@ -92,7 +92,9 @@ async function loadOverview() {
   }
   setText('ov-live-banner', banner);
   setText('ov-live-detail', live.dispatch_allowed ? 'Live dispatch is currently allowed to run.' : live.blocked_reasons.join('; '));
-  setText('ov-live-allowance', `Up to ${live.control.max_dispatches_per_cycle} dispatch(es) per cycle, ${live.pending_live_cycles} live cycle(s) pending.`);
+  const effectiveLiveMax = Math.min(5, live.control.max_dispatches_per_cycle, policy.successful_grab_target);
+  const effectiveLiveDelay = Math.max(live.control.min_delay_seconds_between_dispatches, policy.dispatch_interval_seconds);
+  setText('ov-live-allowance', `Up to ${effectiveLiveMax} eligible search(es) per cycle, at least ${effectiveLiveDelay} second(s) apart; ${live.pending_live_cycles} live cycle(s) pending.`);
   setText(
     'ov-live-last-dispatch',
     live.control.last_dispatch_at ? `Last dispatch: ${live.control.last_dispatch_at} - ${live.control.last_dispatch_summary}` : 'Last dispatch: none'

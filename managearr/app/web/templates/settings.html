@@ -23,7 +23,7 @@
   <p class="simulation-notice"><strong>Live sends real Sonarr EpisodeSearch commands.</strong> Authorization is persistent until explicitly paused or stopped.</p>
   <p>Status: <strong id="live-state">-</strong> · Scheduler mode: <strong id="live-mode">-</strong></p>
   <p id="live-reason" class="muted">-</p>
-  <p class="muted">Up to <strong id="live-max-dispatches">-</strong> command(s) per cycle; policy dispatch interval applies.</p>
+  <p class="muted">Up to <strong id="live-max-dispatches">-</strong> eligible search(es) per cycle, at least <strong id="live-min-delay">-</strong> second(s) apart.</p>
   <p class="muted" id="live-last-dispatch">Last dispatch: none</p>
   <div id="live-first-enable">
     <h3>Enable Live (first time)</h3>
@@ -202,10 +202,14 @@ document.getElementById('scheduler-run').addEventListener('click', async () => {
 // --- Persistent live authorization --------------------------------------
 let liveModeChallenge = null;
 async function loadLive() {
-  const live = (await api('/api/v1/scheduler/live/status')).live;
+  const [liveResponse, policy] = await Promise.all([
+    api('/api/v1/scheduler/live/status'), api('/api/v1/policy')
+  ]);
+  const live = liveResponse.live;
   setText('live-mode', live.mode); setText('live-state', live.control.state);
   setText('live-reason', live.dispatch_allowed ? `Running: ${live.control.authorization_reason}` : `Blocked: ${live.blocked_reasons.join('; ')}. ${live.control.authorization_reason || ''}`);
-  setText('live-max-dispatches', live.control.max_dispatches_per_cycle);
+  setText('live-max-dispatches', Math.min(5, live.control.max_dispatches_per_cycle, policy.successful_grab_target));
+  setText('live-min-delay', Math.max(live.control.min_delay_seconds_between_dispatches, policy.dispatch_interval_seconds));
   setText('live-last-dispatch', live.control.last_dispatch_at ? `Last dispatch: ${live.control.last_dispatch_at} - ${live.control.last_dispatch_summary}` : 'Last dispatch: none');
   document.getElementById('live-first-enable').hidden = live.mode === 'live';
 }

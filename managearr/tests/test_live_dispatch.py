@@ -34,6 +34,19 @@ class StubSonarrClient:
         raise AssertionError(f"live dispatch attempted a non-search Sonarr method: {name}")
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 def _library_scan(library_repo, activity_repo, candidate_repo, count=3):
     library = library_repo.create({
         "name": "Shows", "type": "sonarr", "url": "http://sonarr.invalid:8989",
@@ -74,7 +87,12 @@ def _plan_and_dispatch(worker, scheduler_repo, owner="live-worker"):
 
 
 def _make_worker(scheduler_repo, policy_repo, live_repo, dispatch_service, owner="live-worker"):
-    coordinator = LiveDispatchCoordinator(live_repo, scheduler_repo, dispatch_service)
+    clock = FakeClock()
+    coordinator = LiveDispatchCoordinator(
+        live_repo, scheduler_repo, dispatch_service,
+        sleeper=clock.sleep, monotonic=clock.monotonic,
+    )
+    coordinator.test_clock = clock
     return SchedulerWorker(scheduler_repo, policy_repo, live_repository=live_repo, live_coordinator=coordinator, owner_id=owner)
 
 
@@ -430,7 +448,7 @@ def test_live_respects_max_dispatches_per_cycle(
     assert len(stub.calls) == 2
 
 
-def test_live_respects_minimum_delay_between_dispatches(
+def test_live_spaces_multiple_dispatches_without_real_sleep(
     database, scheduler_repo, policy_repo, live_repo, library_repo, activity_repo, candidate_repo,
     dispatch_repo, dispatch_planning_service,
 ):
@@ -442,16 +460,85 @@ def test_live_respects_minimum_delay_between_dispatches(
     stub = StubSonarrClient()
     dispatch_service = _dispatch_service_with_stub(dispatch_planning_service, dispatch_repo, library_repo, stub)
     worker = _make_worker(scheduler_repo, policy_repo, live_repo, dispatch_service)
+    call_times = []
+    original_search = stub.search_episodes
 
+    def timed_search(episode_ids):
+        call_times.append(worker._ensure_live_coordinator().test_clock.now)
+        return original_search(episode_ids)
+
+    stub.search_episodes = timed_search
     cycle_id = _queue_live_cycle(database, scheduler_repo, policy_repo)
     _plan_and_dispatch(worker, scheduler_repo)
 
-    # Only the very first candidate is dispatched; the rest are blocked by
-    # the (very long) minimum delay rather than burst-catching-up.
+    assert len(stub.calls) == 5
+    assert call_times == [0, 600, 1200, 1800, 2400]
+    assert sum(worker._ensure_live_coordinator().test_clock.sleeps) == 4 * 600
+    assert len([r for r in live_repo.ledger_for_cycle(cycle_id) if r["state"] == "dispatched"]) == 5
+
+
+@pytest.mark.parametrize("interruption", ["pause", "stop", "generation"])
+def test_live_wait_is_interrupted_by_persistent_control_change(
+    interruption, database, scheduler_repo, policy_repo, live_repo, live_control_service,
+    library_repo, activity_repo, candidate_repo, dispatch_repo, dispatch_planning_service,
+):
+    _library_scan(library_repo, activity_repo, candidate_repo, count=3)
+    live_repo.enable_live_mode(actor="t", reason="t")
+    live_repo.arm(actor="t", reason="t", ttl_minutes=15)
+    with database.connect() as conn:
+        conn.execute("UPDATE live_control SET max_dispatches_per_cycle=5 WHERE id=1")
+    stub = StubSonarrClient()
+    worker = _make_worker(
+        scheduler_repo, policy_repo, live_repo,
+        _dispatch_service_with_stub(dispatch_planning_service, dispatch_repo, library_repo, stub),
+    )
+    coordinator = worker._ensure_live_coordinator()
+    clock = coordinator.test_clock
+    interrupted = False
+
+    def sleep_and_interrupt(seconds):
+        nonlocal interrupted
+        clock.sleep(seconds)
+        if interrupted:
+            return
+        interrupted = True
+        if interruption == "pause":
+            live_control_service.pause({"confirm": True, "reason": "test"}, actor="t")
+        elif interruption == "stop":
+            live_control_service.emergency_stop({"reason": "test"}, actor="t")
+        else:
+            with database.connect() as conn:
+                conn.execute(
+                    "UPDATE live_control SET authorization_generation=authorization_generation+1 WHERE id=1"
+                )
+
+    coordinator.sleeper = sleep_and_interrupt
+    _queue_live_cycle(database, scheduler_repo, policy_repo)
+    _plan_and_dispatch(worker, scheduler_repo)
     assert len(stub.calls) == 1
-    ledger = live_repo.ledger_for_cycle(cycle_id)
-    skipped = [r for r in ledger if r["state"] == "skipped" and "delay" in r["terminal_reason"]]
-    assert len(skipped) == 1
+
+
+def test_live_wait_stops_when_worker_heartbeat_is_lost(
+    database, scheduler_repo, policy_repo, live_repo, library_repo, activity_repo,
+    candidate_repo, dispatch_repo, dispatch_planning_service,
+):
+    _library_scan(library_repo, activity_repo, candidate_repo, count=3)
+    live_repo.enable_live_mode(actor="t", reason="t")
+    live_repo.arm(actor="t", reason="t", ttl_minutes=15)
+    with database.connect() as conn:
+        conn.execute("UPDATE live_control SET max_dispatches_per_cycle=5 WHERE id=1")
+    stub = StubSonarrClient()
+    worker = _make_worker(
+        scheduler_repo, policy_repo, live_repo,
+        _dispatch_service_with_stub(dispatch_planning_service, dispatch_repo, library_repo, stub),
+    )
+    _queue_live_cycle(database, scheduler_repo, policy_repo)
+    cycle = scheduler_repo.start_next_cycle("live-worker")
+    worker.service.execute_cycle(cycle, heartbeat=lambda: True)
+    clock = worker._ensure_live_coordinator().test_clock
+    worker._ensure_live_coordinator().execute(cycle, heartbeat=lambda: clock.now < 5)
+    assert len(stub.calls) == 1
+    assert clock.now == 5
 
 
 def test_persistent_running_ignores_legacy_ttl(database, live_control_service, live_repo):

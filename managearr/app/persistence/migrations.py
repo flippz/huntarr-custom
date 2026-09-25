@@ -1150,6 +1150,21 @@ MIGRATIONS: list[Migration] = [
                        'migration-v7', authorization_generation FROM live_control WHERE id = 1;
         """,
     ),
+    Migration(
+        version=8,
+        name="paced_live_dispatch_ceiling",
+        sql="""
+            -- v6 shipped a singleton ceiling of one, which would silently
+            -- prevent the policy's successful-grab target from ever taking
+            -- effect. Raise only that legacy value to the conservative hard
+            -- maximum. Deliberately lower operator ceilings (2-4), live
+            -- authorization state, and generation are preserved unchanged.
+            UPDATE live_control
+               SET max_dispatches_per_cycle = 5,
+                   updated_at = now()
+             WHERE id = 1 AND max_dispatches_per_cycle = 1;
+        """,
+    ),
 ]
 
 

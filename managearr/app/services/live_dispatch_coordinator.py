@@ -26,8 +26,17 @@ Per candidate, in order:
    before any network call - unchanged from the M2/M3 manual path.
 3. Record exactly one ``live_dispatch_ledger`` row for that candidate
    result, linking it to the resulting dispatch batch/item (if any).
+4. After a successful dispatch, wait for the configured minimum delay before
+   attempting the next candidate, checking heartbeat and live state
+   frequently to allow interruption.
 """
 from __future__ import annotations
+
+import time
+from typing import Callable, Optional
+
+HARD_MAX_DISPATCHES_PER_CYCLE = 5
+WAIT_CHECK_INTERVAL_SECONDS = 5.0
 
 from .dispatch_service import NO_ELIGIBLE_CANDIDATES_ERROR
 from ..persistence.live_repository import LiveRepository
@@ -35,10 +44,21 @@ from ..persistence.scheduler_repository import SchedulerRepository
 
 
 class LiveDispatchCoordinator:
-    def __init__(self, live_repo: LiveRepository, scheduler_repo: SchedulerRepository, dispatch_service):
+    def __init__(
+        self,
+        live_repo: LiveRepository,
+        scheduler_repo: SchedulerRepository,
+        dispatch_service,
+        sleeper: Optional[Callable[[float], None]] = None,
+        monotonic: Optional[Callable[[], float]] = None,
+        wait_check_interval_seconds: float = WAIT_CHECK_INTERVAL_SECONDS,
+    ):
         self.live_repo = live_repo
         self.scheduler_repo = scheduler_repo
         self.dispatch_service = dispatch_service
+        self.sleeper = sleeper or time.sleep
+        self.monotonic = monotonic or time.monotonic
+        self.wait_check_interval_seconds = wait_check_interval_seconds
 
     def execute(self, cycle: dict, heartbeat=None) -> None:
         if cycle["mode_snapshot"] != "live":
@@ -46,18 +66,22 @@ class LiveDispatchCoordinator:
 
         control = self.live_repo.get_control()
         expected_generation = control["authorization_generation"]
-        max_dispatches = control["max_dispatches_per_cycle"]
-        # Policy is snapshotted on the cycle; never dispatch faster than
-        # either that operator policy or the hard live-control floor.
+        policy_snapshot = cycle.get("policy_snapshot") or {}
+        policy_successful_grab_target = int(policy_snapshot.get("successful_grab_target", 1))
+        # The policy target is the desired count; live control remains a
+        # conservative operator ceiling. Schema v8 raises the legacy default
+        # ceiling from one to the hard safety maximum without changing state.
+        max_dispatches = min(
+            policy_successful_grab_target,
+            control["max_dispatches_per_cycle"],
+            HARD_MAX_DISPATCHES_PER_CYCLE,
+        )
         min_delay_seconds = max(
             control["min_delay_seconds_between_dispatches"],
-            int((cycle.get("policy_snapshot") or {}).get("dispatch_interval_seconds", 0)),
+            int((policy_snapshot).get("dispatch_interval_seconds", 0)),
         )
 
         if control["state"] != "running" or expected_generation == 0:
-            # Nothing was ever attempted; planning alone (identical to
-            # simulate) already ran and is fully audited by the cycle's
-            # own scheduler_library_results/scheduler_candidate_results.
             return
 
         detail = self.scheduler_repo.get_cycle(cycle["id"])
@@ -65,6 +89,7 @@ class LiveDispatchCoordinator:
             return
 
         dispatched_or_attempted = 0
+        last_dispatch_time = None  # monotonic start time of the last write attempt
         for library in detail["libraries"]:
             if dispatched_or_attempted >= max_dispatches:
                 break
@@ -81,18 +106,24 @@ class LiveDispatchCoordinator:
                 if heartbeat is not None and not heartbeat():
                     return
 
+                # If we have made at least one network call in this cycle, wait for the delay since the last one
+                if last_dispatch_time is not None:
+                    elapsed = self.monotonic() - last_dispatch_time
+                    if elapsed < min_delay_seconds:
+                        remaining = min_delay_seconds - elapsed
+                        if not self._wait_for_next_dispatch(remaining, heartbeat, expected_generation):
+                            return  # Wait was interrupted due to loss of authorization or heartbeat
+
+                # Recheck both lease ownership and persistent authorization
+                # immediately before every potentially ambiguous write.
+                if heartbeat is not None and not heartbeat():
+                    return
                 authorized, reason = self.live_repo.check_dispatch_authorized(expected_generation)
                 if not authorized:
                     self._ledger(cycle["id"], library, candidate, expected_generation, "blocked", reason)
                     return
 
-                if not self.live_repo.check_dispatch_delay_elapsed(min_delay_seconds):
-                    self._ledger(
-                        cycle["id"], library, candidate, expected_generation, "skipped",
-                        f"minimum delay of {min_delay_seconds}s between live dispatches has not elapsed",
-                    )
-                    return
-
+                write_started_at = self.monotonic()
                 outcome, error = self.dispatch_service.dispatch(job_id, [candidate["candidate_id"]], True)
                 if error:
                     # A validation-style rejection (e.g. the library became
@@ -110,6 +141,8 @@ class LiveDispatchCoordinator:
                     self._ledger(cycle["id"], library, candidate, expected_generation, "skipped", batch.error_summary)
                     continue
 
+                # Network call happened
+                last_dispatch_time = write_started_at
                 dispatched_or_attempted += 1
                 item = batch.items[0] if batch.items else None
                 if batch.state in ("completed", "partial"):
@@ -121,6 +154,7 @@ class LiveDispatchCoordinator:
                         dispatch_batch_id=batch.id, dispatch_item_id=item.id if item else None,
                         sonarr_command_id=batch.sonarr_command_id, sonarr_command_status=batch.sonarr_command_status,
                     )
+                    # Note: we do not wait here because we will wait before the next network call (at the top of the loop)
                     continue
 
                 # A real Sonarr-side failure (timeout/429/5xx/rejection).
@@ -136,6 +170,28 @@ class LiveDispatchCoordinator:
                     dispatch_batch_id=batch.id, dispatch_item_id=item.id if item else None,
                 )
                 return
+
+    def _wait_for_next_dispatch(
+        self, wait_seconds: float, heartbeat, expected_generation: int
+    ) -> bool:
+        """Wait for the specified time to elapse, checking heartbeat and live state.
+
+        Returns True if the wait completed normally, False if interrupted.
+        """
+        end_time = self.monotonic() + wait_seconds
+        while self.monotonic() < end_time:
+            if heartbeat is not None and not heartbeat():
+                return False
+            authorized, reason = self.live_repo.check_dispatch_authorized(expected_generation)
+            if not authorized:
+                # Authorization lost during wait - stop the cycle
+                return False
+            # Sleep for a short interval to avoid busy waiting
+            remaining = end_time - self.monotonic()
+            if remaining <= 0:
+                break
+            self.sleeper(min(self.wait_check_interval_seconds, remaining))
+        return True
 
     def _ledger(
         self, cycle_id: int, library: dict, candidate: dict, arm_generation: int, state: str, reason: str,
@@ -154,5 +210,5 @@ class LiveDispatchCoordinator:
             "state": state,
             "sonarr_command_id": sonarr_command_id,
             "sonarr_command_status": sonarr_command_status,
-            "terminal_reason": reason,
+            "terminal_reason": reason[:500],
         })

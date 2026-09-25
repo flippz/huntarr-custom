@@ -493,6 +493,26 @@ def test_v6_live_control_bounds_are_enforced(database):
             conn.execute("UPDATE live_control SET min_delay_seconds_between_dispatches = 1 WHERE id = 1")
 
 
+def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(database):
+    assert MIGRATIONS[-1].version == 8
+    with database.connect() as conn:
+        conn.execute(
+            "UPDATE live_control SET max_dispatches_per_cycle=1, "
+            "authorization_state='running', authorization_generation=41, "
+            "authorized_at=now(), authorized_by='operator', "
+            "authorization_reason='keep running' WHERE id=1"
+        )
+        conn.execute(MIGRATIONS[-1].sql)
+        row = conn.execute(
+            "SELECT max_dispatches_per_cycle, authorization_state, "
+            "authorization_generation, authorization_reason FROM live_control WHERE id=1"
+        ).fetchone()
+    assert row["max_dispatches_per_cycle"] == 5
+    assert row["authorization_state"] == "running"
+    assert row["authorization_generation"] == 41
+    assert row["authorization_reason"] == "keep running"
+
+
 def test_v6_live_challenge_kind_shape_is_enforced(database):
     with pytest.raises(psycopg.errors.CheckViolation):
         with database.connect() as conn:
