@@ -1165,6 +1165,85 @@ MIGRATIONS: list[Migration] = [
              WHERE id = 1 AND max_dispatches_per_cycle = 1;
         """,
     ),
+    Migration(
+        version=9,
+        name="definitive_dispatch_outcomes",
+        sql="""
+            ALTER TABLE dispatch_batches DROP CONSTRAINT dispatch_batches_reconciliation_state_check;
+            ALTER TABLE dispatch_batches ADD CONSTRAINT dispatch_batches_reconciliation_state_check CHECK (
+                reconciliation_state IN ('not_reconciled','operator_review','unresolved','partial','resolved','error','no_result'));
+            ALTER TABLE dispatch_reconciliation_attempts DROP CONSTRAINT dispatch_reconciliation_attempts_state_check;
+            ALTER TABLE dispatch_reconciliation_attempts ADD CONSTRAINT dispatch_reconciliation_attempts_state_check CHECK (
+                state IN ('unresolved','partial','resolved','error','no_result'));
+            ALTER TABLE refresh_run_reconciled_batches DROP CONSTRAINT refresh_run_reconciled_batches_result_check;
+            ALTER TABLE refresh_run_reconciled_batches ADD CONSTRAINT refresh_run_reconciled_batches_result_check CHECK (
+                result IN ('resolved','partial','unresolved','error','skipped','no_result'));
+            ALTER TABLE dispatch_outcome_events DROP CONSTRAINT dispatch_outcome_events_source_endpoint_check;
+            ALTER TABLE dispatch_outcome_events ADD CONSTRAINT dispatch_outcome_events_source_endpoint_check CHECK (
+                source_endpoint IN ('command','history','queue','reconciliation'));
+            ALTER TABLE dispatch_outcome_events DROP CONSTRAINT dispatch_outcome_events_event_type_check;
+            ALTER TABLE dispatch_outcome_events ADD CONSTRAINT dispatch_outcome_events_event_type_check CHECK (
+                event_type IN ('command_queued','command_running','command_completed','command_failed',
+                    'command_aborted','grabbed','downloading','imported','download_failed','import_failed','unknown','no_result'));
+
+            CREATE OR REPLACE FUNCTION protect_dispatch_batch_audit() RETURNS trigger AS $$
+            DECLARE reconciliation_only BOOLEAN;
+            BEGIN
+                IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'dispatch audit rows cannot be deleted'; END IF;
+                IF NEW.scan_job_id IS DISTINCT FROM OLD.scan_job_id
+                   OR (NEW.library_id IS DISTINCT FROM OLD.library_id
+                       AND NOT (OLD.library_id IS NOT NULL AND NEW.library_id IS NULL))
+                   OR NEW.library_name IS DISTINCT FROM OLD.library_name OR NEW.mode IS DISTINCT FROM OLD.mode
+                   OR NEW.requested_count IS DISTINCT FROM OLD.requested_count
+                   OR NEW.selected_count IS DISTINCT FROM OLD.selected_count
+                   OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+                    RAISE EXCEPTION 'dispatch audit identity is immutable';
+                END IF;
+                IF OLD.library_id IS NOT NULL AND NEW.library_id IS NULL
+                   AND NEW.state IS NOT DISTINCT FROM OLD.state
+                   AND NEW.dispatched_count IS NOT DISTINCT FROM OLD.dispatched_count
+                   AND NEW.sonarr_command_id IS NOT DISTINCT FROM OLD.sonarr_command_id
+                   AND NEW.sonarr_command_status IS NOT DISTINCT FROM OLD.sonarr_command_status
+                   AND NEW.error_summary IS NOT DISTINCT FROM OLD.error_summary
+                   AND NEW.reconciliation_state IS NOT DISTINCT FROM OLD.reconciliation_state
+                   AND NEW.reconciliation_summary IS NOT DISTINCT FROM OLD.reconciliation_summary
+                   AND NEW.last_reconciled_at IS NOT DISTINCT FROM OLD.last_reconciled_at
+                   AND NEW.command_observed_state IS NOT DISTINCT FROM OLD.command_observed_state
+                   AND NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN RETURN NEW; END IF;
+                reconciliation_only := NEW.state IS NOT DISTINCT FROM OLD.state
+                    AND NEW.dispatched_count IS NOT DISTINCT FROM OLD.dispatched_count
+                    AND NEW.sonarr_command_id IS NOT DISTINCT FROM OLD.sonarr_command_id
+                    AND NEW.sonarr_command_status IS NOT DISTINCT FROM OLD.sonarr_command_status
+                    AND NEW.error_summary IS NOT DISTINCT FROM OLD.error_summary;
+                IF reconciliation_only THEN
+                    IF (OLD.reconciliation_state = 'resolved' AND NEW.reconciliation_state <> 'resolved')
+                       OR (OLD.reconciliation_state = 'partial' AND NEW.reconciliation_state NOT IN ('partial','resolved'))
+                       OR (OLD.reconciliation_state = 'no_result' AND NEW.reconciliation_state NOT IN ('no_result','partial','resolved'))
+                       OR (OLD.reconciliation_state = 'unresolved'
+                           AND NEW.reconciliation_state IN ('not_reconciled','operator_review','error'))
+                       OR (OLD.reconciliation_state IN ('operator_review','error')
+                           AND NEW.reconciliation_state = 'not_reconciled') THEN
+                        RAISE EXCEPTION 'reconciliation state cannot regress';
+                    END IF;
+                    RETURN NEW;
+                END IF;
+                IF OLD.state = 'dispatching' AND NEW.state = 'dispatching'
+                   AND OLD.sonarr_command_id IS NULL AND NEW.sonarr_command_id IS NOT NULL
+                   AND NEW.dispatched_count = 0
+                   AND NEW.error_summary IS NOT DISTINCT FROM OLD.error_summary THEN RETURN NEW; END IF;
+                IF OLD.state <> 'dispatching' OR NEW.state NOT IN ('completed','partial','failed','ambiguous') THEN
+                    RAISE EXCEPTION 'invalid dispatch batch state transition';
+                END IF;
+                IF OLD.sonarr_command_id IS NOT NULL
+                   AND NEW.sonarr_command_id IS DISTINCT FROM OLD.sonarr_command_id THEN
+                    RAISE EXCEPTION 'accepted Sonarr command identity is immutable';
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+        """,
+    ),
+
 ]
 
 

@@ -40,6 +40,10 @@ class SonarrResponseError(SonarrError):
     """Sonarr returned a non-2xx response for a reason other than auth."""
 
 
+class SonarrNotFoundError(SonarrResponseError):
+    """A previously known Sonarr resource is no longer retained."""
+
+
 class SonarrDataError(SonarrError):
     """Sonarr returned a response that doesn't match the expected shape."""
 
@@ -87,6 +91,8 @@ class SonarrClient:
 
         if response.status_code in (401, 403):
             raise SonarrAuthError("Sonarr rejected the configured API key")
+        if response.status_code == 404:
+            raise SonarrNotFoundError("Sonarr returned HTTP 404")
         if not response.ok:
             raise SonarrResponseError(f"Sonarr returned HTTP {response.status_code}")
 

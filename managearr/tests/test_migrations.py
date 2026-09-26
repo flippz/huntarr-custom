@@ -494,7 +494,8 @@ def test_v6_live_control_bounds_are_enforced(database):
 
 
 def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(database):
-    assert MIGRATIONS[-1].version == 8
+    assert MIGRATIONS[-1].version == 9
+    migration = next(item for item in MIGRATIONS if item.version == 8)
     with database.connect() as conn:
         conn.execute(
             "UPDATE live_control SET max_dispatches_per_cycle=1, "
@@ -502,7 +503,7 @@ def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(datab
             "authorized_at=now(), authorized_by='operator', "
             "authorization_reason='keep running' WHERE id=1"
         )
-        conn.execute(MIGRATIONS[-1].sql)
+        conn.execute(migration.sql)
         row = conn.execute(
             "SELECT max_dispatches_per_cycle, authorization_state, "
             "authorization_generation, authorization_reason FROM live_control WHERE id=1"
@@ -537,3 +538,29 @@ def test_failed_pending_migration_rolls_back_ddl_and_bookkeeping(database, monke
     with database.connect() as conn:
         exists = conn.execute("SELECT to_regclass('public.migration_rollback_probe') AS name").fetchone()["name"]
     assert exists is None
+
+
+def test_m9_constraints_allow_only_documented_no_result_shapes(database):
+    with database.connect() as conn:
+        rows = conn.execute(
+            """SELECT conname, pg_get_constraintdef(oid) AS definition
+               FROM pg_constraint
+               WHERE conname IN (
+                 'dispatch_batches_reconciliation_state_check',
+                 'dispatch_reconciliation_attempts_state_check',
+                 'refresh_run_reconciled_batches_result_check',
+                 'dispatch_outcome_events_source_endpoint_check',
+                 'dispatch_outcome_events_event_type_check')"""
+        ).fetchall()
+    definitions = {row["conname"]: row["definition"] for row in rows}
+    assert set(definitions) == {
+        'dispatch_batches_reconciliation_state_check',
+        'dispatch_reconciliation_attempts_state_check',
+        'refresh_run_reconciled_batches_result_check',
+        'dispatch_outcome_events_source_endpoint_check',
+        'dispatch_outcome_events_event_type_check',
+    }
+    assert "no_result" in definitions['dispatch_batches_reconciliation_state_check']
+    assert "no_result" in definitions['dispatch_reconciliation_attempts_state_check']
+    assert "reconciliation" in definitions['dispatch_outcome_events_source_endpoint_check']
+    assert "no_result" in definitions['dispatch_outcome_events_event_type_check']

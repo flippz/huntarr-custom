@@ -1,13 +1,8 @@
-"""Manual, read-only Sonarr command/outcome reconciliation.
-
-The service only follows a command id already recorded by the confirmed manual
-dispatch path. Network reads occur before the short transaction that appends
-normalized evidence and updates the dedicated reconciliation summary fields.
-"""
+"""Read-only Sonarr command/outcome reconciliation."""
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
-from ..adapters.sonarr_client import SonarrClient, SonarrError
+from ..adapters.sonarr_client import SonarrClient, SonarrError, SonarrNotFoundError
 from ..persistence.outcome_repository import OutcomeRepository
 from .library_readiness import ready_sonarr_library
 
@@ -17,6 +12,7 @@ FAILED_BATCH_ERROR = "failed dispatch batches cannot be reconciled"
 NO_COMMAND_ERROR = "no Sonarr command id was recorded; inspect Sonarr manually before retrying"
 WRONG_STATE_ERROR = "dispatch batch is not eligible for reconciliation"
 CROSS_LIBRARY_ERROR = "dispatch audit has ambiguous cross-library ownership"
+NO_RESULT_GRACE_SECONDS = 15 * 60
 
 COMMAND_TYPES = {
     "queued": ("command_queued", "nonterminal", "queued"),
@@ -35,7 +31,19 @@ HISTORY_TYPES = {
     "downloadfailed": ("download_failed", "terminal"),
     "importfailed": ("import_failed", "terminal"),
 }
-TERMINAL_ITEM_TYPES = {"imported", "download_failed", "import_failed"}
+# The order is the contract used for immediate results, stored summaries and detail.
+OUTCOME_PRECEDENCE = {
+    "no_result": 1, "grabbed": 2, "downloading": 2,
+    "download_failed": 3, "import_failed": 3, "imported": 4,
+}
+FAILURE_TYPES = {"download_failed", "import_failed"}
+TERMINAL_ITEM_TYPES = {"imported", *FAILURE_TYPES}
+HUMAN_OUTCOME = {
+    "pending": "Pending", "grabbed": "Grabbed/downloading",
+    "downloading": "Grabbed/downloading", "imported": "Imported",
+    "download_failed": "Failed", "import_failed": "Failed",
+    "no_result": "No result",
+}
 
 
 @dataclass
@@ -47,12 +55,34 @@ class ReconciliationResult:
 
     def to_dict(self) -> dict:
         return {
-            "batch": self.batch.to_dict(),
-            "attempt": self.attempt.to_dict(),
+            "batch": self.batch.to_dict(), "attempt": self.attempt.to_dict(),
             "inserted_event_count": self.inserted_event_count,
             "item_results": self.item_results,
             "notice": "Reconciliation sends no search. Command completion is not evidence of a grab, download, or import.",
         }
+
+
+def _event_dict(event) -> dict:
+    if isinstance(event, dict):
+        return event
+    return {
+        "dispatch_item_id": event.dispatch_item_id, "candidate_id": event.candidate_id,
+        "episode_id": event.episode_id, "source_endpoint": event.source_endpoint,
+        "event_type": event.event_type, "event_state": event.event_state,
+        "safe_summary": event.safe_summary, "sonarr_command_id": event.sonarr_command_id,
+        "sonarr_event_id": event.sonarr_event_id, "download_id": event.download_id,
+        "id": event.id,
+    }
+
+
+def effective_item_event(events: list[dict]) -> dict | None:
+    relevant = [event for event in events if event.get("event_type") in OUTCOME_PRECEDENCE]
+    if not relevant:
+        return None
+    return max(relevant, key=lambda event: (
+        OUTCOME_PRECEDENCE[event["event_type"]], event.get("sonarr_event_id") or 0,
+        event.get("id") or 0,
+    ))
 
 
 class ReconciliationService:
@@ -61,17 +91,9 @@ class ReconciliationService:
     QUEUE_PAGE_SIZE = 100
     QUEUE_MAX_PAGES = 3
 
-    def __init__(
-        self,
-        dispatch_repo,
-        outcome_repo: OutcomeRepository,
-        library_repo,
-        activity_repo,
-        candidate_repo,
-        *,
-        client_factory=SonarrClient,
-        timeout: int | None = None,
-    ):
+    def __init__(self, dispatch_repo, outcome_repo: OutcomeRepository, library_repo,
+                 activity_repo, candidate_repo, *, client_factory=SonarrClient,
+                 timeout: int | None = None, clock=None):
         self.dispatch_repo = dispatch_repo
         self.outcome_repo = outcome_repo
         self.library_repo = library_repo
@@ -79,6 +101,7 @@ class ReconciliationService:
         self.candidate_repo = candidate_repo
         self._client_factory = client_factory
         self._timeout = timeout
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def _client(self, library):
         if self._timeout is None:
@@ -105,78 +128,96 @@ class ReconciliationService:
         library, error = ready_sonarr_library(self.library_repo, batch.library_id)
         if error:
             return batch, None, error
-
         relevant = [item for item in (batch.items or []) if item.state != "excluded"]
-        candidates = {c.id: c for c in self.candidate_repo.get_many([item.candidate_id for item in relevant])}
-        if any(
-            item.candidate_id not in candidates
-            or candidates[item.candidate_id].job_id != batch.scan_job_id
-            or candidates[item.candidate_id].library_id != batch.library_id
-            or candidates[item.candidate_id].episode_id != item.episode_id
-            for item in relevant
-        ):
+        candidates = {c.id: c for c in self.candidate_repo.get_many([i.candidate_id for i in relevant])}
+        if any(i.candidate_id not in candidates or candidates[i.candidate_id].job_id != batch.scan_job_id
+               or candidates[i.candidate_id].library_id != batch.library_id
+               or candidates[i.candidate_id].episode_id != i.episode_id for i in relevant):
             return batch, None, CROSS_LIBRARY_ERROR
         return batch, library, None
 
     @staticmethod
     def _item_event(item, *, source, event_type, event_state, summary, evidence_key,
                     sonarr_event_id=None, download_id=None):
-        return {
-            "dispatch_item_id": item.id,
-            "candidate_id": item.candidate_id,
-            "episode_id": item.episode_id,
-            "source_endpoint": source,
-            "event_type": event_type,
-            "event_state": event_state,
-            "safe_summary": summary,
-            "sonarr_event_id": sonarr_event_id,
-            "download_id": download_id,
-            "evidence_key": evidence_key,
-        }
+        return {"dispatch_item_id": item.id, "candidate_id": item.candidate_id,
+                "episode_id": item.episode_id, "source_endpoint": source,
+                "event_type": event_type, "event_state": event_state,
+                "safe_summary": summary, "sonarr_event_id": sonarr_event_id,
+                "download_id": download_id, "evidence_key": evidence_key}
+
+    def _summarize(self, items, events, command_state, *, truncated=False):
+        by_item = {item.id: [] for item in items}
+        for event in events:
+            if event.get("dispatch_item_id") in by_item:
+                by_item[event["dispatch_item_id"]].append(event)
+        results, effective = [], []
+        for item in items:
+            chosen = effective_item_event(by_item[item.id])
+            outcome = chosen["event_type"] if chosen else "pending"
+            effective.append(outcome)
+            results.append({"dispatch_item_id": item.id, "candidate_id": item.candidate_id,
+                            "episode_id": item.episode_id,
+                            "latest_outcome": outcome if chosen else "unresolved",
+                            "human_state": HUMAN_OUTCOME[outcome],
+                            "terminal": outcome in TERMINAL_ITEM_TYPES or outcome == "no_result"})
+        if truncated:
+            return "partial", "Sonarr exceeded the bounded read limit; manual review is required.", results
+        if effective and all(value == "no_result" for value in effective):
+            return "no_result", "Completed search produced no grab, download, import, or failure evidence within 15 minutes.", results
+        if effective and all(value in TERMINAL_ITEM_TYPES or value == "no_result" for value in effective):
+            return "resolved", f"Definitive terminal outcomes were recorded for all {len(items)} dispatch items.", results
+        if any(value != "pending" for value in effective):
+            count = sum(value != "pending" for value in effective)
+            return "partial", f"Outcome evidence was recorded for {count} of {len(items)} dispatch items; others remain pending.", results
+        if command_state in ("failed", "aborted"):
+            return "unresolved", "The command failed or was aborted; no per-episode outcome was inferred.", results
+        if command_state == "completed":
+            return "unresolved", "Search command completed; the 15-minute outcome grace period is still pending.", results
+        return "unresolved", "Search command is pending or no related episode evidence was found.", results
 
     def reconcile(self, batch_id: int):
         batch, library, error = self._validate(batch_id)
         if error:
             return None, error
-
         items = [item for item in batch.items if item.state != "excluded"]
         by_episode = {item.episode_id: item for item in items}
-        events: list[dict] = []
-        endpoint_reads = {"command": False, "history": False, "queue": False}
-        command_state = "unknown"
-        truncated = False
+        events, endpoint_reads = [], {"command": False, "history": False, "queue": False}
+        command_state, truncated = "unknown", False
         dispatched_at = datetime.fromisoformat(batch.created_at)
-
+        # Item finalization is the durable point at which Managearr knows the
+        # accepted command became a completed local dispatch. Batch creation
+        # precedes the network write and must not start the grace early.
+        grace_started_at = max(
+            (datetime.fromisoformat(item.updated_at) for item in items),
+            default=dispatched_at,
+        )
         try:
             client = self._client(library)
-            command = client.get_command(batch.sonarr_command_id)
-            endpoint_reads["command"] = True
-            event_type, event_state, command_state = COMMAND_TYPES.get(
-                command["status"], ("unknown", "unknown", "unknown")
-            )
-            events.append({
-                "dispatch_item_id": None,
-                "candidate_id": None,
-                "episode_id": None,
-                "source_endpoint": "command",
-                "event_type": event_type,
-                "event_state": event_state,
-                "safe_summary": f"EpisodeSearch command is {command_state}.",
-                "sonarr_command_id": command["id"],
-                "sonarr_event_id": None,
-                "download_id": None,
-                "evidence_key": f"command:{command['id']}:{event_type}",
-            })
+            try:
+                command = client.get_command(batch.sonarr_command_id)
+            except SonarrNotFoundError:
+                # Sonarr may prune old commands. Only durable prior completion
+                # authorizes continuing; 404 itself proves nothing.
+                if batch.command_observed_state != "completed":
+                    raise
+                command_state = "completed"
+            else:
+                endpoint_reads["command"] = True
+                event_type, event_state, command_state = COMMAND_TYPES.get(
+                    command["status"], ("unknown", "unknown", "unknown"))
+                events.append({"dispatch_item_id": None, "candidate_id": None,
+                    "episode_id": None, "source_endpoint": "command",
+                    "event_type": event_type, "event_state": event_state,
+                    "safe_summary": f"EpisodeSearch command is {command_state}.",
+                    "sonarr_command_id": command["id"], "sonarr_event_id": None,
+                    "download_id": None,
+                    "evidence_key": f"command:{command['id']}:{event_type}"})
 
-            # Sonarr's history filter is singular, so read exactly one bounded
-            # first page for each dispatched episode and still discard any
-            # unrelated record if an upstream version ignores that filter.
             seen_history_ids = set()
             for episode_id, item in by_episode.items():
                 for page in range(1, self.HISTORY_MAX_PAGES + 1):
-                    history = client.get_history(
-                        page=page, page_size=self.HISTORY_PAGE_SIZE, episode_id=episode_id
-                    )
+                    history = client.get_history(page=page, page_size=self.HISTORY_PAGE_SIZE,
+                                                 episode_id=episode_id)
                     endpoint_reads["history"] = True
                     for record in history["records"]:
                         if record["episode_id"] != episode_id or record["id"] in seen_history_ids:
@@ -184,28 +225,21 @@ class ReconciliationService:
                         try:
                             event_at = datetime.fromisoformat(record["date"].replace("Z", "+00:00"))
                         except (AttributeError, ValueError):
-                            # A custom/test adapter may bypass the production
-                            # shape validator. Never treat an undated event as
-                            # evidence subsequent to this dispatch.
                             continue
                         if event_at < dispatched_at:
                             continue
                         seen_history_ids.add(record["id"])
                         normalized = "".join(ch for ch in record["event_type"].lower() if ch.isalnum())
-                        mapped = HISTORY_TYPES.get(normalized, ("unknown", "unknown"))
-                        mapped_type, mapped_state = mapped
-                        summary = {
-                            "grabbed": "Sonarr history records a grab.",
+                        mapped_type, mapped_state = HISTORY_TYPES.get(normalized, ("unknown", "unknown"))
+                        summary = {"grabbed": "Sonarr history records a grab.",
                             "imported": "Sonarr history records an import.",
                             "download_failed": "Sonarr history records a download failure.",
-                            "import_failed": "Sonarr history records an import failure.",
-                        }.get(mapped_type, "Sonarr history contains an unrecognized related event.")
-                        events.append(self._item_event(
-                            item, source="history", event_type=mapped_type,
-                            event_state=mapped_state, summary=summary,
-                            sonarr_event_id=record["id"], download_id=record["download_id"],
-                            evidence_key=f"history:{record['id']}:{mapped_type}:{episode_id}",
-                        ))
+                            "import_failed": "Sonarr history records an import failure."}.get(
+                                mapped_type, "Sonarr history contains an unrecognized related event.")
+                        events.append(self._item_event(item, source="history", event_type=mapped_type,
+                            event_state=mapped_state, summary=summary, sonarr_event_id=record["id"],
+                            download_id=record["download_id"],
+                            evidence_key=f"history:{record['id']}:{mapped_type}:{episode_id}"))
                     if page * self.HISTORY_PAGE_SIZE >= history["total_records"]:
                         break
                 else:
@@ -229,8 +263,7 @@ class ReconciliationService:
                         tracked = (record["tracked_state"] or "").lower()
                         if record["status"] in ("failed", "warning"):
                             queue_type = "import_failed" if "import" in tracked else "download_failed"
-                            queue_state = "terminal"
-                            summary = "Sonarr queue reports a failure."
+                            queue_state, summary = "terminal", "Sonarr queue reports a failure."
                         elif record["status"] in ("queued", "downloading", "paused", "delay", "stalled"):
                             queue_type, queue_state = "downloading", "nonterminal"
                             summary = "Sonarr queue shows an active or pending download."
@@ -238,12 +271,9 @@ class ReconciliationService:
                             queue_type, queue_state = "unknown", "unknown"
                             summary = "Sonarr queue contains an unrecognized related state."
                         key_download = record["download_id"] or "none"
-                        events.append(self._item_event(
-                            item, source="queue", event_type=queue_type,
-                            event_state=queue_state, summary=summary,
-                            download_id=record["download_id"],
-                            evidence_key=f"queue:{key_download}:{episode_id}:{queue_type}:{record['status']}:{tracked}",
-                        ))
+                        events.append(self._item_event(item, source="queue", event_type=queue_type,
+                            event_state=queue_state, summary=summary, download_id=record["download_id"],
+                            evidence_key=f"queue:{key_download}:{episode_id}:{queue_type}:{record['status']}:{tracked}"))
                 if page * self.QUEUE_PAGE_SIZE >= queue["total_records"]:
                     break
             else:
@@ -251,81 +281,42 @@ class ReconciliationService:
         except SonarrError as exc:
             summary = str(exc)[:1000]
             attempt, inserted = self.outcome_repo.record_reconciliation(
-                batch_id=batch.id, state="error", summary=summary,
-                command_state=command_state, events=events, endpoint_reads=endpoint_reads,
-            )
-            return ReconciliationResult(
-                batch=self.dispatch_repo.get_batch(batch.id), attempt=attempt,
-                inserted_event_count=inserted, item_results=[]
-            ), summary
+                batch_id=batch.id, state="error", summary=summary, command_state=command_state,
+                events=events, endpoint_reads=endpoint_reads)
+            return ReconciliationResult(self.dispatch_repo.get_batch(batch.id), attempt, inserted, []), summary
         except Exception:
             summary = "unexpected error while reading reconciliation data from Sonarr"
             attempt, inserted = self.outcome_repo.record_reconciliation(
-                batch_id=batch.id, state="error", summary=summary,
-                command_state=command_state, events=events, endpoint_reads=endpoint_reads,
-            )
-            return ReconciliationResult(
-                batch=self.dispatch_repo.get_batch(batch.id), attempt=attempt,
-                inserted_event_count=inserted, item_results=[]
-            ), summary
+                batch_id=batch.id, state="error", summary=summary, command_state=command_state,
+                events=events, endpoint_reads=endpoint_reads)
+            return ReconciliationResult(self.dispatch_repo.get_batch(batch.id), attempt, inserted, []), summary
 
-        evidence_by_item = {item.id: [] for item in items}
-        for event in events:
-            if event.get("dispatch_item_id") is not None:
-                evidence_by_item[event["dispatch_item_id"]].append(event)
-        item_results = []
-        terminal_count = 0
-        evidence_count = 0
-        for item in items:
-            item_events = evidence_by_item[item.id]
-            terminal_events = [
-                event for event in item_events if event["event_type"] in TERMINAL_ITEM_TYPES
-            ]
-            terminal_event = max(
-                terminal_events,
-                key=lambda event: (event.get("sonarr_event_id") or 0, item_events.index(event)),
-                default=None,
-            )
-            latest = (
-                terminal_event["event_type"] if terminal_event
-                else item_events[-1]["event_type"] if item_events
-                else "unresolved"
-            )
-            terminal_count += int(terminal_event is not None)
-            evidence_count += int(bool(item_events))
-            item_results.append({
-                "dispatch_item_id": item.id,
-                "candidate_id": item.candidate_id,
-                "episode_id": item.episode_id,
-                "latest_outcome": latest,
-                "terminal": terminal_event is not None,
-            })
+        persisted = [_event_dict(event) for event in self.outcome_repo.list_events(batch.id)]
+        combined = persisted + events
+        # Only locally finalized dispatched batches with durable/current command
+        # completion can close. Ambiguous writes and bounded reads never do.
+        if (not truncated and batch.state in ("completed", "partial")
+                and (command_state == "completed" or batch.command_observed_state == "completed")
+                and (self._clock() - grace_started_at).total_seconds() >= NO_RESULT_GRACE_SECONDS):
+            for item in items:
+                item_events = [event for event in combined if event.get("dispatch_item_id") == item.id]
+                if effective_item_event(item_events) is None:
+                    closure = self._item_event(item, source="reconciliation", event_type="no_result",
+                        event_state="terminal", summary="No outcome evidence appeared within 15 minutes.",
+                        evidence_key=f"no-result:{item.id}")
+                    events.append(closure)
+                    combined.append(closure)
 
-        if items and terminal_count == len(items):
-            state = "resolved"
-            summary = f"Terminal import/failure evidence was found for all {len(items)} dispatch items."
-        elif evidence_count or command_state in ("completed", "failed", "aborted"):
-            state = "partial" if evidence_count else "unresolved"
-            if command_state == "completed" and not evidence_count:
-                summary = "Search command completed, but no grab, download, import, or failure evidence was found."
-            else:
-                summary = f"Evidence was found for {evidence_count} of {len(items)} dispatch items; unresolved items remain."
-        else:
-            state = "unresolved"
-            summary = "The command is still pending or no related episode evidence was found."
-        if truncated:
-            summary = (summary + " Sonarr reported more records than the bounded read limit; the result is partial.")[:1000]
-            if state == "unresolved":
-                state = "partial"
-
+        effective_command = command_state
+        if effective_command == "unknown" and batch.command_observed_state:
+            effective_command = batch.command_observed_state
+        state, summary, item_results = self._summarize(
+            items, combined, effective_command, truncated=truncated)
         attempt, inserted = self.outcome_repo.record_reconciliation(
-            batch_id=batch.id, state=state, summary=summary,
-            command_state=command_state, events=events, endpoint_reads=endpoint_reads,
-        )
-        return ReconciliationResult(
-            batch=self.dispatch_repo.get_batch(batch.id), attempt=attempt,
-            inserted_event_count=inserted, item_results=item_results,
-        ), None
+            batch_id=batch.id, state=state, summary=summary, command_state=command_state,
+            events=events, endpoint_reads=endpoint_reads)
+        return ReconciliationResult(self.dispatch_repo.get_batch(batch.id), attempt,
+                                    inserted, item_results), None
 
     def detail(self, batch_id: int):
         batch = self.dispatch_repo.get_batch(batch_id)
@@ -345,19 +336,10 @@ class ReconciliationService:
         for item in batch.items or []:
             item_data = item.to_dict()
             item_data["outcomes"] = by_item.get(item.id, [])
-            terminal = [
-                event for event in item_data["outcomes"]
-                if event["event_type"] in TERMINAL_ITEM_TYPES
-            ]
-            item_data["latest_outcome"] = (
-                max(terminal, key=lambda event: (event.get("sonarr_event_id") or 0, event["id"]))
-                if terminal else item_data["outcomes"][-1] if item_data["outcomes"] else None
-            )
+            item_data["latest_outcome"] = effective_item_event(item_data["outcomes"])
+            outcome_type = (item_data["latest_outcome"] or {}).get("event_type", "pending")
+            item_data["human_state"] = HUMAN_OUTCOME[outcome_type]
             items.append(item_data)
-        return {
-            "batch": batch.to_dict(),
-            "attempts": [attempt.to_dict() for attempt in attempts],
-            "batch_events": batch_events,
-            "items": items,
-            "notice": "Reconciliation sends no search. A completed search command is not proof of a grab, download, or import.",
-        }
+        return {"batch": batch.to_dict(), "attempts": [a.to_dict() for a in attempts],
+                "batch_events": batch_events, "items": items,
+                "notice": "Reconciliation sends no search. A completed search command is not proof of a grab, download, or import."}

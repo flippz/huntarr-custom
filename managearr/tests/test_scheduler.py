@@ -452,3 +452,34 @@ def test_worker_and_compose_are_separate_processes():
     assert "ports:" not in worker_section
     run_source = open("app/__init__.py", encoding="utf-8").read()
     assert "SchedulerWorker" not in run_source
+
+
+def test_no_result_adds_no_failure_cooldown_but_late_grab_is_active(
+    database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    policy_repo.update({"cooldown_minutes": 60, "queue_target": 2})
+    library, job, candidates = _library_scan(library_repo, activity_repo, candidate_repo, count=2)
+    with database.connect() as conn:
+        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        batch_id, item_id = _completed_dispatch(
+            conn, dispatch_repo, library, job, candidates[0], dispatched_at=old
+        )
+        conn.execute(
+            """INSERT INTO dispatch_outcome_events (
+                   batch_id,dispatch_item_id,candidate_id,episode_id,observed_at,
+                   source_endpoint,event_type,event_state,safe_summary,evidence_key)
+               VALUES (%s,%s,%s,%s,now(),'reconciliation','no_result','terminal','safe','no-result')""",
+            (batch_id, item_id, candidates[0].id, candidates[0].episode_id),
+        )
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="no-result")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    assert cycle["libraries"][0]["queue_occupancy"] == 0
+    rows = {row["candidate_id"]: row for row in cycle["libraries"][0]["candidates"]}
+    assert rows[candidates[0].id]["selected"] is True
+
+    with database.connect() as conn:
+        _record_outcome(conn, batch_id, item_id, candidates[0], "grabbed", "nonterminal", "late-grab")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    rows = {row["candidate_id"]: row for row in cycle["libraries"][0]["candidates"]}
+    assert "active grab" in rows[candidates[0].id]["exclusion_reason"]
+    assert cycle["libraries"][0]["queue_occupancy"] == 1

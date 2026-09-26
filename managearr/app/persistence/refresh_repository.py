@@ -245,7 +245,7 @@ class RefreshRepository:
             SELECT count(*) AS c FROM dispatch_batches
             WHERE mode = 'manual' AND sonarr_command_id IS NOT NULL
               AND state IN ('completed', 'partial', 'ambiguous')
-              AND reconciliation_state <> 'resolved'
+              AND reconciliation_state NOT IN ('resolved', 'no_result')
         """
         if conn is not None:
             return conn.execute(sql).fetchone()["c"]
@@ -313,7 +313,7 @@ class RefreshRepository:
                 SELECT id FROM dispatch_batches
                 WHERE mode = 'manual' AND sonarr_command_id IS NOT NULL
                   AND state IN ('completed', 'partial', 'ambiguous')
-                  AND reconciliation_state <> 'resolved'
+                  AND reconciliation_state NOT IN ('resolved', 'no_result')
                 ORDER BY updated_at ASC, id ASC LIMIT %s
                 """,
                 (limit,),

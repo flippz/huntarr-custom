@@ -193,7 +193,7 @@ async function loadDispatchAudit(jobId) {
       <td><span class="state-pill state-${escapeHtml(batch.state)}">${escapeHtml(batch.state)}</span></td>
       <td>${batch.requested_count}/${batch.selected_count}/${batch.dispatched_count}</td>
       <td>${escapeHtml(command)}<br><span class="muted">${escapeHtml(batch.command_observed_state || '')}</span></td>
-      <td>${escapeHtml(batch.reconciliation_state)}<br><span class="muted">${escapeHtml(batch.reconciliation_summary || '')}</span></td>
+      <td>${escapeHtml(batch.outcome_human_state)}<br><span class="muted">${escapeHtml(batch.reconciliation_summary || '')}</span></td>
       <td>${escapeHtml(batch.last_reconciled_at || 'never')}</td>
       <td>${escapeHtml(batch.error_summary || '')}</td>
       <td><button type="button" data-action="outcomes" data-batch-id="${batch.id}">Evidence</button>
@@ -214,7 +214,7 @@ async function showOutcomeDetail(batchId) {
   detail.items.forEach(item => {
     const block = document.createElement('div');
     const timeline = item.outcomes.map(event => `${event.event_type} (${event.source_endpoint}: ${event.safe_summary})`).join(' → ');
-    block.textContent = `Candidate #${item.candidate_id}, episode #${item.episode_id}: ${timeline || 'unresolved; no related evidence'}`;
+    block.textContent = `Candidate #${item.candidate_id}, episode #${item.episode_id}: ${item.human_state}. ${timeline || 'No related evidence yet.'}`;
     root.appendChild(block);
   });
   document.getElementById('outcome-detail').hidden = false;

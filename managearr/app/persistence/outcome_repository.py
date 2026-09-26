@@ -1,4 +1,4 @@
-"""Transactional persistence for append-only reconciliation evidence."""
+"""Transactional persistence for the append-only reconciliation ledger."""
 from datetime import datetime, timezone
 
 from ..domain.outcome import OutcomeEvent, ReconciliationAttempt
@@ -36,46 +36,35 @@ class OutcomeRepository:
         self.db = db
 
     def record_reconciliation(
-        self,
-        *,
-        batch_id: int,
-        state: str,
-        summary: str,
-        command_state: str,
-        events: list[dict],
-        endpoint_reads: dict[str, bool],
+        self, *, batch_id: int, state: str, summary: str, command_state: str,
+        events: list[dict], endpoint_reads: dict[str, bool],
     ) -> tuple[ReconciliationAttempt, int]:
-        """Dedupe evidence and append the attempt in one short transaction."""
+        """Append deduplicated evidence and one attempt in a short transaction."""
         observed_at = _now()
         inserted = 0
         with self.db.connect() as conn:
             locked = conn.execute(
-                """
-                SELECT reconciliation_state, reconciliation_summary, command_observed_state
-                FROM dispatch_batches WHERE id = %s FOR UPDATE
-                """,
-                (batch_id,),
+                """SELECT reconciliation_state, reconciliation_summary, command_observed_state
+                   FROM dispatch_batches WHERE id = %s FOR UPDATE""", (batch_id,),
             ).fetchone()
             if locked is None:
                 raise LookupError("dispatch batch not found")
-            aggregate_state = state
-            aggregate_summary = summary
-            aggregate_command_state = (
-                locked["command_observed_state"]
-                if command_state == "unknown" and locked["command_observed_state"]
-                else command_state
-            )
-            rank = {
-                "not_reconciled": 0,
-                "operator_review": 0,
-                "error": 0,
-                "unresolved": 1,
-                "partial": 2,
-                "resolved": 3,
-            }
-            if rank[locked["reconciliation_state"]] > rank[state]:
+
+            # A failed read is an attempt result, not contrary outcome evidence.
+            # Preserve a prior evidence-derived state and summary across it.
+            aggregate_state, aggregate_summary = state, summary
+            if state == "error" and locked["reconciliation_state"] not in (
+                "not_reconciled", "operator_review", "error"
+            ):
                 aggregate_state = locked["reconciliation_state"]
                 aggregate_summary = locked["reconciliation_summary"]
+
+            command_rank = {None: -1, "unknown": 0, "queued": 1, "running": 2,
+                            "failed": 3, "aborted": 3, "completed": 4}
+            old_command = locked["command_observed_state"]
+            aggregate_command_state = command_state
+            if command_rank.get(old_command, 0) > command_rank.get(command_state, 0):
+                aggregate_command_state = old_command
 
             for event in events:
                 result = conn.execute(
@@ -84,46 +73,37 @@ class OutcomeRepository:
                         batch_id, dispatch_item_id, candidate_id, episode_id, observed_at,
                         source_endpoint, event_type, event_state, safe_summary,
                         sonarr_command_id, sonarr_event_id, download_id, evidence_key
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (batch_id, source_endpoint, evidence_key) DO NOTHING
                     RETURNING id
                     """,
-                    (
-                        batch_id, event.get("dispatch_item_id"), event.get("candidate_id"),
-                        event.get("episode_id"), observed_at, event["source_endpoint"],
-                        event["event_type"], event["event_state"], event["safe_summary"],
-                        event.get("sonarr_command_id"), event.get("sonarr_event_id"),
-                        event.get("download_id"), event["evidence_key"],
-                    ),
+                    (batch_id, event.get("dispatch_item_id"), event.get("candidate_id"),
+                     event.get("episode_id"), observed_at, event["source_endpoint"],
+                     event["event_type"], event["event_state"], event["safe_summary"],
+                     event.get("sonarr_command_id"), event.get("sonarr_event_id"),
+                     event.get("download_id"), event["evidence_key"]),
                 ).fetchone()
                 inserted += int(result is not None)
 
             attempt_row = conn.execute(
                 """
                 INSERT INTO dispatch_reconciliation_attempts (
-                    batch_id, observed_at, state, safe_summary,
-                    command_endpoint_read, history_endpoint_read, queue_endpoint_read,
-                    inserted_event_count
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING *
+                    batch_id, observed_at, state, safe_summary, command_endpoint_read,
+                    history_endpoint_read, queue_endpoint_read, inserted_event_count
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *
                 """,
-                (
-                    batch_id, observed_at, state, summary,
-                    bool(endpoint_reads.get("command")), bool(endpoint_reads.get("history")),
-                    bool(endpoint_reads.get("queue")), inserted,
-                ),
+                (batch_id, observed_at, state, summary, bool(endpoint_reads.get("command")),
+                 bool(endpoint_reads.get("history")), bool(endpoint_reads.get("queue")), inserted),
             ).fetchone()
             conn.execute(
                 """
                 UPDATE dispatch_batches
-                SET reconciliation_state = %s, reconciliation_summary = %s,
-                    last_reconciled_at = %s, command_observed_state = %s, updated_at = %s
-                WHERE id = %s
+                SET reconciliation_state=%s, reconciliation_summary=%s,
+                    last_reconciled_at=%s, command_observed_state=%s, updated_at=%s
+                WHERE id=%s
                 """,
-                (
-                    aggregate_state, aggregate_summary, observed_at,
-                    aggregate_command_state, observed_at, batch_id,
-                ),
+                (aggregate_state, aggregate_summary, observed_at,
+                 aggregate_command_state, observed_at, batch_id),
             )
         return _attempt(attempt_row), inserted
 
@@ -131,10 +111,7 @@ class OutcomeRepository:
         limit = max(1, min(int(limit), 500))
         with self.db.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT * FROM dispatch_outcome_events
-                WHERE batch_id = %s ORDER BY observed_at, id LIMIT %s
-                """,
+                "SELECT * FROM dispatch_outcome_events WHERE batch_id=%s ORDER BY observed_at,id LIMIT %s",
                 (batch_id, limit),
             ).fetchall()
         return [_event(row) for row in rows]
@@ -143,10 +120,8 @@ class OutcomeRepository:
         limit = max(1, min(int(limit), 100))
         with self.db.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT * FROM dispatch_reconciliation_attempts
-                WHERE batch_id = %s ORDER BY observed_at DESC, id DESC LIMIT %s
-                """,
+                """SELECT * FROM dispatch_reconciliation_attempts
+                   WHERE batch_id=%s ORDER BY observed_at DESC,id DESC LIMIT %s""",
                 (batch_id, limit),
             ).fetchall()
         return [_attempt(row) for row in rows]

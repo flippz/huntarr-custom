@@ -6,6 +6,7 @@ called, proving the worker's read-only refresh path never reaches them.
 """
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import psycopg
 import pytest
@@ -635,3 +636,34 @@ def test_nonterminal_reconciliation_schedules_prompt_followup(
             "SELECT next_reconcile_due_at <= now() + interval '65 seconds' AS prompt FROM refresh_settings WHERE id=1"
         ).fetchone()
     assert row["prompt"] is True
+
+
+def test_no_result_is_terminal_for_auto_sweep_and_followup(
+    database, refresh_repo, library_repo, activity_repo, candidate_repo, dispatch_repo,
+    refresh_service, monkeypatch
+):
+    _library, _job, batch_id = make_reconcilable_batch(
+        library_repo, activity_repo, candidate_repo, dispatch_repo,
+        episode_id=8801, command_id=8802,
+    )
+    with database.connect() as conn:
+        conn.execute(
+            "UPDATE dispatch_batches SET reconciliation_state='no_result' WHERE id=%s",
+            (batch_id,),
+        )
+    assert batch_id not in refresh_repo.eligible_reconciliation_batches(50)
+    assert refresh_repo.eligible_reconciliation_count() == 0
+
+    with database.connect() as conn:
+        run_id = conn.execute(
+            "INSERT INTO refresh_runs (kind,trigger,state) VALUES ('reconcile','scheduled','queued') RETURNING id"
+        ).fetchone()["id"]
+    monkeypatch.setattr(refresh_repo, "eligible_reconciliation_batches", lambda limit: [batch_id])
+    monkeypatch.setattr(refresh_service.reconciliation_service, "reconcile", lambda _batch_id: (
+        SimpleNamespace(batch=SimpleNamespace(reconciliation_state="no_result")), None
+    ))
+    before = refresh_repo.get_settings().next_reconcile_due_at
+    run = refresh_repo.start_next_run("no-result-worker")
+    refresh_service.execute_run(run)
+    after = refresh_repo.get_settings().next_reconcile_due_at
+    assert before == after

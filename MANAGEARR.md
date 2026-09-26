@@ -4,7 +4,52 @@ Managearr is a standalone Flask/PostgreSQL rewrite beside the legacy Huntarr
 application (`main.py`, `src/`). It has its own image, database, port, API, and
 UI. Nothing in this application changes the legacy runtime.
 
-## Current milestone: controlled scheduled live dispatch (M6)
+## Current milestone: definitive dispatch outcomes (M9)
+
+M9 keeps the append-only `dispatch_outcome_events` ledger as the single source
+of item outcomes. For each dispatched item, effective evidence is selected by
+the deterministic precedence `imported > download/import failure >
+grabbed/downloading > no_result`. Both the response from the current read and
+the stored batch summary are derived from persisted plus newly observed ledger
+events, so repeated passes and process restarts do not erase prior evidence.
+
+A locally finalized `completed`/`partial` dispatch whose EpisodeSearch command
+is durably observed `completed` receives a `no_result` ledger event only after
+an exact 15-minute grace period with no item evidence. Ambiguous or failed
+writes never qualify, bounded/truncated reads never close the grace, and a 404
+for an old Sonarr command never proves completion. A 404 permits bounded
+history/queue fallback only when `command_observed_state = 'completed'` was
+already durable. Other read failures remain safe errors.
+
+`no_result` is terminal for automatic reconciliation and gets no minute
+follow-up, but the manual read-only reconcile action remains available. Late
+evidence is appended rather than rewriting history: a late grab corrects
+`no_result` to `partial` and is active queue occupancy; a later import/failure
+resolves it. `no_result` adds no outcome-failure cooldown—the ordinary dispatch
+cooldown already starts when the search is sent. Queue occupancy counts unique
+episode IDs and uses the same effective-event precedence.
+
+Activity/API surfaces human states **Pending**, **Grabbed/downloading**,
+**Imported**, **Failed**, **Ambiguous/manual review**, and **No result**. M9
+adds no Sonarr write path; stale production-shaped accepted/completed attempts
+are backfilled idempotently by the normal read-only reconciliation flow.
+
+## Persistent paced Live baseline (M7-M8)
+
+M7 replaced expiring arm-only operation with durable authorization states
+`running`, `paused`, and `emergency_stopped`. Restarts preserve the explicit
+state; the v7 migration itself fails closed to `paused`, and resume/pause or
+emergency-stop transitions remain audited and rechecked before every send. M8
+keeps the same gates while allowing a bounded paced cycle: the policy target and
+operator ceiling are both enforced, each command uses the existing dispatch
+ledger/service, and sends are separated by the configured minimum delay. A
+fresh install still defaults to scheduler mode `off`; upgrading never starts
+Live dispatch by itself.
+
+The M6 section below is retained as historical design context. Where its
+expiring-arm wording differs, the persistent M7-M8 behavior above is current.
+
+## Previous milestone: controlled scheduled live dispatch (M6)
 
 M6 adds a real, scheduled `live` dispatch path alongside the existing
 simulation scheduler, without weakening any earlier milestone's safety
@@ -823,8 +868,9 @@ losing the audit in an opaque 5xx response.
 
 The reconciliation response includes the refreshed batch summary, one durable
 attempt, count of newly inserted deduplicated events, and an explicit item
-result for every dispatched candidate. The result remains `unresolved` or
-`partial` when evidence is absent, unknown, or exceeds bounded pagination.
+result for every dispatched candidate. Before the grace closes the result remains `unresolved`; bounded pagination
+remains `partial`. A fully observed completed search with no item evidence
+becomes `no_result` at 15 minutes, and later evidence can correct it.
 Upstream read failures return a safe 502 and still append an `error` attempt;
 they do not store or echo a raw Sonarr payload.
 
@@ -917,13 +963,13 @@ of `test_migrations.py`) is summarized in their own sections above.
 ## Current limitations
 
 - Sonarr only; other Arr types remain CRUD-only.
-- Automatic dispatch exists only via the M6 controlled live scheduler path
-  (mode `live` plus a valid unexpired arm - see M6 above); every deployment
-  still defaults to `off` and unarmed. The M2 manual endpoint remains
-  available and independent of scheduler mode. Reconciliation runs both on
-  explicit operator request (M3) and on a bounded automatic cooldown (M5);
-  no path here or in M6 ever retries a sent search. No download-client API,
-  grab, download, or import pipeline exists.
+- Automatic dispatch exists only through the M7-M8 persistent, paced Live
+  scheduler path (`mode = live` plus authorization state `running`, rechecked
+  before every send); fresh deployments still default to `off`. The M2 manual
+  endpoint remains independent. Reconciliation runs on explicit operator
+  request and a bounded automatic cadence, but terminal `resolved` and
+  `no_result` batches leave that automatic sweep. No path retries a sent
+  search. No download-client write, grab, download, or import pipeline exists.
 - Managearr has no authentication/authorization yet; protect the service at the
   network/reverse-proxy layer.
 - A process crash after Sonarr accepts a command but before local finalization

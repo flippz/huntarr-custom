@@ -1,10 +1,10 @@
 """M3 command/outcome reconciliation against mocked Sonarr reads."""
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
 
-from app.adapters.sonarr_client import SonarrAuthError
+from app.adapters.sonarr_client import SonarrAuthError, SonarrNotFoundError
 from app.persistence import dispatch_repository as dispatch_repository_module
 from app.services.reconciliation_service import ReconciliationService
 
@@ -239,7 +239,8 @@ def test_reconciliation_summary_does_not_regress_when_later_read_is_empty(
 
     install_reconciliation(app, StubReconciliationClient())
     second = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
-    assert second["attempt"]["state"] == "unresolved"
+    # Persisted ledger evidence drives both the immediate attempt and stored summary.
+    assert second["attempt"]["state"] == "partial"
     assert second["batch"]["reconciliation_state"] == "partial"
 
 
@@ -434,3 +435,106 @@ def test_reconciliation_pagination_is_bounded_and_reports_partial(
     assert [call[1] for call in stub.calls if call[0] == "queue"] == [1, 2, 3]
     assert result["batch"]["reconciliation_state"] == "partial"
     assert "bounded read limit" in result["batch"]["reconciliation_summary"]
+
+
+def install_reconciliation_at(app, stub, now):
+    services = app.extensions["managearr"]
+    services["reconciliation"] = ReconciliationService(
+        services["dispatch_repo"], services["outcome_repo"],
+        services["reconciliation"].library_repo,
+        services["reconciliation"].activity_repo,
+        services["reconciliation"].candidate_repo,
+        client_factory=lambda *args, **kwargs: stub,
+        clock=lambda: now,
+    )
+
+
+def test_no_result_grace_boundary_is_centralized_and_append_only(
+    app, client, database, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    _, _, batch = make_batch(library_repo, activity_repo, candidate_repo, dispatch_repo)
+    created = max(datetime.fromisoformat(item.updated_at) for item in batch.items)
+    stub = StubReconciliationClient()
+    install_reconciliation_at(app, stub, created + timedelta(seconds=899))
+    before = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
+    assert before["batch"]["reconciliation_state"] == "unresolved"
+    assert before["item_results"][0]["human_state"] == "Pending"
+
+    install_reconciliation_at(app, stub, created + timedelta(seconds=900))
+    boundary = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
+    assert boundary["batch"]["reconciliation_state"] == "no_result"
+    assert boundary["item_results"][0]["latest_outcome"] == "no_result"
+    assert boundary["item_results"][0]["human_state"] == "No result"
+    detail = client.get(f"/api/v1/dispatch-batches/{batch.id}/outcomes").get_json()["outcomes"]
+    assert [e["event_type"] for e in detail["items"][0]["outcomes"]].count("no_result") == 1
+
+    repeated = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
+    assert repeated["batch"]["reconciliation_state"] == "no_result"
+    assert repeated["attempt"]["state"] == "no_result"
+    with pytest.raises(psycopg.errors.RaiseException):
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE dispatch_batches SET reconciliation_state='unresolved' WHERE id=%s",
+                (batch.id,),
+            )
+
+
+def test_late_evidence_corrects_no_result_by_precedence_and_survives_restart(
+    app, client, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    _, _, batch = make_batch(library_repo, activity_repo, candidate_repo, dispatch_repo)
+    created = max(datetime.fromisoformat(item.updated_at) for item in batch.items)
+    install_reconciliation_at(app, StubReconciliationClient(), created + timedelta(minutes=15))
+    assert client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]["batch"]["reconciliation_state"] == "no_result"
+
+    install_reconciliation_at(app, StubReconciliationClient(
+        history={101: [history_record(10, "grabbed", 101)]}), created + timedelta(minutes=30))
+    grabbed = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
+    assert grabbed["batch"]["reconciliation_state"] == "partial"
+    assert grabbed["item_results"][0]["latest_outcome"] == "grabbed"
+
+    # A fresh service instance has only the persisted ledger and still keeps the correction.
+    install_reconciliation_at(app, StubReconciliationClient(), created + timedelta(minutes=31))
+    restarted = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
+    assert restarted["attempt"]["state"] == "partial"
+
+    install_reconciliation_at(app, StubReconciliationClient(
+        history={101: [history_record(11, "downloadFailed", 101),
+                       history_record(12, "downloadFolderImported", 101)]}),
+        created + timedelta(minutes=32))
+    terminal = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
+    assert terminal["batch"]["reconciliation_state"] == "resolved"
+    assert terminal["item_results"][0]["latest_outcome"] == "imported"
+
+
+def test_ambiguous_accepted_attempt_never_closes_as_no_result(
+    app, client, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    _, _, batch = make_batch(library_repo, activity_repo, candidate_repo, dispatch_repo,
+                             state="ambiguous")
+    created = max(datetime.fromisoformat(item.updated_at) for item in batch.items)
+    install_reconciliation_at(app, StubReconciliationClient(), created + timedelta(hours=1))
+    result = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
+    assert result["batch"]["command_observed_state"] == "completed"
+    assert result["batch"]["reconciliation_state"] == "unresolved"
+    assert result["item_results"][0]["latest_outcome"] == "unresolved"
+
+
+def test_pruned_command_requires_durable_completed_state_before_fallback(
+    app, client, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    _, _, batch = make_batch(library_repo, activity_repo, candidate_repo, dispatch_repo)
+    created = max(datetime.fromisoformat(item.updated_at) for item in batch.items)
+    missing = StubReconciliationClient(error=SonarrNotFoundError("Sonarr returned HTTP 404"))
+    install_reconciliation_at(app, missing, created + timedelta(hours=1))
+    unsafe = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile")
+    assert unsafe.status_code == 502
+    assert [call[0] for call in missing.calls] == ["command"]
+
+    install_reconciliation_at(app, StubReconciliationClient(), created + timedelta(minutes=1))
+    client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile")
+    missing = StubReconciliationClient(error=SonarrNotFoundError("Sonarr returned HTTP 404"))
+    install_reconciliation_at(app, missing, created + timedelta(minutes=15))
+    safe = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
+    assert safe["batch"]["reconciliation_state"] == "no_result"
+    assert {call[0] for call in missing.calls} >= {"command", "history", "queue"}

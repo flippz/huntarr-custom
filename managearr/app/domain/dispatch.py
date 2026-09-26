@@ -121,6 +121,15 @@ class DispatchBatch:
             "reconciliation_summary": self.reconciliation_summary,
             "last_reconciled_at": self.last_reconciled_at,
             "command_observed_state": self.command_observed_state,
+            "outcome_human_state": {
+                "not_reconciled": "Pending",
+                "unresolved": "Pending",
+                "partial": "Grabbed/downloading or mixed outcomes",
+                "resolved": "Imported or failed",
+                "operator_review": "Ambiguous/manual review",
+                "error": "Ambiguous/manual review",
+                "no_result": "No result",
+            }.get(self.reconciliation_state, "Pending"),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

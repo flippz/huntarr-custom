@@ -9,6 +9,7 @@ from app.adapters.sonarr_client import (
     SonarrClient,
     SonarrConnectionError,
     SonarrDataError,
+    SonarrNotFoundError,
     SonarrResponseError,
 )
 
@@ -24,6 +25,11 @@ class FakeResponse:
         if self._raise_json_error:
             raise ValueError("not json")
         return self._json_data
+
+
+def test_http_404_has_typed_not_found_error():
+    with pytest.raises(SonarrNotFoundError, match="HTTP 404"):
+        SonarrClient("http://sonarr.invalid", "key", session=FakeSession(FakeResponse(404))).get_command(42)
 
 
 class FakeSession:

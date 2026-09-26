@@ -401,7 +401,7 @@ class SchedulerRepository:
                 FROM dispatch_outcome_events grabbed
                 JOIN dispatch_batches b ON b.id = grabbed.batch_id
                 WHERE b.library_id = %s AND grabbed.episode_id = ANY(%s)
-                  AND grabbed.event_type = 'grabbed'
+                  AND grabbed.event_type IN ('grabbed','downloading')
                   AND NOT EXISTS (
                       SELECT 1 FROM dispatch_outcome_events terminal
                       WHERE terminal.dispatch_item_id = grabbed.dispatch_item_id
@@ -417,8 +417,11 @@ class SchedulerRepository:
                 SELECT DISTINCT e.episode_id FROM dispatch_outcome_events e
                 JOIN dispatch_batches b ON b.id = e.batch_id
                 WHERE b.library_id = %s AND e.episode_id = ANY(%s)
-                  AND e.event_type IN (
-                      'download_failed','import_failed','command_failed','command_aborted'
+                  AND e.event_type IN ('download_failed','import_failed')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dispatch_outcome_events imported
+                      WHERE imported.dispatch_item_id = e.dispatch_item_id
+                        AND imported.event_type = 'imported'
                   )
                   AND e.observed_at >= now() - (%s * interval '1 minute')
                 """, (library_id, episode_ids, cooldown),
