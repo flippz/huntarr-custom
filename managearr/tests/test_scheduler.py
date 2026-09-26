@@ -286,6 +286,63 @@ def test_grabbed_without_terminal_outcome_is_excluded_and_occupies_queue(
     assert cycle["selected_count"] == 1
 
 
+def test_queue_occupancy_counts_repeated_active_attempts_once(
+    database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    library, job, candidates = _library_scan(library_repo, activity_repo, candidate_repo, count=2)
+    policy_repo.update({"queue_target": 2})
+    with database.connect() as conn:
+        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        for suffix in ("a", "b"):
+            batch_id, item_id = _completed_dispatch(
+                conn, dispatch_repo, library, job, candidates[0], dispatched_at=old
+            )
+            _record_outcome(
+                conn, batch_id, item_id, candidates[0], "grabbed", "nonterminal",
+                f"grab-active-{suffix}", observed_at=old,
+            )
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="deduplicated-queue")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    result = cycle["libraries"][0]
+    assert result["queue_occupancy"] == 1
+    assert cycle["selected_count"] == 1
+
+
+def test_stale_command_only_attempt_releases_queue_capacity(
+    database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    library, job, candidates = _library_scan(library_repo, activity_repo, candidate_repo, count=2)
+    policy_repo.update({"queue_target": 1})
+    with database.connect() as conn:
+        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        batch_id, item_id = _completed_dispatch(
+            conn, dispatch_repo, library, job, candidates[0], dispatched_at=old
+        )
+        _record_outcome(
+            conn, batch_id, item_id, candidates[0], "command_completed", "terminal",
+            "command-only", observed_at=old + timedelta(seconds=5),
+        )
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="stale-command-only")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    result = cycle["libraries"][0]
+    assert result["queue_occupancy"] == 0
+    assert cycle["selected_count"] == 1
+
+
+def test_recent_unreconciled_attempt_temporarily_occupies_queue(
+    database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    library, job, candidates = _library_scan(library_repo, activity_repo, candidate_repo, count=2)
+    policy_repo.update({"queue_target": 1})
+    with database.connect() as conn:
+        _completed_dispatch(conn, dispatch_repo, library, job, candidates[0])
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="recent-unreconciled")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    result = cycle["libraries"][0]
+    assert result["queue_occupancy"] == 1
+    assert cycle["selected_count"] == 0
+
+
 def test_terminal_failure_starts_cooldown_from_durable_outcome(
     database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
 ):

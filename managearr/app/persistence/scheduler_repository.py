@@ -426,20 +426,31 @@ class SchedulerRepository:
             queue = conn.execute(
                 """
                 WITH dispatched AS (
-                    SELECT i.id FROM dispatch_batch_items i
+                    SELECT i.id, i.episode_id, i.created_at
+                    FROM dispatch_batch_items i
                     JOIN dispatch_batches b ON b.id = i.batch_id
                     WHERE b.library_id = %s AND b.mode = 'manual'
                       AND b.state IN ('completed','partial') AND i.state = 'dispatched'
+                ), active_episodes AS (
+                    SELECT DISTINCT d.episode_id
+                    FROM dispatched d
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM dispatch_outcome_events terminal
+                        WHERE terminal.dispatch_item_id = d.id
+                          AND terminal.event_type IN (
+                              'imported','download_failed','import_failed',
+                              'command_failed','command_aborted'
+                          )
+                    ) AND (
+                        d.created_at >= now() - interval '5 minutes'
+                        OR EXISTS (
+                            SELECT 1 FROM dispatch_outcome_events active
+                            WHERE active.dispatch_item_id = d.id
+                              AND active.event_type IN ('grabbed','downloading')
+                        )
+                    )
                 )
-                SELECT count(*) AS c FROM dispatched d
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM dispatch_outcome_events terminal
-                    WHERE terminal.dispatch_item_id = d.id
-                      AND terminal.event_type IN (
-                          'imported','download_failed','import_failed',
-                          'command_failed','command_aborted'
-                      )
-                )
+                SELECT count(*) AS c FROM active_episodes
                 """, (library_id,),
             ).fetchone()["c"]
             successes = conn.execute(
