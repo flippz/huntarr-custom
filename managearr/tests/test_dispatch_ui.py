@@ -42,3 +42,6 @@ def test_activity_ui_exposes_read_only_reconciliation_and_evidence_timeline(clie
     assert 'data-action="reconcile"' in html
     assert "/reconcile`, {method: 'POST'}" in html
     assert "/outcomes`" in html
+    assert "item.human_status" in html
+    assert "status.label" in html
+    assert "status.explanation" in html

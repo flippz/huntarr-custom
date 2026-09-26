@@ -29,10 +29,17 @@ resolves it. `no_result` adds no outcome-failure cooldown—the ordinary dispatc
 cooldown already starts when the search is sent. Queue occupancy counts unique
 episode IDs and uses the same effective-event precedence.
 
-Activity/API surfaces human states **Pending**, **Grabbed/downloading**,
-**Imported**, **Failed**, **Ambiguous/manual review**, and **No result**. M9
-adds no Sonarr write path; stale production-shaped accepted/completed attempts
-are backfilled idempotently by the normal read-only reconciliation flow.
+Activity/API surfaces structured human status codes, labels, and explanations
+for exactly **Pending**, **Grabbed/downloading**, **Imported**, **Failed**,
+**Ambiguous/manual review**, and **No result**. M9 adds no Sonarr write path;
+stale production-shaped accepted/completed attempts are backfilled idempotently
+by the normal read-only reconciliation flow.
+
+M9 has no down-migration. A code-only rollback to a pre-M9 build is **not**
+claimed safe after M9 outcome rows exist: older reconciliation-state checks and
+readers were not designed for `no_result`. Rollback therefore requires restoring
+a matched pre-M9 database backup, or first deploying an explicitly tested
+forward-compatibility change. Normal deployment remains forward-only.
 
 ## Persistent paced Live baseline (M7-M8)
 

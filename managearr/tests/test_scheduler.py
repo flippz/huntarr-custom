@@ -308,7 +308,7 @@ def test_queue_occupancy_counts_repeated_active_attempts_once(
     assert cycle["selected_count"] == 1
 
 
-def test_stale_command_only_attempt_releases_queue_capacity(
+def test_old_pending_item_still_occupies_queue_without_item_outcome(
     database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
 ):
     library, job, candidates = _library_scan(library_repo, activity_repo, candidate_repo, count=2)
@@ -322,11 +322,11 @@ def test_stale_command_only_attempt_releases_queue_capacity(
             conn, batch_id, item_id, candidates[0], "command_completed", "terminal",
             "command-only", observed_at=old + timedelta(seconds=5),
         )
-    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="stale-command-only")
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="old-pending")
     _, cycle = _run_manual(worker, scheduler_repo)
     result = cycle["libraries"][0]
-    assert result["queue_occupancy"] == 0
-    assert cycle["selected_count"] == 1
+    assert result["queue_occupancy"] == 1
+    assert cycle["selected_count"] == 0
 
 
 def test_recent_unreconciled_attempt_temporarily_occupies_queue(
@@ -352,17 +352,40 @@ def test_terminal_failure_starts_cooldown_from_durable_outcome(
         batch_id, item_id = _completed_dispatch(
             conn, dispatch_repo, library, job, candidates[0], dispatched_at=old
         )
+        _record_outcome(conn, batch_id, item_id, candidates[0], "download_failed", "terminal", "recent-failure")
         _record_outcome(
             conn, batch_id, item_id, candidates[0], "grabbed", "nonterminal",
-            "grab-before-failure", observed_at=old,
+            "late-grab-still-below-failure",
         )
-        _record_outcome(conn, batch_id, item_id, candidates[0], "download_failed", "terminal", "recent-failure")
     worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="failure-cooldown")
     _, cycle = _run_manual(worker, scheduler_repo)
     result = cycle["libraries"][0]
     reasons = {c["candidate_id"]: c["exclusion_reason"] for c in result["candidates"]}
     assert "cooldown" in reasons[candidates[0].id]
     assert result["queue_occupancy"] == 0
+
+
+def test_imported_effective_outcome_outranks_failure_and_adds_no_failure_cooldown(
+    database, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    policy_repo.update({"cooldown_minutes": 60})
+    library, job, candidates = _library_scan(library_repo, activity_repo, candidate_repo, count=1)
+    with database.connect() as conn:
+        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        batch_id, item_id = _completed_dispatch(
+            conn, dispatch_repo, library, job, candidates[0], dispatched_at=old
+        )
+        _record_outcome(conn, batch_id, item_id, candidates[0],
+                        "download_failed", "terminal", "failure-before-import")
+        _record_outcome(conn, batch_id, item_id, candidates[0],
+                        "imported", "terminal", "import-wins")
+    facts = scheduler_repo.planning_facts(
+        library.id, [candidates[0].episode_id], policy_repo.get().to_dict()
+    )
+    assert facts["imported"] == {candidates[0].episode_id}
+    assert facts["active_grabbed"] == set()
+    assert facts["cooldown"] == set()
+    assert facts["queue_occupancy"] == 0
 
 
 def test_episode_becomes_eligible_after_definitive_failure_cooldown(

@@ -214,7 +214,8 @@ async function showOutcomeDetail(batchId) {
   detail.items.forEach(item => {
     const block = document.createElement('div');
     const timeline = item.outcomes.map(event => `${event.event_type} (${event.source_endpoint}: ${event.safe_summary})`).join(' → ');
-    block.textContent = `Candidate #${item.candidate_id}, episode #${item.episode_id}: ${item.human_state}. ${timeline || 'No related evidence yet.'}`;
+    const status = item.human_status || {label: item.human_state, explanation: ''};
+    block.textContent = `Candidate #${item.candidate_id}, episode #${item.episode_id}: ${status.label}. ${status.explanation} ${timeline || 'No related evidence yet.'}`;
     root.appendChild(block);
   });
   document.getElementById('outcome-detail').hidden = false;

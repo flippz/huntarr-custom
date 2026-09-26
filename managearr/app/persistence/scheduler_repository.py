@@ -387,71 +387,84 @@ class SchedulerRepository:
                         AND i.created_at >= now() - interval '5 minutes'))
                 """, (library_id,),
             ).fetchone()["c"]
+            # Keep every planning decision on the reconciliation precedence:
+            # imported > failure > grabbed/downloading > no_result.  Ranking
+            # by ledger id is only a deterministic tie-break within a class.
+            effective_sql = """
+                WITH ranked AS (
+                    SELECT e.dispatch_item_id, e.episode_id, e.event_type, e.observed_at,
+                           row_number() OVER (
+                               PARTITION BY e.dispatch_item_id
+                               ORDER BY CASE e.event_type
+                                   WHEN 'imported' THEN 4
+                                   WHEN 'download_failed' THEN 3
+                                   WHEN 'import_failed' THEN 3
+                                   WHEN 'grabbed' THEN 2
+                                   WHEN 'downloading' THEN 2
+                                   WHEN 'no_result' THEN 1
+                                   ELSE 0 END DESC,
+                                   COALESCE(e.sonarr_event_id, 0) DESC, e.id DESC
+                           ) AS outcome_rank
+                    FROM dispatch_outcome_events e
+                    JOIN dispatch_batches b ON b.id = e.batch_id
+                    WHERE b.library_id = %s AND e.episode_id = ANY(%s)
+                      AND e.event_type IN (
+                          'imported','download_failed','import_failed',
+                          'grabbed','downloading','no_result'
+                      )
+                )
+                SELECT DISTINCT episode_id FROM ranked
+                WHERE outcome_rank = 1 AND event_type = ANY(%s)
+            """
             imported = conn.execute(
-                """
-                SELECT DISTINCT e.episode_id FROM dispatch_outcome_events e
-                JOIN dispatch_batches b ON b.id = e.batch_id
-                WHERE b.library_id = %s AND e.episode_id = ANY(%s)
-                  AND e.event_type = 'imported'
-                """, (library_id, episode_ids),
+                effective_sql, (library_id, episode_ids, ["imported"]),
             ).fetchall()
             active_grabbed = conn.execute(
-                """
-                SELECT DISTINCT grabbed.episode_id
-                FROM dispatch_outcome_events grabbed
-                JOIN dispatch_batches b ON b.id = grabbed.batch_id
-                WHERE b.library_id = %s AND grabbed.episode_id = ANY(%s)
-                  AND grabbed.event_type IN ('grabbed','downloading')
-                  AND NOT EXISTS (
-                      SELECT 1 FROM dispatch_outcome_events terminal
-                      WHERE terminal.dispatch_item_id = grabbed.dispatch_item_id
-                        AND terminal.event_type IN (
-                            'imported','download_failed','import_failed',
-                            'command_failed','command_aborted'
-                        )
-                  )
-                """, (library_id, episode_ids),
+                effective_sql, (library_id, episode_ids, ["grabbed", "downloading"]),
             ).fetchall()
             outcome_cooldown = conn.execute(
-                """
-                SELECT DISTINCT e.episode_id FROM dispatch_outcome_events e
-                JOIN dispatch_batches b ON b.id = e.batch_id
-                WHERE b.library_id = %s AND e.episode_id = ANY(%s)
-                  AND e.event_type IN ('download_failed','import_failed')
-                  AND NOT EXISTS (
-                      SELECT 1 FROM dispatch_outcome_events imported
-                      WHERE imported.dispatch_item_id = e.dispatch_item_id
-                        AND imported.event_type = 'imported'
-                  )
-                  AND e.observed_at >= now() - (%s * interval '1 minute')
-                """, (library_id, episode_ids, cooldown),
+                effective_sql.replace(
+                    "WHERE outcome_rank = 1 AND event_type = ANY(%s)",
+                    "WHERE outcome_rank = 1 AND event_type = ANY(%s) "
+                    "AND observed_at >= now() - (%s * interval '1 minute')",
+                ),
+                (library_id, episode_ids, ["download_failed", "import_failed"], cooldown),
             ).fetchall()
             queue = conn.execute(
                 """
                 WITH dispatched AS (
-                    SELECT i.id, i.episode_id, i.created_at
+                    SELECT i.id, i.episode_id
                     FROM dispatch_batch_items i
                     JOIN dispatch_batches b ON b.id = i.batch_id
                     WHERE b.library_id = %s AND b.mode = 'manual'
                       AND b.state IN ('completed','partial') AND i.state = 'dispatched'
+                ), ranked AS (
+                    SELECT e.dispatch_item_id, e.event_type,
+                           row_number() OVER (
+                               PARTITION BY e.dispatch_item_id
+                               ORDER BY CASE e.event_type
+                                   WHEN 'imported' THEN 4
+                                   WHEN 'download_failed' THEN 3
+                                   WHEN 'import_failed' THEN 3
+                                   WHEN 'grabbed' THEN 2
+                                   WHEN 'downloading' THEN 2
+                                   WHEN 'no_result' THEN 1
+                                   ELSE 0 END DESC,
+                                   COALESCE(e.sonarr_event_id, 0) DESC, e.id DESC
+                           ) AS outcome_rank
+                    FROM dispatch_outcome_events e
+                    JOIN dispatched d ON d.id = e.dispatch_item_id
+                    WHERE e.event_type IN (
+                        'imported','download_failed','import_failed',
+                        'grabbed','downloading','no_result'
+                    )
                 ), active_episodes AS (
                     SELECT DISTINCT d.episode_id
                     FROM dispatched d
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM dispatch_outcome_events terminal
-                        WHERE terminal.dispatch_item_id = d.id
-                          AND terminal.event_type IN (
-                              'imported','download_failed','import_failed',
-                              'command_failed','command_aborted'
-                          )
-                    ) AND (
-                        d.created_at >= now() - interval '5 minutes'
-                        OR EXISTS (
-                            SELECT 1 FROM dispatch_outcome_events active
-                            WHERE active.dispatch_item_id = d.id
-                              AND active.event_type IN ('grabbed','downloading')
-                        )
-                    )
+                    LEFT JOIN ranked r
+                      ON r.dispatch_item_id = d.id AND r.outcome_rank = 1
+                    WHERE r.event_type IS NULL
+                       OR r.event_type IN ('grabbed','downloading')
                 )
                 SELECT count(*) AS c FROM active_episodes
                 """, (library_id,),

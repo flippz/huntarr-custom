@@ -458,13 +458,17 @@ def test_no_result_grace_boundary_is_centralized_and_append_only(
     install_reconciliation_at(app, stub, created + timedelta(seconds=899))
     before = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
     assert before["batch"]["reconciliation_state"] == "unresolved"
-    assert before["item_results"][0]["human_state"] == "Pending"
+    assert before["item_results"][0]["human_status"] == {
+        "code": "pending", "label": "Pending",
+        "explanation": "No item outcome evidence has been observed yet.",
+    }
 
     install_reconciliation_at(app, stub, created + timedelta(seconds=900))
     boundary = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
     assert boundary["batch"]["reconciliation_state"] == "no_result"
     assert boundary["item_results"][0]["latest_outcome"] == "no_result"
-    assert boundary["item_results"][0]["human_state"] == "No result"
+    assert boundary["item_results"][0]["human_status"]["code"] == "no_result"
+    assert boundary["item_results"][0]["human_status"]["label"] == "No result"
     detail = client.get(f"/api/v1/dispatch-batches/{batch.id}/outcomes").get_json()["outcomes"]
     assert [e["event_type"] for e in detail["items"][0]["outcomes"]].count("no_result") == 1
 
@@ -507,6 +511,44 @@ def test_late_evidence_corrects_no_result_by_precedence_and_survives_restart(
     assert terminal["item_results"][0]["latest_outcome"] == "imported"
 
 
+def test_mixed_terminal_proof_and_no_result_progresses_deterministically(
+    app, client, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    _, _, batch = make_batch(
+        library_repo, activity_repo, candidate_repo, dispatch_repo,
+        episode_ids=(101, 102),
+    )
+    created = max(datetime.fromisoformat(item.updated_at) for item in batch.items)
+    install_reconciliation_at(app, StubReconciliationClient(history={
+        101: [history_record(20, "downloadFolderImported", 101)],
+    }), created + timedelta(minutes=15))
+    mixed = client.post(
+        f"/api/v1/dispatch-batches/{batch.id}/reconcile"
+    ).get_json()["reconciliation"]
+    assert mixed["batch"]["reconciliation_state"] == "no_result"
+    assert [row["latest_outcome"] for row in mixed["item_results"]] == ["imported", "no_result"]
+
+    install_reconciliation_at(app, StubReconciliationClient(history={
+        101: [history_record(20, "downloadFolderImported", 101)],
+        102: [history_record(21, "grabbed", 102)],
+    }), created + timedelta(minutes=16))
+    active = client.post(
+        f"/api/v1/dispatch-batches/{batch.id}/reconcile"
+    ).get_json()["reconciliation"]
+    assert active["batch"]["reconciliation_state"] == "partial"
+    assert [row["latest_outcome"] for row in active["item_results"]] == ["imported", "grabbed"]
+
+    install_reconciliation_at(app, StubReconciliationClient(history={
+        101: [history_record(20, "downloadFolderImported", 101)],
+        102: [history_record(22, "downloadFailed", 102)],
+    }), created + timedelta(minutes=17))
+    resolved = client.post(
+        f"/api/v1/dispatch-batches/{batch.id}/reconcile"
+    ).get_json()["reconciliation"]
+    assert resolved["batch"]["reconciliation_state"] == "resolved"
+    assert [row["latest_outcome"] for row in resolved["item_results"]] == ["imported", "download_failed"]
+
+
 def test_ambiguous_accepted_attempt_never_closes_as_no_result(
     app, client, library_repo, activity_repo, candidate_repo, dispatch_repo
 ):
@@ -518,6 +560,33 @@ def test_ambiguous_accepted_attempt_never_closes_as_no_result(
     assert result["batch"]["command_observed_state"] == "completed"
     assert result["batch"]["reconciliation_state"] == "unresolved"
     assert result["item_results"][0]["latest_outcome"] == "unresolved"
+    assert result["item_results"][0]["human_status"]["code"] == "ambiguous_manual_review"
+    assert result["item_results"][0]["human_status"]["label"] == "Ambiguous/manual review"
+    detail = client.get(f"/api/v1/dispatch-batches/{batch.id}/outcomes").get_json()["outcomes"]
+    assert detail["items"][0]["human_status"]["code"] == "ambiguous_manual_review"
+
+
+def test_failed_dispatch_item_has_structured_failed_human_status(
+    client, library_repo, activity_repo, candidate_repo, dispatch_repo
+):
+    _, job, batch = make_batch(
+        library_repo, activity_repo, candidate_repo, dispatch_repo,
+        state="failed", command_id=None,
+    )
+    candidate = candidate_repo.list_for_job(job.id)[0]
+    with dispatch_repo.db.connect() as conn:
+        dispatch_repo.create_items(conn, batch.id, [{
+            "candidate_id": candidate.id, "episode_id": candidate.episode_id,
+            "series_id": candidate.series_id, "series_title": candidate.series_title,
+            "season_number": candidate.season_number, "episode_number": candidate.episode_number,
+            "state": "failed", "reason": "dispatch failed",
+        }])
+    detail = client.get(f"/api/v1/dispatch-batches/{batch.id}/outcomes").get_json()["outcomes"]
+    item = detail["items"][0]
+    assert item["latest_outcome"] is None
+    assert item["human_status"]["code"] == "failed"
+    assert item["human_status"]["label"] == "Failed"
+    assert "dispatch failed" in item["human_status"]["explanation"].lower()
 
 
 def test_pruned_command_requires_durable_completed_state_before_fallback(

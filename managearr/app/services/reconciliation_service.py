@@ -38,11 +38,25 @@ OUTCOME_PRECEDENCE = {
 }
 FAILURE_TYPES = {"download_failed", "import_failed"}
 TERMINAL_ITEM_TYPES = {"imported", *FAILURE_TYPES}
-HUMAN_OUTCOME = {
-    "pending": "Pending", "grabbed": "Grabbed/downloading",
-    "downloading": "Grabbed/downloading", "imported": "Imported",
-    "download_failed": "Failed", "import_failed": "Failed",
-    "no_result": "No result",
+HUMAN_STATUS = {
+    "pending": {"code": "pending", "label": "Pending",
+                "explanation": "No item outcome evidence has been observed yet."},
+    "grabbed": {"code": "grabbed_downloading", "label": "Grabbed/downloading",
+                "explanation": "Sonarr recorded a grab or an active download."},
+    "downloading": {"code": "grabbed_downloading", "label": "Grabbed/downloading",
+                    "explanation": "Sonarr recorded a grab or an active download."},
+    "imported": {"code": "imported", "label": "Imported",
+                 "explanation": "Sonarr recorded a completed import."},
+    "download_failed": {"code": "failed", "label": "Failed",
+                        "explanation": "Sonarr recorded a download or import failure."},
+    "import_failed": {"code": "failed", "label": "Failed",
+                      "explanation": "Sonarr recorded a download or import failure."},
+    "no_result": {"code": "no_result", "label": "No result",
+                  "explanation": "No grab, download, import, or failure appeared during the grace period."},
+    "ambiguous": {"code": "ambiguous_manual_review", "label": "Ambiguous/manual review",
+                  "explanation": "The dispatch write is ambiguous and requires operator review."},
+    "dispatch_failed": {"code": "failed", "label": "Failed",
+                        "explanation": "The item dispatch failed before a definitive outcome was recorded."},
 }
 
 
@@ -83,6 +97,18 @@ def effective_item_event(events: list[dict]) -> dict | None:
         OUTCOME_PRECEDENCE[event["event_type"]], event.get("sonarr_event_id") or 0,
         event.get("id") or 0,
     ))
+
+
+def human_status(item, outcome: str) -> dict:
+    # Local dispatch certainty is more fundamental than downstream evidence.
+    # Never present an ambiguous write as a normal pending/result item.
+    if item.state == "ambiguous":
+        key = "ambiguous"
+    elif item.state == "failed":
+        key = "dispatch_failed"
+    else:
+        key = outcome
+    return dict(HUMAN_STATUS[key])
 
 
 class ReconciliationService:
@@ -155,17 +181,22 @@ class ReconciliationService:
             chosen = effective_item_event(by_item[item.id])
             outcome = chosen["event_type"] if chosen else "pending"
             effective.append(outcome)
+            status = human_status(item, outcome)
             results.append({"dispatch_item_id": item.id, "candidate_id": item.candidate_id,
                             "episode_id": item.episode_id,
                             "latest_outcome": outcome if chosen else "unresolved",
-                            "human_state": HUMAN_OUTCOME[outcome],
+                            "human_status": status, "human_state": status["label"],
                             "terminal": outcome in TERMINAL_ITEM_TYPES or outcome == "no_result"})
         if truncated:
             return "partial", "Sonarr exceeded the bounded read limit; manual review is required.", results
-        if effective and all(value == "no_result" for value in effective):
-            return "no_result", "Completed search produced no grab, download, import, or failure evidence within 15 minutes.", results
-        if effective and all(value in TERMINAL_ITEM_TYPES or value == "no_result" for value in effective):
+        if effective and all(value in TERMINAL_ITEM_TYPES for value in effective):
             return "resolved", f"Definitive terminal outcomes were recorded for all {len(items)} dispatch items.", results
+        if (effective and any(value == "no_result" for value in effective)
+                and all(value in TERMINAL_ITEM_TYPES or value == "no_result" for value in effective)):
+            proof = sum(value in TERMINAL_ITEM_TYPES for value in effective)
+            empty = sum(value == "no_result" for value in effective)
+            return "no_result", (f"Definitive proof was recorded for {proof} dispatch item(s); "
+                                 f"{empty} completed search item(s) produced no result within 15 minutes."), results
         if any(value != "pending" for value in effective):
             count = sum(value != "pending" for value in effective)
             return "partial", f"Outcome evidence was recorded for {count} of {len(items)} dispatch items; others remain pending.", results
@@ -338,7 +369,9 @@ class ReconciliationService:
             item_data["outcomes"] = by_item.get(item.id, [])
             item_data["latest_outcome"] = effective_item_event(item_data["outcomes"])
             outcome_type = (item_data["latest_outcome"] or {}).get("event_type", "pending")
-            item_data["human_state"] = HUMAN_OUTCOME[outcome_type]
+            status = human_status(item, outcome_type)
+            item_data["human_status"] = status
+            item_data["human_state"] = status["label"]
             items.append(item_data)
         return {"batch": batch.to_dict(), "attempts": [a.to_dict() for a in attempts],
                 "batch_events": batch_events, "items": items,
