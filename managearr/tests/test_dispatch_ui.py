@@ -57,4 +57,4 @@ def test_settings_explains_safe_individual_upgrade_search(client):
     html = client.get("/settings").get_data(as_text=True)
     assert "Search individual episode quality upgrades" in html
     assert "No season packs, file deletion, or replacement" in html
-    assert "up to 20% of shared caps is reserved for upgrades" in html
+    assert "roughly 20% of shared capacity is reserved for upgrades" in html

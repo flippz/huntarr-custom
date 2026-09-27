@@ -584,11 +584,12 @@ ordering is deterministic:
 Missing candidates are excluded when `missing_enabled` is false. Quality-upgrade
 candidates are excluded independently when `upgrades_enabled` is false. Under
 shared scan and planning caps, the configured order is retained within each kind.
-When both kinds are available, up to 20% of the cap (at least one slot where the
-planning cap is at least two) is reserved for Upgrade; unused reserved capacity
-returns to either kind. Missing therefore retains at least 80% when both pools are
-large without starving upgrades. Audit rows snapshot the candidate kind and report
-upgrade planning as `enabled` or `disabled`.
+When both kinds are available, roughly 20% of the cap is reserved for Upgrade,
+with a minimum of one slot when the planning cap is at least two; that one-slot
+minimum can exceed 20% for small caps. Unused reserved capacity returns to either
+kind. Missing retains at least 80% for normal caps of five or more without starving
+upgrades. Audit rows snapshot the candidate kind and report upgrade planning as
+`enabled` or `disabled`.
 
 The planner conservatively reads the durable manual dispatch/outcome ledger to
 exclude duplicate episodes, imported outcomes, live reservations, and episodes
