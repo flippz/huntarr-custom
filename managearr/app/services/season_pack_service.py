@@ -1,7 +1,8 @@
 """Manual-only strict Sonarr season-pack preview and confirmed exact grab."""
 import hashlib, secrets
-from ..adapters.sonarr_client import SonarrClient, SonarrError, SonarrConnectionError
+from ..adapters.sonarr_client import SonarrClient, SonarrError, SonarrPostAmbiguousError, SonarrPostRejectedError
 from ..domain.season_pack import PROTOCOLS, SeasonInventory, evaluate_release, strict_int
+from ..persistence.season_pack_repository import library_identity_digest
 
 class SeasonPackService:
     def __init__(self,repo,libraries,live_repo,scheduler_repo,client_factory=SonarrClient,timeout=None):
@@ -47,12 +48,14 @@ class SeasonPackService:
         except SonarrError as e:return None,str(e)
         accepted=[];rejected=[]
         for i,r in enumerate(raw):
-            decision,reasons=evaluate_release(r,inv,settings["protocol"],settings["allow_cutoff_override"])
+            route_evidence={"id":match["id"],"enabled":match["enabled"],"protocol":match["protocol"]}
+            decision,reasons=evaluate_release(r,inv,settings["protocol"],settings["allow_cutoff_override"],download_client_id=settings["download_client_id"],routing_evidence=route_evidence)
             if decision:accepted.append((decision.weight,i,decision))
             else:rejected.append({"title":r.get("title")[:200] if isinstance(r,dict) and isinstance(r.get("title"),str) else "(malformed release)","reasons":reasons[:12]})
         accepted.sort(key=lambda x:(x[0],x[1]));selected=accepted[0][2] if accepted else None
         token=secrets.token_urlsafe(32);digest=hashlib.sha256(token.encode()).hexdigest()
         snapshot={k:settings[k] for k in ("protocol","download_client_id","allow_cutoff_override","hourly_grab_cap","cooldown_minutes","pacing_seconds")}
+        snapshot.update({"library_id":lib.id,"library_type":lib.type,"library_enabled":lib.enabled,"library_identity_digest":library_identity_digest(lib.to_dict()),"library_config_generation":lib.updated_at})
         audit=self.repo.create_preview({"library_id":library_id,"series_id":sid,"season_number":snum,"series_title":inv.series_title,"selected_fingerprint":selected.fingerprint if selected else None,"selected_title":selected.title if selected else None,"selected_protocol":selected.protocol if selected else None,"selected_indexer_id":selected.indexer_id if selected else None,"episode_count":len(inv.episode_ids),"cutoff_override":selected.cutoff_override if selected else False,"rejected_summary":rejected[:100],"confirmation_digest":digest,"settings_snapshot":snapshot})
         return {"audit":self.safe_audit(audit),"selected":selected.safe_dict() if selected else None,"rejected":rejected,"confirmation_token":token if selected else None,"expires_in_seconds":600},None
     def confirm(self,audit_id,payload):
@@ -70,9 +73,12 @@ class SeasonPackService:
         if not current["allowed"] or current["generation"]!=row["live_generation"]:return self.safe_audit(self.repo.finalize(audit_id,"blocked","Live authorization changed before grab")),None
         lib=self.libraries.get(row["library_id"]);s=row["settings_snapshot"];attempted=False
         try:
+            if not lib or lib.type!="sonarr" or not lib.enabled or library_identity_digest(lib.to_dict())!=s.get("library_identity_digest") or lib.updated_at!=s.get("library_config_generation"):
+                return self.safe_audit(self.repo.finalize(audit_id,"blocked","library routing identity changed since preview")),None
             client=self._client(lib)
             current_settings=self.repo.settings(row["library_id"])
-            if not current_settings.get("enabled") or any(current_settings.get(k)!=s.get(k) for k in s):
+            setting_keys=("protocol","download_client_id","allow_cutoff_override","hourly_grab_cap","cooldown_minutes","pacing_seconds")
+            if not current_settings.get("enabled") or any(current_settings.get(k)!=s.get(k) for k in setting_keys):
                 return self.safe_audit(self.repo.finalize(audit_id,"blocked","season-pack settings changed since preview")),None
             clients=client.get_download_clients()
             route=next((x for x in clients if x["id"]==s["download_client_id"]),None)
@@ -82,17 +88,23 @@ class SeasonPackService:
             if e:return self.safe_audit(self.repo.finalize(audit_id,"blocked",e)),None
             matches=[]
             for raw in client.search_season_releases(row["series_id"],row["season_number"]):
-                d,_=evaluate_release(raw,inv,s["protocol"],s["allow_cutoff_override"])
+                route_evidence={"id":route["id"],"enabled":route["enabled"],"protocol":route["protocol"]}
+                d,_=evaluate_release(raw,inv,s["protocol"],s["allow_cutoff_override"],download_client_id=s["download_client_id"],routing_evidence=route_evidence)
                 if d and d.fingerprint==row["selected_fingerprint"]:matches.append(d)
             if len(matches)!=1:return self.safe_audit(self.repo.finalize(audit_id,"blocked","exact previewed release is missing or ambiguous on revalidation")),None
             d=matches[0];body={"guid":d.guid,"indexerId":d.indexer_id,"downloadClientId":s["download_client_id"]}
             if d.cutoff_override:body.update({"shouldOverride":True,"seriesId":inv.series_id,"episodeIds":list(d.episode_ids),"quality":d.quality,"languages":d.languages})
-            attempted=True
-            client.grab_release(body)
-        except SonarrConnectionError as e:return self.safe_audit(self.repo.finalize(audit_id,"ambiguous" if attempted else "blocked",str(e))),None
-        except SonarrError as e:return self.safe_audit(self.repo.finalize(audit_id,"blocked",str(e))),None
-        except Exception:return self.safe_audit(self.repo.finalize(audit_id,"ambiguous" if attempted else "blocked","unexpected error after grab attempt")),None
-        return self.safe_audit(self.repo.finalize(audit_id,"completed")),None
+            with self.repo.authorized_write(audit_id,row["live_generation"]) as (conn,authorization_error):
+                if authorization_error:return self.safe_audit(self.repo.finalize(audit_id,"blocked",authorization_error,conn=conn)),None
+                try:
+                    attempted=True
+                    client.grab_release(body)
+                except SonarrPostRejectedError as e:return self.safe_audit(self.repo.finalize(audit_id,"blocked",str(e),conn=conn)),None
+                except SonarrPostAmbiguousError as e:return self.safe_audit(self.repo.finalize(audit_id,"ambiguous",str(e),conn=conn)),None
+                except Exception:return self.safe_audit(self.repo.finalize(audit_id,"ambiguous","unexpected error after grab attempt",conn=conn)),None
+                return self.safe_audit(self.repo.finalize(audit_id,"completed",conn=conn)),None
+        except SonarrError as e:return self.safe_audit(self.repo.finalize(audit_id,"ambiguous" if attempted else "blocked",str(e))),None
+        except Exception:return self.safe_audit(self.repo.finalize(audit_id,"ambiguous" if attempted else "blocked","unexpected error after grab attempt" if attempted else "unexpected error before grab attempt")),None
     def _live_status(self):
         mode=self.scheduler_repo.get_settings().mode;c=self.live_repo.get_control();reasons=[]
         if mode!="live":reasons.append("scheduler mode is not live")

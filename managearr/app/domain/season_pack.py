@@ -29,12 +29,18 @@ class SeasonInventory:
     def parse(cls, series, episodes, series_id, season_number):
         if not strict_int(series_id, positive=True) or not strict_int(season_number, positive=True):
             return None, "series_id and season_number must be positive integers; specials are not supported"
-        if not isinstance(series, dict) or series.get("id") != series_id:
+        if not isinstance(series, dict) or not strict_int(series.get("id"),positive=True) or series.get("id") != series_id:
             return None, "Sonarr returned malformed or mismatched series data"
         if series.get("seriesType") != "standard": return None, "daily and anime series are not supported for strict season packs"
         title=series.get("title")
         if not isinstance(title,str) or not title or len(title)>255 or not isinstance(episodes,list): return None,"Sonarr returned malformed series or episode data"
-        rows=[e for e in episodes if isinstance(e,dict) and e.get("seasonNumber")==season_number]
+        for episode in episodes:
+            season=episode.get("seasonNumber") if isinstance(episode,dict) else None
+            if (not isinstance(episode,dict) or not strict_int(episode.get("id"),positive=True)
+                    or not isinstance(season,int) or isinstance(season,bool) or season<0
+                    or not strict_int(episode.get("episodeNumber"),positive=True)):
+                return None,"Sonarr episode inventory is malformed or ambiguous"
+        rows=[e for e in episodes if e["seasonNumber"]==season_number]
         if not rows:return None,"Sonarr has no authoritative episodes for the requested season"
         ids,numbers=[],[]
         for episode in rows:
@@ -46,10 +52,10 @@ class SeasonInventory:
 
 @dataclass(frozen=True)
 class ReleaseDecision:
-    guid:str; indexer_id:int; title:str; protocol:str; weight:int; episode_ids:tuple[int,...]; quality:dict; languages:list; cutoff_override:bool
+    guid:str; indexer_id:int; title:str; protocol:str; weight:int; episode_ids:tuple[int,...]; quality:dict; languages:list; cutoff_override:bool; decision_binding:dict
     @property
     def fingerprint(self):
-        raw=json.dumps([self.guid,self.indexer_id,self.protocol,self.episode_ids],separators=(",",":"))
+        raw=json.dumps(self.decision_binding,sort_keys=True,separators=(",",":"),ensure_ascii=False)
         return hashlib.sha256(raw.encode()).hexdigest()
     def safe_dict(self):
         return {"fingerprint":self.fingerprint,"title":self.title,"protocol":self.protocol,"indexer_id":self.indexer_id,"episode_count":len(self.episode_ids),"cutoff_override":self.cutoff_override,"release_weight":self.weight}
@@ -57,14 +63,14 @@ class ReleaseDecision:
 def _quality_ok(value):
     if not isinstance(value,dict):return False
     q,r=value.get("quality"),value.get("revision")
-    return isinstance(q,dict) and strict_int(q.get("id")) and isinstance(q.get("name"),str) and bool(q["name"]) and isinstance(r,dict) and strict_int(r.get("version")) and strict_int(r.get("real")) and isinstance(r.get("isRepack"),bool)
+    return isinstance(q,dict) and strict_int(q.get("id"),positive=True) and isinstance(q.get("name"),str) and bool(q["name"]) and isinstance(r,dict) and strict_int(r.get("version")) and strict_int(r.get("real")) and isinstance(r.get("isRepack"),bool)
 
-def evaluate_release(raw,inventory,protocol,allow_cutoff):
+def evaluate_release(raw,inventory,protocol,allow_cutoff,*,download_client_id=None,routing_evidence=None):
     reasons=[]
     if not isinstance(raw,dict):return None,["release is not an object"]
     if raw.get("fullSeason") is not True:reasons.append("not a confirmed full-season release")
-    if raw.get("mappedSeriesId")!=inventory.series_id:reasons.append("mapped series does not match")
-    if raw.get("mappedSeasonNumber")!=inventory.season_number:reasons.append("mapped season does not match")
+    if not strict_int(raw.get("mappedSeriesId"),positive=True) or raw.get("mappedSeriesId")!=inventory.series_id:reasons.append("mapped series does not match")
+    if not strict_int(raw.get("mappedSeasonNumber"),positive=True) or raw.get("mappedSeasonNumber")!=inventory.season_number:reasons.append("mapped season does not match")
     title=raw.get("title")
     if not isinstance(title,str) or not title or len(title)>512:reasons.append("release title is malformed")
     else:
@@ -82,14 +88,14 @@ def evaluate_release(raw,inventory,protocol,allow_cutoff):
     else:
         nums=[]
         for entry in mapped:
-            if not isinstance(entry,dict) or not strict_int(entry.get("id"),positive=True) or entry.get("seasonNumber")!=inventory.season_number or not strict_int(entry.get("episodeNumber"),positive=True):
+            if not isinstance(entry,dict) or not strict_int(entry.get("id"),positive=True) or not strict_int(entry.get("seasonNumber"),positive=True) or entry.get("seasonNumber")!=inventory.season_number or not strict_int(entry.get("episodeNumber"),positive=True):
                 reasons.append("mapped episode information is malformed or cross-season");break
             mapped_ids.append(entry["id"]);nums.append(entry["episodeNumber"])
         if len(mapped_ids)!=len(set(mapped_ids)) or len(nums)!=len(set(nums)):reasons.append("mapped episodes are duplicated or multi-episode ambiguous")
         if set(mapped_ids)!=set(inventory.episode_ids):reasons.append("release is not authoritatively complete for the season")
     quality,languages=raw.get("quality"),raw.get("languages")
     if not _quality_ok(quality):reasons.append("quality model is malformed")
-    if not isinstance(languages,list) or any(not isinstance(x,dict) or not strict_int(x.get("id")) or not isinstance(x.get("name"),str) or not x.get("name") for x in languages):reasons.append("language model is malformed")
+    if not isinstance(languages,list) or any(not isinstance(x,dict) or not strict_int(x.get("id"),positive=True) or not isinstance(x.get("name"),str) or not x.get("name") for x in languages):reasons.append("language model is malformed")
     approved,rejected,temp,rejections=raw.get("approved"),raw.get("rejected"),raw.get("temporarilyRejected"),raw.get("rejections")
     override=False
     if approved is True and rejected is False and temp is False and rejections==[]:pass
@@ -100,4 +106,14 @@ def evaluate_release(raw,inventory,protocol,allow_cutoff):
     if reasons:return None,reasons
     weight=raw.get("releaseWeight")
     if not strict_int(weight):weight=2**31-1
-    return ReleaseDecision(guid,indexer,title,actual_protocol,weight,tuple(sorted(mapped_ids)),quality,languages,override),[]
+    mapped_normalized=sorted(({"id":x["id"],"season_number":x["seasonNumber"],"episode_number":x["episodeNumber"]} for x in mapped),key=lambda x:(x["episode_number"],x["id"]))
+    override_payload=None
+    if override:
+        override_payload={"shouldOverride":True,"seriesId":inventory.series_id,"episodeIds":sorted(mapped_ids),"quality":quality,"languages":languages}
+    binding={
+        "identity":{"guid":guid,"title":title,"indexer_id":indexer,"series_id":inventory.series_id,"season_number":inventory.season_number},
+        "release":{"protocol":actual_protocol,"weight":weight,"quality":quality,"languages":languages,"mapped_episodes":mapped_normalized},
+        "sonarr_decision":{"full_season":raw.get("fullSeason"),"download_allowed":raw.get("downloadAllowed"),"approved":approved,"rejected":rejected,"temporarily_rejected":temp,"rejections":rejections,"cutoff_override":override,"override_payload":override_payload},
+        "routing":{"download_client_id":download_client_id,"evidence":routing_evidence},
+    }
+    return ReleaseDecision(guid,indexer,title,actual_protocol,weight,tuple(sorted(mapped_ids)),quality,languages,override,binding),[]

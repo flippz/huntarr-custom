@@ -3,7 +3,7 @@
 {% block content %}
 <h1>Strict Sonarr season packs</h1>
 <p class="readonly-notice"><strong>Manual only.</strong> Preview uses GET requests. A grab requires an exact release preview, a second explicit confirmation, and active Live authorization. Managearr never sends broad SeasonSearch.</p>
-<p class="readonly-notice">Defaults are off. Simulation never searches releases or grabs. Pause and Emergency Stop block confirmation.</p>
+<p class="readonly-notice">Defaults are off. A manual preview performs read-only interactive release GETs even while the scheduler is Off or Simulate. Scheduler simulation and automatic scheduler runs never search releases or grab; Pause and Emergency Stop block confirmation.</p>
 <section class="card">
   <h2>Library routing and limits</h2>
   <label>Sonarr library <select id="sp-library"></select></label>

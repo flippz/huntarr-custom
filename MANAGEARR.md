@@ -1037,9 +1037,16 @@ The Season Packs page exposes routing/limits, a read-only preview with selected 
 | Live running, authorization generation unchanged | allowed | manual confirmation only |
 | settings/client/release changed after preview | new facts shown | blocked on revalidation |
 | hourly cap, target cooldown, or pacing interval active | allowed | blocked atomically |
-| timeout/connection loss after POST attempt | n/a | durable ambiguous; never retried |
+| timeout/connection loss, 5xx, malformed 2xx, or any unknown failure after POST attempt | n/a | durable ambiguous; consumes cap/cooldown and is never retried |
 
-M11 is not wired into the scheduler or LiveDispatchCoordinator; automatic Live season-pack grabbing is intentionally absent. Simulation never calls release search or grab methods. Existing individual EpisodeSearch behavior remains unchanged.
+Confirmation finishes every Sonarr GET and release revalidation first, then takes
+short-lived database row locks and rechecks scheduler mode, Live state and exact
+authorization generation, library routing identity/config generation, and season-pack
+settings immediately before the one POST. Those locks make a concurrent Pause,
+Emergency Stop, mode change, library edit, or settings edit linearize either before
+the check (and block the POST) or after the bounded POST transaction.
+
+M11 is not wired into the scheduler or LiveDispatchCoordinator; automatic Live season-pack grabbing is intentionally absent. A user-requested manual preview performs the read-only interactive release GET even when scheduler mode is Off or Simulate. Scheduler simulation and automatic scheduler runs never call release search or grab methods. Existing individual EpisodeSearch behavior remains unchanged.
 
 ### Explicit M12 destructive-replacement boundary
 

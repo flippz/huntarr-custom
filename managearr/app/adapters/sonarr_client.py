@@ -46,6 +46,12 @@ class SonarrNotFoundError(SonarrResponseError):
 class SonarrDataError(SonarrError):
     """Sonarr returned a response that doesn't match the expected shape."""
 
+class SonarrPostRejectedError(SonarrResponseError):
+    """The release POST received a definite 4xx HTTP rejection."""
+
+class SonarrPostAmbiguousError(SonarrError):
+    """A release POST was attempted and acceptance cannot be disproved."""
+
 
 def _safe_join(base_url: str, path: str) -> str:
     """Join a configured base URL with a fixed, adapter-controlled path.
@@ -351,9 +357,43 @@ class SonarrClient:
         if not isinstance(body, dict) or set(body) - allowed or not isinstance(body.get("guid"), str) or not body["guid"]: raise ValueError("invalid exact release grab body")
         for key in ("indexerId", "downloadClientId"):
             if not strict_int(body.get(key), positive=True): raise ValueError("invalid exact release grab body")
-        data = self._post("/api/v3/release", body)
-        if data is not None and not isinstance(data, dict): raise SonarrDataError("Sonarr release grab response was malformed")
-        return data or {}
+        override_keys={"shouldOverride","seriesId","episodeIds","quality","languages"}
+        if body.get("shouldOverride") is True:
+            episode_ids=body.get("episodeIds")
+            if (not strict_int(body.get("seriesId"),positive=True) or not isinstance(episode_ids,list) or not episode_ids
+                    or any(not strict_int(x,positive=True) for x in episode_ids) or len(episode_ids)!=len(set(episode_ids))
+                    or not isinstance(body.get("quality"),dict) or not isinstance(body.get("languages"),list)):
+                raise ValueError("invalid exact release grab body")
+        elif set(body)&override_keys:
+            raise ValueError("invalid exact release grab body")
+        url = _safe_join(self._base_url, "/api/v3/release")
+        headers = {"X-Api-Key": self._api_key}
+        try:
+            response = self._session.post(url, headers=headers, json=body, timeout=self._timeout)
+        except requests.exceptions.RequestException as exc:
+            raise SonarrPostAmbiguousError("Sonarr release grab outcome is unknown") from exc
+        if not response.ok:
+            if not 400 <= response.status_code < 500:
+                raise SonarrPostAmbiguousError(f"Sonarr release grab outcome is unknown after HTTP {response.status_code}")
+            reason=""
+            try:
+                problem=response.json()
+                if isinstance(problem,list):
+                    texts=[x.get("errorMessage") for x in problem if isinstance(x,dict)]
+                    texts=[x for x in texts if isinstance(x,str) and 0<len(x)<=300]
+                    reason="; ".join(texts[:5])
+            except (ValueError,TypeError):pass
+            suffix=f": {reason}" if reason else ""
+            raise SonarrPostRejectedError(f"Sonarr definitely rejected the release grab with HTTP {response.status_code}{suffix}")
+        try:
+            data=response.json()
+        except (ValueError, TypeError) as exc:
+            raise SonarrPostAmbiguousError("Sonarr release grab returned an invalid success response") from exc
+        if (not isinstance(data,dict) or not isinstance(data.get("guid"),str) or not data["guid"]
+                or not strict_int(data.get("indexerId"),positive=True)
+                or data["guid"]!=body["guid"] or data["indexerId"]!=body["indexerId"]):
+            raise SonarrPostAmbiguousError("Sonarr release grab returned an invalid success response")
+        return data
 
     def search_episodes(self, episode_ids: list[int]) -> dict:
         """The only write operation this adapter exposes: dispatch one

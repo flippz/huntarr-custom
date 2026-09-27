@@ -1,6 +1,12 @@
 """M11 settings and append-only manual season-pack audit."""
 from datetime import datetime, timedelta, timezone
-import json
+from contextlib import contextmanager
+import hashlib, json
+
+def library_identity_digest(row):
+    if row is None:return None
+    raw=json.dumps({"id":row["id"],"type":row["type"],"enabled":row["enabled"],"url":row["url"],"api_key":row["api_key"]},sort_keys=True,separators=(",",":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 class SeasonPackRepository:
     LOCK_CLASS=87235
@@ -29,6 +35,7 @@ class SeasonPackRepository:
             if row["state"]=="dispatching" and row["dispatch_started_at"] and now-row["dispatch_started_at"]>timedelta(minutes=5):
                 row=dict(c.execute("UPDATE season_pack_audit SET state='ambiguous',error_summary='grab reservation expired; inspect Sonarr before any retry',updated_at=now() WHERE id=%s RETURNING *",(audit_id,)).fetchone())
             if row["state"]!="previewed":return row,None
+            if row["library_id"] is None:return None,"preview library no longer exists"
             c.execute("SELECT pg_advisory_xact_lock(%s,%s)",(self.LOCK_CLASS,row["library_id"]))
             if row["confirmation_digest"]!=digest:return None,"confirmation token is invalid"
             if now-row["created_at"]>timedelta(minutes=10):return None,"preview expired; create a new preview"
@@ -41,7 +48,34 @@ class SeasonPackRepository:
             if cool:return None,"season is in cooldown or has an ambiguous prior grab"
             c.execute("UPDATE season_pack_audit SET state='dispatching',live_generation=%s,dispatch_started_at=%s,updated_at=%s WHERE id=%s",(live_generation,now,now,audit_id))
         return self.get(audit_id),None
-    def finalize(self,audit_id,state,error=""):
+    @contextmanager
+    def authorized_write(self,audit_id,expected_generation):
+        """Linearize the last authorization check with the release POST.
+
+        Shared row locks prevent mode, Live authorization, settings, or library
+        routing changes from committing between this check and the write. The
+        transaction is deliberately held only around this single bounded POST.
+        """
+        with self.db.connect() as c:
+            row=c.execute("SELECT * FROM season_pack_audit WHERE id=%s FOR UPDATE",(audit_id,)).fetchone()
+            if not row or row["state"]!="dispatching":yield c,"season-pack reservation is no longer dispatching";return
+            row=dict(row);c.execute("SELECT pg_advisory_xact_lock(%s,%s)",(self.LOCK_CLASS,row["library_id"]))
+            scheduler=c.execute("SELECT mode FROM scheduler_settings WHERE id=1 FOR SHARE").fetchone()
+            live=c.execute("SELECT authorization_state,authorization_generation FROM live_control WHERE id=1 FOR SHARE").fetchone()
+            library=c.execute("SELECT * FROM arr_libraries WHERE id=%s FOR SHARE",(row["library_id"],)).fetchone()
+            settings=c.execute("SELECT * FROM season_pack_settings WHERE library_id=%s FOR SHARE",(row["library_id"],)).fetchone()
+            snapshot=row["settings_snapshot"]
+            error=None
+            if scheduler["mode"]!="live" or live["authorization_state"]!="running" or live["authorization_generation"]!=expected_generation:
+                error="Live authorization changed before grab"
+            elif not library or library["type"]!="sonarr" or library["enabled"] is not True or library_identity_digest(library)!=snapshot.get("library_identity_digest") or library["updated_at"].isoformat()!=snapshot.get("library_config_generation"):
+                error="library routing identity changed since preview"
+            elif not settings or not settings["enabled"] or any(settings[k]!=snapshot.get(k) for k in ("protocol","download_client_id","allow_cutoff_override","hourly_grab_cap","cooldown_minutes","pacing_seconds")):
+                error="season-pack settings changed since preview"
+            yield c,error
+    def finalize(self,audit_id,state,error="",conn=None):
+        if conn is not None:
+            conn.execute("UPDATE season_pack_audit SET state=%s,error_summary=%s,updated_at=now() WHERE id=%s AND state='dispatching'",(state,error[:500],audit_id));return self.get(audit_id,conn=conn)
         with self.db.connect() as c:c.execute("UPDATE season_pack_audit SET state=%s,error_summary=%s,updated_at=now() WHERE id=%s AND state='dispatching'",(state,error[:500],audit_id))
         return self.get(audit_id)
     def recent(self,limit=50):
