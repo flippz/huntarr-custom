@@ -452,7 +452,7 @@ class LiveRepository:
                       ELSE 'Failed'
                     END result,
                     l.terminal_reason details, c.series_title, c.season_number,
-                    c.episode_number, l.dispatch_batch_id, l.sonarr_command_id
+                    c.episode_number, c.candidate_kind, l.dispatch_batch_id, l.sonarr_command_id
                   FROM live_dispatch_ledger l
                   JOIN scheduler_candidate_results c ON c.id=l.candidate_result_id
                   UNION ALL
@@ -470,10 +470,11 @@ class LiveRepository:
                       ELSE 'Failed'
                     END result,
                     e.safe_summary details, i.series_title, i.season_number,
-                    i.episode_number, e.batch_id AS dispatch_batch_id,
+                    i.episode_number, s.candidate_kind, e.batch_id AS dispatch_batch_id,
                     e.sonarr_command_id
                   FROM effective_outcomes e
                   JOIN dispatch_batch_items i ON i.id=e.dispatch_item_id
+                  JOIN scan_candidates s ON s.id=i.candidate_id
                 ) timeline
                 ORDER BY occurred_at DESC, event_key DESC LIMIT %s
             """, (limit,)).fetchall()

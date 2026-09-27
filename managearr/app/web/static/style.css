@@ -120,12 +120,16 @@ button[data-action="delete"] { background: var(--danger); }
 }
 .data-table th { color: var(--muted); font-weight: 500; }
 
-.state-pill {
+.state-pill, .kind-pill {
+  display: inline-block;
   padding: 2px 8px;
   border-radius: 999px;
   font-size: 0.75rem;
+  white-space: nowrap;
   background: var(--border);
 }
+.kind-missing { background: #17395d; color: #9ed0ff; }
+.kind-upgrade { background: #442b64; color: #d9b7ff; }
 
 .status-ok { background: #17402a; color: #7ee2a8; }
 .status-error { background: #402020; color: #ff9b9b; }

@@ -10,8 +10,8 @@
   <h2>Episode history</h2>
   <p class="muted">Searches and their real download or import results. Newest activity appears first.</p>
   <div class="table-scroll"><table class="data-table">
-    <thead><tr><th>Time</th><th>Episode</th><th>Activity</th><th>Result</th><th>Details</th></tr></thead>
-    <tbody id="activity-timeline"><tr><td colspan="5">Loading...</td></tr></tbody>
+    <thead><tr><th>Time</th><th>Episode</th><th>Search type</th><th>Activity</th><th>Result</th><th>Details</th></tr></thead>
+    <tbody id="activity-timeline"><tr><td colspan="6">Loading...</td></tr></tbody>
   </table></div>
 </section>
 
@@ -116,7 +116,7 @@ async function loadTimeline() {
   const tbody = document.getElementById('activity-timeline');
   tbody.innerHTML = '';
   if (!data.events.length) {
-    tbody.innerHTML = '<tr><td colspan="5">No episode activity yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6">No episode activity yet.</td></tr>';
     return;
   }
   data.events.forEach(event => {
@@ -125,6 +125,7 @@ async function loadTimeline() {
     tr.innerHTML = `
       <td class="activity-time">${escapeHtml(formatLocalTime(event.occurred_at))}</td>
       <td><strong>${episode}</strong></td>
+      <td><span class="kind-pill kind-${escapeHtml(event.candidate_kind)}">${escapeHtml(event.candidate_kind === 'upgrade' ? 'Upgrade' : 'Missing')}</span></td>
       <td>${escapeHtml(event.activity)}</td>
       <td><span class="state-pill state-${escapeHtml(resultClass(event.result))}">${escapeHtml(event.result)}</span></td>
       <td>${escapeHtml(event.details || '')}</td>`;
@@ -254,7 +255,7 @@ async function openJob(jobId) {
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>${canDispatch ? `<input class="candidate-checkbox" type="checkbox" value="${c.id}" aria-label="Select ${escapeHtml(c.series_title)} season ${c.season_number} episode ${c.episode_number}">` : ''}</td>
-        <td><span class="state-pill">${escapeHtml(c.candidate_kind === 'upgrade' ? 'Upgrade' : 'Missing')}</span></td>
+        <td><span class="kind-pill kind-${escapeHtml(c.candidate_kind)}">${escapeHtml(c.candidate_kind === 'upgrade' ? 'Upgrade' : 'Missing')}</span></td>
         <td>${escapeHtml(c.series_title)}</td><td>${c.season_number}</td><td>${c.episode_number}</td>
         <td>${escapeHtml(c.air_date || '')}</td><td>${escapeHtml(c.reason)}</td>`;
       tbody.appendChild(tr);
