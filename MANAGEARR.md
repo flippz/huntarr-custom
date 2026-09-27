@@ -583,10 +583,12 @@ ordering is deterministic:
 
 Missing candidates are excluded when `missing_enabled` is false. Quality-upgrade
 candidates are excluded independently when `upgrades_enabled` is false. Under
-shared scan and planning caps, the configured order is retained within each kind
-but Missing always precedes Upgrade, so upgrade hunting cannot starve existing
-missing-item behavior. Audit rows snapshot the candidate kind and report upgrade
-planning as `enabled` or `disabled`.
+shared scan and planning caps, the configured order is retained within each kind.
+When both kinds are available, up to 20% of the cap (at least one slot where the
+planning cap is at least two) is reserved for Upgrade; unused reserved capacity
+returns to either kind. Missing therefore retains at least 80% when both pools are
+large without starving upgrades. Audit rows snapshot the candidate kind and report
+upgrade planning as `enabled` or `disabled`.
 
 The planner conservatively reads the durable manual dispatch/outcome ledger to
 exclude duplicate episodes, imported outcomes, live reservations, and episodes
@@ -978,7 +980,10 @@ When `upgrades_enabled` is true, a read-only scan consumes Sonarr v4
 reports the episode below cutoff and the record also proves that the known,
 monitored series and episode are monitored, aired, and have a file. Unknown or
 malformed fields, future episodes, missing files, unmonitored records, and series
-not present in the scanned library fail closed. Existing rows are safely
+not present in the scanned library fail closed. Cutoff reads remain bounded to five
+100-record pages even when missing discovery reaches its cap. A cutoff read failure
+is surfaced as an incomplete, fail-closed upgrade portion while safe missing results
+may still complete. Existing rows are safely
 backfilled as `missing`; new API and audit snapshots expose `candidate_kind` as
 `missing` or `upgrade`.
 

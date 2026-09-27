@@ -56,4 +56,5 @@ def test_activity_ui_labels_missing_and_upgrade_candidate_kinds(client):
 def test_settings_explains_safe_individual_upgrade_search(client):
     html = client.get("/settings").get_data(as_text=True)
     assert "Search individual episode quality upgrades" in html
-    assert "no season packs, file deletion, or replacement" in html
+    assert "No season packs, file deletion, or replacement" in html
+    assert "up to 20% of shared caps is reserved for upgrades" in html

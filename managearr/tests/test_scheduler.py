@@ -546,3 +546,65 @@ def test_no_result_adds_no_failure_cooldown_but_late_grab_is_active(
     rows = {row["candidate_id"]: row for row in cycle["libraries"][0]["candidates"]}
     assert "active grab" in rows[candidates[0].id]["exclusion_reason"]
     assert cycle["libraries"][0]["queue_occupancy"] == 1
+
+
+@pytest.mark.parametrize("cap", [4, 5])
+def test_mixed_scheduler_cap_reserves_at_least_one_upgrade(
+    cap, scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo
+):
+    library, job, _ = _library_scan(library_repo, activity_repo, candidate_repo, count=10)
+    candidate_repo.create_many(job.id, library.id, [
+        {"series_id": 200 + i, "series_title": f"Upgrade {i}", "episode_id": 2000 + i,
+         "season_number": 1, "episode_number": i + 1, "air_date": f"2023-02-{i+1:02d}",
+         "candidate_kind": "upgrade", "reason": "below cutoff"}
+        for i in range(10)
+    ])
+    policy_repo.update({"successful_grab_target": cap})
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id=f"share-{cap}")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    selected = sorted(
+        (c for c in cycle["libraries"][0]["candidates"] if c["selected"]),
+        key=lambda c: c["order_position"],
+    )
+    assert len(selected) == cap
+    assert sum(c["candidate_kind"] == "missing" for c in selected) == cap - 1
+    assert sum(c["candidate_kind"] == "upgrade" for c in selected) == 1
+    assert [c["order_position"] for c in selected] == list(range(1, cap + 1))
+
+
+def test_scheduler_single_kind_uses_full_effective_cap(
+    scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo
+):
+    _library_scan(library_repo, activity_repo, candidate_repo, count=5)
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="missing-full-cap")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    selected = [c for c in cycle["libraries"][0]["candidates"] if c["selected"]]
+    assert cycle["libraries"][0]["effective_cap"] == 5
+    assert len(selected) == 5
+    assert all(c["candidate_kind"] == "missing" for c in selected)
+
+
+def test_scheduler_upgrade_only_uses_full_effective_cap(
+    scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo
+):
+    library = library_repo.create({
+        "name": "Upgrades", "type": "sonarr", "url": "http://sonarr.invalid:8989",
+        "api_key": "secret", "enabled": True,
+    })
+    job = activity_repo.create({
+        "library_id": library.id, "library_name": library.name, "job_type": "sonarr_scan",
+        "state": "completed", "title": "snapshot", "candidate_count": 5,
+    })
+    candidate_repo.create_many(job.id, library.id, [
+        {"series_id": 300 + i, "series_title": f"Upgrade {i}", "episode_id": 3000 + i,
+         "season_number": 1, "episode_number": i + 1, "air_date": f"2023-03-{i+1:02d}",
+         "candidate_kind": "upgrade", "reason": "below cutoff"}
+        for i in range(5)
+    ])
+    policy_repo.update({"missing_enabled": False, "upgrades_enabled": True})
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="upgrade-full-cap")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    selected = [c for c in cycle["libraries"][0]["candidates"] if c["selected"]]
+    assert cycle["libraries"][0]["effective_cap"] == 5
+    assert len(selected) == 5
+    assert all(c["candidate_kind"] == "upgrade" for c in selected)

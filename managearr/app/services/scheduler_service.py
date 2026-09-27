@@ -60,9 +60,7 @@ class SchedulerService:
             return sorted(base, key=lambda c: (c["air_date"] is not None, c["air_date"] or "", -c["id"]), reverse=True)
         if order == "random":
             Random(seed ^ library_id).shuffle(base)
-        # Stable partition preserves the selected ordering within each kind
-        # while ensuring the shared safety cap cannot starve missing items.
-        return sorted(base, key=lambda c: 0 if c.get("candidate_kind") == "missing" else 1)
+        return base
 
     @staticmethod
     def _cap_reason(*, hourly: int, queue: int, success: int, safety: int) -> str:
@@ -234,7 +232,20 @@ class SchedulerService:
                 results.append(self._candidate_result(candidate, False, reason, None))
             seen_episodes.add(episode_id)
 
-        selected = eligible[:effective_cap]
+        eligible_missing = [c for c in eligible if c.get("candidate_kind", "missing") == "missing"]
+        eligible_upgrades = [c for c in eligible if c.get("candidate_kind") == "upgrade"]
+        if eligible_missing and eligible_upgrades and effective_cap >= 2:
+            upgrade_reserve = max(1, effective_cap // 5)
+            missing_take = min(len(eligible_missing), effective_cap - upgrade_reserve)
+            upgrade_take = min(len(eligible_upgrades), effective_cap - missing_take)
+            # Unused upgrade reservation returns to missing candidates.
+            missing_take = min(len(eligible_missing), effective_cap - upgrade_take)
+            selected = eligible_missing[:missing_take] + eligible_upgrades[:upgrade_take]
+        elif eligible_missing:
+            # A one-slot cap intentionally retains missing priority.
+            selected = eligible_missing[:effective_cap]
+        else:
+            selected = eligible_upgrades[:effective_cap]
         selected_ids = {c["id"] for c in selected}
         for position, candidate in enumerate(selected, 1):
             results.append(self._candidate_result(candidate, True, None, position))
@@ -248,6 +259,8 @@ class SchedulerService:
 
         results.sort(key=lambda r: (not r["selected"], r["order_position"] or 10**9, r["candidate_id"]))
         selected_count = len(selected)
+        selected_missing_count = sum(c.get("candidate_kind", "missing") == "missing" for c in selected)
+        selected_upgrade_count = sum(c.get("candidate_kind") == "upgrade" for c in selected)
         considered = len(candidates)
         state = "completed" if policy["missing_enabled"] or policy["upgrades_enabled"] else "skipped"
         missing_count = sum(c.get("candidate_kind", "missing") == "missing" for c in candidates)
@@ -256,10 +269,16 @@ class SchedulerService:
             f"Latest completed scan {scan['id']} ({age_seconds // 60} minute(s) old): "
             f"considered {missing_count} missing and {upgrade_count} upgrade candidate(s); "
             f"selected {selected_count} of {considered}; "
+            f"selection contains {selected_missing_count} missing and {selected_upgrade_count} upgrade candidate(s); "
             f"effective cap {effective_cap} = min(safety {MAX_SIMULATION_SELECTION}, "
             f"hourly remaining {hourly_remaining}, queue remaining {queue_remaining}, "
             f"successful-grab remaining {success_remaining}). {upgrade_note}"
         )
+        if eligible_missing and eligible_upgrades and effective_cap >= 2:
+            summary += (
+                f" Bounded-share planning reserved up to {max(1, effective_cap // 5)} "
+                "upgrade slot(s), with unused capacity returned to either kind."
+            )
         if "truncated" in (scan.get("details") or ""):
             summary += " The source scan snapshot was truncated at its candidate cap."
         return ({

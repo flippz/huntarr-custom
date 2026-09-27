@@ -39,6 +39,7 @@ class StubSonarrClient:
         self._cutoff_pages = cutoff_pages or {}
         self._cutoff_error = cutoff_error
         self.cutoff_calls = []
+        self.episode_calls = []
 
     def system_status(self):
         if self._status_error:
@@ -51,6 +52,7 @@ class StubSonarrClient:
         return self._series
 
     def get_episodes(self, series_id):
+        self.episode_calls.append(series_id)
         if series_id in self._episode_errors:
             raise self._episode_errors[series_id]
         return self._episodes_by_series.get(series_id, [])
@@ -356,7 +358,7 @@ def test_scan_policy_toggles_missing_and_upgrade_independently(
     assert [(c.episode_id, c.candidate_kind) for c in candidate_repo.list_for_job(second.id)] == [(31, "missing")]
 
 
-def test_shared_scan_cap_prioritizes_missing_without_reading_cutoff(
+def test_shared_scan_cap_reserves_upgrade_share_when_both_modes_are_enabled(
     library_repo, activity_repo, candidate_repo, monkeypatch
 ):
     monkeypatch.setattr(scan_service_module, "MAX_CANDIDATES_PER_SCAN", 2)
@@ -368,7 +370,90 @@ def test_shared_scan_cap_prioritizes_missing_without_reading_cutoff(
     )
     job, _ = make_service(library_repo, activity_repo, candidate_repo, stub).run_scan(lib.id)
     assert [(c.episode_id, c.candidate_kind) for c in candidate_repo.list_for_job(job.id)] == [
-        (41, "missing"), (42, "missing")
+        (41, "missing"), (44, "upgrade")
     ]
-    assert stub.cutoff_calls == []
+    assert stub.cutoff_calls == [(1, 100)]
     assert "truncated" in job.details.lower()
+
+
+def test_production_shape_500_missing_still_persists_reserved_upgrades(
+    library_repo, activity_repo, candidate_repo
+):
+    lib = create_sonarr_library(library_repo)
+    stub = StubSonarrClient(
+        series=[series(1, "Large Show")],
+        episodes_by_series={1: [episode(i, 1, i) for i in range(1, 502)]},
+        cutoff_pages={1: [cutoff_episode(i) for i in range(1001, 1101)]},
+    )
+    job, error = make_service(library_repo, activity_repo, candidate_repo, stub).run_scan(lib.id)
+    assert error is None
+    candidates = candidate_repo.list_for_job(job.id)
+    assert len(candidates) == 500
+    assert sum(c.candidate_kind == "missing" for c in candidates) == 400
+    assert sum(c.candidate_kind == "upgrade" for c in candidates) == 100
+    assert stub.cutoff_calls == [(1, 100)]
+    assert "Missing source discovery was truncated" in job.details
+    assert "Persisted results were truncated" in job.details
+
+
+def test_missing_only_retains_full_scan_cap(
+    library_repo, activity_repo, candidate_repo, policy_repo, monkeypatch
+):
+    monkeypatch.setattr(scan_service_module, "MAX_CANDIDATES_PER_SCAN", 5)
+    policy_repo.update({"missing_enabled": True, "upgrades_enabled": False})
+    lib = create_sonarr_library(library_repo)
+    stub = StubSonarrClient(
+        series=[series(1, "Show")],
+        episodes_by_series={1: [episode(i, 1, i) for i in range(1, 7)]},
+        cutoff_pages={1: [cutoff_episode(100)]},
+    )
+    service = SonarrScanService(
+        library_repo, activity_repo, candidate_repo, policy_repo, client_factory=make_factory(stub)
+    )
+    job, _ = service.run_scan(lib.id)
+    candidates = candidate_repo.list_for_job(job.id)
+    assert len(candidates) == 5
+    assert all(c.candidate_kind == "missing" for c in candidates)
+    assert stub.cutoff_calls == []
+
+
+def test_upgrades_only_retains_full_scan_cap_without_episode_reads(
+    library_repo, activity_repo, candidate_repo, policy_repo, monkeypatch
+):
+    monkeypatch.setattr(scan_service_module, "MAX_CANDIDATES_PER_SCAN", 5)
+    policy_repo.update({"missing_enabled": False, "upgrades_enabled": True})
+    lib = create_sonarr_library(library_repo)
+    stub = StubSonarrClient(
+        series=[series(1, "Show")],
+        episodes_by_series={1: [episode(1, 1, 1)]},
+        cutoff_pages={1: [cutoff_episode(i) for i in range(101, 107)]},
+    )
+    service = SonarrScanService(
+        library_repo, activity_repo, candidate_repo, policy_repo, client_factory=make_factory(stub)
+    )
+    job, _ = service.run_scan(lib.id)
+    candidates = candidate_repo.list_for_job(job.id)
+    assert len(candidates) == 5
+    assert all(c.candidate_kind == "upgrade" for c in candidates)
+    assert stub.episode_calls == []
+
+
+def test_upgrade_read_failure_returns_full_missing_capacity_and_surfaces_incomplete_snapshot(
+    library_repo, activity_repo, candidate_repo, policy_repo, monkeypatch
+):
+    monkeypatch.setattr(scan_service_module, "MAX_CANDIDATES_PER_SCAN", 5)
+    lib = create_sonarr_library(library_repo)
+    stub = StubSonarrClient(
+        series=[series(1, "Show")],
+        episodes_by_series={1: [episode(i, 1, i) for i in range(1, 7)]},
+        cutoff_error=SonarrConnectionError("safe read failure"),
+    )
+    service = SonarrScanService(
+        library_repo, activity_repo, candidate_repo, policy_repo, client_factory=make_factory(stub)
+    )
+    job, _ = service.run_scan(lib.id)
+    candidates = candidate_repo.list_for_job(job.id)
+    assert job.state == "completed"
+    assert len(candidates) == 5
+    assert all(c.candidate_kind == "missing" for c in candidates)
+    assert "upgrade portion of this completed snapshot is incomplete and failed closed" in job.details

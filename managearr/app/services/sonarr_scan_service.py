@@ -1,8 +1,9 @@
 """Orchestrates read-only Sonarr connection tests and candidate scans.
 
 Safety invariant for this whole module: it never calls anything on
-``SonarrClient`` other than ``system_status``, ``get_series``, and
-``get_episodes`` - all read-only GETs. No Sonarr command is ever sent
+``SonarrClient`` other than ``system_status``, ``get_series``,
+``get_episodes``, and ``get_cutoff_unmet_episodes`` - all read-only GETs.
+No Sonarr command is ever sent
 and no Sonarr state is ever mutated.
 """
 from datetime import date
@@ -115,49 +116,50 @@ class SonarrScanService:
 
         today = date.today()
         policy = self.policy_repo.get()
-        candidates: list[dict] = []
-        missing_count = 0
-        upgrade_count = 0
+        missing_pool: list[dict] = []
+        upgrade_pool: list[dict] = []
         skipped_series = 0
-        truncated = False
+        missing_source_truncated = False
+        upgrade_source_truncated = False
+        upgrade_error = False
 
+        # Build the complete cross-library identity map before bounded missing
+        # discovery can stop early. Cutoff records may refer to any series in
+        # this Sonarr library, including one after the missing scan cap.
         known_series: dict[int, dict] = {}
         for series in series_list:
             if not isinstance(series, dict):
                 continue
             series_id = series.get("id")
-            if series_id is None:
-                continue
-            known_series[series_id] = series
+            if isinstance(series_id, int) and not isinstance(series_id, bool) and series_id > 0:
+                known_series[series_id] = series
 
-            if not policy.missing_enabled:
-                continue
-
-            try:
-                episodes = client.get_episodes(series_id)
-            except SonarrError:
-                skipped_series += 1
-                continue
-
-            for episode in episodes:
-                if not isinstance(episode, dict):
+        if policy.missing_enabled:
+            for series_id, series in known_series.items():
+                try:
+                    episodes = client.get_episodes(series_id)
+                except SonarrError:
+                    skipped_series += 1
                     continue
-                if len(candidates) >= MAX_CANDIDATES_PER_SCAN:
-                    truncated = True
+
+                for episode in episodes:
+                    if not isinstance(episode, dict):
+                        continue
+                    if len(missing_pool) >= MAX_CANDIDATES_PER_SCAN:
+                        missing_source_truncated = True
+                        break
+                    candidate = derive_missing_candidate(series, episode, today=today)
+                    if candidate is not None:
+                        missing_pool.append(candidate)
+                if missing_source_truncated:
                     break
-                candidate = derive_missing_candidate(series, episode, today=today)
-                if candidate is not None:
-                    candidates.append(candidate)
-                    missing_count += 1
 
-            if truncated:
-                break
-
-        # Preserve existing missing ordering and reserve the shared cap for
-        # missing candidates first. Upgrade records only fill remaining slots.
-        upgrade_error = False
-        if policy.upgrades_enabled and not truncated:
-            seen_episode_ids = {candidate["episode_id"] for candidate in candidates}
+        # This read remains bounded even when missing discovery reached its
+        # own cap. When both modes are enabled, allocation below reserves a
+        # deterministic 20% share for eligible upgrades without exceeding the
+        # one shared persistence cap.
+        if policy.upgrades_enabled:
+            seen_episode_ids = {candidate["episode_id"] for candidate in missing_pool}
             for page in range(1, MAX_UPGRADE_PAGES + 1):
                 try:
                     result = client.get_cutoff_unmet_episodes(
@@ -165,13 +167,15 @@ class SonarrScanService:
                     )
                 except SonarrError:
                     upgrade_error = True
+                    upgrade_pool = []
                     break
+
                 records = result["records"]
                 for episode in records:
                     if not isinstance(episode, dict):
                         continue
-                    if len(candidates) >= MAX_CANDIDATES_PER_SCAN:
-                        truncated = True
+                    if len(upgrade_pool) >= MAX_CANDIDATES_PER_SCAN:
+                        upgrade_source_truncated = True
                         break
                     series = known_series.get(episode.get("seriesId"))
                     if series is None:
@@ -179,34 +183,69 @@ class SonarrScanService:
                     candidate = derive_upgrade_candidate(series, episode, today=today)
                     if candidate is None or candidate["episode_id"] in seen_episode_ids:
                         continue
-                    candidates.append(candidate)
+                    upgrade_pool.append(candidate)
                     seen_episode_ids.add(candidate["episode_id"])
-                    upgrade_count += 1
-                if truncated or not records or page * UPGRADE_PAGE_SIZE >= result["total_records"]:
+
+                if upgrade_source_truncated or not records:
                     break
-            else:
-                # There may be additional cutoff records beyond our bounded
-                # five-page read, even if malformed/ineligible records meant
-                # the persisted candidate cap was not reached.
-                truncated = True
+                if page * UPGRADE_PAGE_SIZE >= result["total_records"]:
+                    break
+                if page == MAX_UPGRADE_PAGES:
+                    upgrade_source_truncated = True
+
+        if policy.missing_enabled and policy.upgrades_enabled:
+            upgrade_reserve = max(1, MAX_CANDIDATES_PER_SCAN // 5)
+            missing_take = min(len(missing_pool), MAX_CANDIDATES_PER_SCAN - upgrade_reserve)
+            upgrade_take = min(len(upgrade_pool), MAX_CANDIDATES_PER_SCAN - missing_take)
+            # Any unused upgrade reservation returns to missing candidates.
+            missing_take = min(len(missing_pool), MAX_CANDIDATES_PER_SCAN - upgrade_take)
+        elif policy.missing_enabled:
+            missing_take = min(len(missing_pool), MAX_CANDIDATES_PER_SCAN)
+            upgrade_take = 0
+        elif policy.upgrades_enabled:
+            missing_take = 0
+            upgrade_take = min(len(upgrade_pool), MAX_CANDIDATES_PER_SCAN)
+        else:
+            missing_take = upgrade_take = 0
+
+        candidates = missing_pool[:missing_take] + upgrade_pool[:upgrade_take]
+        result_truncated = missing_take < len(missing_pool) or upgrade_take < len(upgrade_pool)
+        missing_count = missing_take
+        upgrade_count = upgrade_take
 
         if candidates:
             self.candidate_repo.create_many(job.id, library.id, candidates)
 
         details_parts = [
-            f"Found {missing_count} missing monitored aired episode(s) and "
+            f"Persisted {missing_count} missing monitored aired episode(s) and "
             f"{upgrade_count} monitored aired quality-upgrade episode(s) across {len(series_list)} series."
         ]
+        if policy.missing_enabled and policy.upgrades_enabled:
+            details_parts.append(
+                "The shared candidate cap reserves up to 20% for eligible upgrades; unused capacity returns to either kind."
+            )
         if not policy.missing_enabled:
             details_parts.append("Missing candidate hunting was disabled by policy.")
         if not policy.upgrades_enabled:
             details_parts.append("Quality-upgrade hunting was disabled by policy.")
         if upgrade_error:
-            details_parts.append("Quality-upgrade candidates were skipped after a Sonarr read error.")
+            details_parts.append(
+                "The quality-upgrade source read failed; the upgrade portion of this completed snapshot is incomplete and failed closed."
+            )
         if skipped_series:
             details_parts.append(f"{skipped_series} series were skipped due to Sonarr errors.")
-        if truncated:
-            details_parts.append(f"Results truncated at {MAX_CANDIDATES_PER_SCAN} candidates.")
+        if missing_source_truncated:
+            details_parts.append(
+                f"Missing source discovery was truncated after {MAX_CANDIDATES_PER_SCAN} eligible candidates."
+            )
+        if upgrade_source_truncated:
+            details_parts.append(
+                f"Quality-upgrade source discovery was truncated after at most {MAX_UPGRADE_PAGES} bounded page(s)."
+            )
+        if result_truncated:
+            details_parts.append(
+                f"Persisted results were truncated at the shared {MAX_CANDIDATES_PER_SCAN}-candidate cap."
+            )
 
         completed = self.activity_repo.update_state(
             job.id,
