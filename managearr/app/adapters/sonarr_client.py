@@ -1,16 +1,14 @@
 """Sonarr API v3 adapter.
 
-Mostly a read-only client (system status, series, episode - all GETs),
-plus exactly one write operation: ``search_episodes``, which issues
-``POST /api/v3/command`` with command ``EpisodeSearch``. That is the
-*only* way anything in this codebase can make Sonarr do something - see
-``app/services/dispatch_service.py``, the only caller. No series/season
-search, delete, file-change, or override endpoint exists here or
-anywhere else in the adapter.
+Read operations cover status, series, episodes, release search, routing metadata,
+history, and queue evidence. Two narrowly scoped writes are exposed:
+search_episodes retains the existing confirmed EpisodeSearch command, and
+ grab_release posts one exact cached release selected by the manual-only M11
+service. No broad SeasonSearch, series search, delete, file mutation, or Sonarr
+configuration write exists here.
 
-All raised exceptions carry static, safe messages - never the
-configured base URL or API key - so callers can surface them directly
-to a UI or log line without leaking secrets.
+Raised messages never include the configured base URL or API key. Bounded Sonarr
+validation reasons may be surfaced so operators can understand release rejection.
 """
 from datetime import datetime
 from urllib.parse import urljoin
@@ -18,6 +16,7 @@ from urllib.parse import urljoin
 import requests
 
 from ..domain.dispatch import MAX_SELECTION_PER_REQUEST
+from ..domain.season_pack import normalize_protocol, strict_int
 
 DEFAULT_TIMEOUT_SECONDS = 10
 MAX_READ_PAGE = 10
@@ -94,7 +93,20 @@ class SonarrClient:
         if response.status_code == 404:
             raise SonarrNotFoundError("Sonarr returned HTTP 404")
         if not response.ok:
-            raise SonarrResponseError(f"Sonarr returned HTTP {response.status_code}")
+            reason = ""
+            try:
+                problem = response.json()
+                if isinstance(problem, list):
+                    texts = [x.get("errorMessage") for x in problem if isinstance(x, dict)]
+                    texts = [x for x in texts if isinstance(x, str) and 0 < len(x) <= 300]
+                    reason = "; ".join(texts[:5])
+                elif isinstance(problem, dict):
+                    text = problem.get("message")
+                    if isinstance(text, str) and 0 < len(text) <= 300: reason = text
+            except ValueError:
+                pass
+            suffix = f": {reason}" if reason else ""
+            raise SonarrResponseError(f"Sonarr returned HTTP {response.status_code}{suffix}")
 
         try:
             return response.json()
@@ -309,6 +321,39 @@ class SonarrClient:
                 }
             )
         return {"page": page, "page_size": page_size, "total_records": total_records, "records": safe_records}
+
+    def get_series_detail(self, series_id: int) -> dict:
+        series_id = self._positive_int(series_id, "series id")
+        data = self._get(f"/api/v3/series/{series_id}")
+        if not isinstance(data, dict): raise SonarrDataError("Sonarr series detail response was not an object")
+        return data
+
+    def get_download_clients(self) -> list[dict]:
+        data = self._get("/api/v3/downloadclient")
+        if not isinstance(data, list): raise SonarrDataError("Sonarr download-client response was not a list")
+        result = []
+        for item in data:
+            if not isinstance(item, dict) or not strict_int(item.get("id"), positive=True): raise SonarrDataError("Sonarr download-client response was malformed")
+            name, protocol = item.get("name"), normalize_protocol(item.get("protocol"))
+            if not isinstance(name, str) or not name or len(name) > 255 or protocol is None or not isinstance(item.get("enable"), bool): raise SonarrDataError("Sonarr download-client response was malformed")
+            result.append({"id": item["id"], "name": name, "protocol": protocol, "enabled": item["enable"]})
+        return result
+
+    def search_season_releases(self, series_id: int, season_number: int) -> list[dict]:
+        series_id = self._positive_int(series_id, "series id")
+        season_number = self._positive_int(season_number, "season number")
+        data = self._get("/api/v3/release", params={"seriesId": series_id, "seasonNumber": season_number})
+        if not isinstance(data, list) or len(data) > 1000: raise SonarrDataError("Sonarr release search response was malformed or unbounded")
+        return data
+
+    def grab_release(self, body: dict) -> dict:
+        allowed = {"guid", "indexerId", "downloadClientId", "shouldOverride", "seriesId", "episodeIds", "quality", "languages"}
+        if not isinstance(body, dict) or set(body) - allowed or not isinstance(body.get("guid"), str) or not body["guid"]: raise ValueError("invalid exact release grab body")
+        for key in ("indexerId", "downloadClientId"):
+            if not strict_int(body.get(key), positive=True): raise ValueError("invalid exact release grab body")
+        data = self._post("/api/v3/release", body)
+        if data is not None and not isinstance(data, dict): raise SonarrDataError("Sonarr release grab response was malformed")
+        return data or {}
 
     def search_episodes(self, episode_ids: list[int]) -> dict:
         """The only write operation this adapter exposes: dispatch one

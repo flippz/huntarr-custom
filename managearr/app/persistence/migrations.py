@@ -1274,6 +1274,49 @@ MIGRATIONS: list[Migration] = [
         """,
     ),
 
+
+    Migration(
+        version=11,
+        name="strict_manual_season_packs",
+        sql="""
+            CREATE TABLE season_pack_settings (
+                library_id BIGINT PRIMARY KEY REFERENCES arr_libraries(id) ON DELETE CASCADE,
+                enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                protocol TEXT NULL CHECK (protocol IN ('usenet','torrent')),
+                download_client_id INTEGER NULL CHECK (download_client_id > 0),
+                allow_cutoff_override BOOLEAN NOT NULL DEFAULT FALSE,
+                hourly_grab_cap INTEGER NOT NULL DEFAULT 1 CHECK (hourly_grab_cap BETWEEN 1 AND 10),
+                cooldown_minutes INTEGER NOT NULL DEFAULT 1440 CHECK (cooldown_minutes BETWEEN 1 AND 10080),
+                pacing_seconds INTEGER NOT NULL DEFAULT 30 CHECK (pacing_seconds BETWEEN 5 AND 3600),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                CHECK (NOT enabled OR (protocol IS NOT NULL AND download_client_id IS NOT NULL))
+            );
+            CREATE TABLE season_pack_audit (
+                id BIGSERIAL PRIMARY KEY,
+                library_id BIGINT NULL REFERENCES arr_libraries(id) ON DELETE SET NULL,
+                series_id INTEGER NOT NULL CHECK (series_id > 0), season_number INTEGER NOT NULL CHECK (season_number > 0),
+                series_title TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('previewed','dispatching','completed','blocked','ambiguous')),
+                selected_fingerprint TEXT NULL CHECK (selected_fingerprint IS NULL OR length(selected_fingerprint)=64),
+                selected_title TEXT NULL, selected_protocol TEXT NULL CHECK (selected_protocol IS NULL OR selected_protocol IN ('usenet','torrent')),
+                selected_indexer_id INTEGER NULL, episode_count INTEGER NOT NULL CHECK (episode_count >= 0), cutoff_override BOOLEAN NOT NULL DEFAULT FALSE,
+                rejected_summary JSONB NOT NULL DEFAULT '[]'::jsonb, confirmation_digest TEXT NOT NULL CHECK (length(confirmation_digest)=64),
+                settings_snapshot JSONB NOT NULL, live_generation INTEGER NULL, dispatch_started_at TIMESTAMPTZ NULL,
+                error_summary TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX idx_season_pack_audit_library_time ON season_pack_audit(library_id, dispatch_started_at DESC);
+            CREATE INDEX idx_season_pack_audit_target ON season_pack_audit(library_id, series_id, season_number, dispatch_started_at DESC);
+            CREATE OR REPLACE FUNCTION protect_season_pack_audit() RETURNS trigger AS $$
+            BEGIN
+              IF TG_OP='DELETE' THEN RAISE EXCEPTION 'season-pack audit rows cannot be deleted'; END IF;
+              IF NEW.library_id IS DISTINCT FROM OLD.library_id AND NOT (OLD.library_id IS NOT NULL AND NEW.library_id IS NULL) THEN RAISE EXCEPTION 'season-pack audit identity is immutable'; END IF;
+              IF OLD.library_id IS NOT NULL AND NEW.library_id IS NULL AND NEW.state IS NOT DISTINCT FROM OLD.state AND NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN RETURN NEW; END IF;
+              IF NEW.series_id IS DISTINCT FROM OLD.series_id OR NEW.season_number IS DISTINCT FROM OLD.season_number OR NEW.series_title IS DISTINCT FROM OLD.series_title OR NEW.selected_fingerprint IS DISTINCT FROM OLD.selected_fingerprint OR NEW.selected_title IS DISTINCT FROM OLD.selected_title OR NEW.selected_protocol IS DISTINCT FROM OLD.selected_protocol OR NEW.selected_indexer_id IS DISTINCT FROM OLD.selected_indexer_id OR NEW.episode_count IS DISTINCT FROM OLD.episode_count OR NEW.cutoff_override IS DISTINCT FROM OLD.cutoff_override OR NEW.rejected_summary IS DISTINCT FROM OLD.rejected_summary OR NEW.confirmation_digest IS DISTINCT FROM OLD.confirmation_digest OR NEW.settings_snapshot IS DISTINCT FROM OLD.settings_snapshot OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN RAISE EXCEPTION 'season-pack audit identity is immutable'; END IF;
+              IF NOT ((OLD.state='previewed' AND NEW.state='dispatching') OR (OLD.state='dispatching' AND NEW.state IN ('completed','blocked','ambiguous'))) THEN RAISE EXCEPTION 'invalid season-pack audit transition'; END IF;
+              RETURN NEW;
+            END; $$ LANGUAGE plpgsql;
+            CREATE TRIGGER trg_protect_season_pack_audit BEFORE UPDATE OR DELETE ON season_pack_audit FOR EACH ROW EXECUTE FUNCTION protect_season_pack_audit();
+        """,
+    ),
 ]
 
 

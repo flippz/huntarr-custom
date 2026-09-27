@@ -15,6 +15,7 @@
     <nav>
       <a href="{{ url_for('web.overview') }}" class="{{ 'active' if active == 'overview' else '' }}">Overview</a>
       <a href="{{ url_for('web.libraries') }}" class="{{ 'active' if active == 'libraries' else '' }}">Libraries</a>
+      <a href="{{ url_for('web.season_packs') }}" class="{{ 'active' if active == 'season_packs' else '' }}">Season Packs</a>
       <a href="{{ url_for('web.activity') }}" class="{{ 'active' if active == 'activity' else '' }}">Activity</a>
       <a href="{{ url_for('web.settings') }}" class="{{ 'active' if active == 'settings' else '' }}">Settings</a>
     </nav>

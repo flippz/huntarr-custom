@@ -34,3 +34,7 @@ def settings():
     return render_template(
         "settings.html", active="settings", search_orders=SEARCH_ORDERS
     )
+
+@web_bp.get("/season-packs")
+def season_packs():
+    return render_template("season_packs.html", active="season_packs")

@@ -411,3 +411,41 @@ def get_dispatch_outcomes(batch_id: int):
     if detail is None:
         return jsonify({"errors": [BATCH_NOT_FOUND]}), 404
     return jsonify({"outcomes": detail})
+
+
+# --- M11 manual-only strict season packs ---------------------------------
+@api_bp.get("/libraries/<int:library_id>/season-packs/settings")
+def season_pack_settings(library_id: int):
+    settings = _services()["season_pack"].settings(library_id)
+    if settings is None: return jsonify({"errors": ["Sonarr library not found"]}), 404
+    return jsonify({"settings": settings})
+
+@api_bp.patch("/libraries/<int:library_id>/season-packs/settings")
+def update_season_pack_settings(library_id: int):
+    settings, errors = _services()["season_pack"].update_settings(library_id, request.get_json(silent=True))
+    if errors: return jsonify({"errors": errors}), 400 if errors != ["Sonarr library not found"] else 404
+    return jsonify({"settings": settings})
+
+@api_bp.get("/libraries/<int:library_id>/season-packs/download-clients")
+def season_pack_clients(library_id: int):
+    clients, error = _services()["season_pack"].clients(library_id)
+    if error: return jsonify({"errors": [error]}), 404 if error == "Sonarr library not found" else 502
+    return jsonify({"clients": clients})
+
+@api_bp.post("/libraries/<int:library_id>/season-packs/preview")
+def preview_season_pack(library_id: int):
+    result, error = _services()["season_pack"].preview(library_id, request.get_json(silent=True))
+    if error: return jsonify({"errors": [error]}), 422
+    return jsonify(result), 201
+
+@api_bp.post("/season-packs/<int:audit_id>/confirm")
+def confirm_season_pack(audit_id: int):
+    result, error = _services()["season_pack"].confirm(audit_id, request.get_json(silent=True))
+    if error: return jsonify({"errors": [error]}), 422
+    return jsonify({"audit": result})
+
+@api_bp.get("/activity/season-packs")
+def season_pack_activity():
+    limit=max(1,min(request.args.get("limit",50,type=int),100))
+    rows=_services()["season_pack_repo"].recent(limit)
+    return jsonify({"audits": [_services()["season_pack"].safe_audit(x) for x in rows]})

@@ -602,8 +602,9 @@ def test_v6_live_control_bounds_are_enforced(database):
 
 
 def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(database):
-    assert MIGRATIONS[-2].version == 9
-    assert MIGRATIONS[-1].version == 10
+    assert MIGRATIONS[-3].version == 9
+    assert MIGRATIONS[-2].version == 10
+    assert MIGRATIONS[-1].version == 11
     migration = next(item for item in MIGRATIONS if item.version == 8)
     with database.connect() as conn:
         conn.execute(
@@ -673,3 +674,34 @@ def test_m9_constraints_allow_only_documented_no_result_shapes(database):
     assert "no_result" in definitions['dispatch_reconciliation_attempts_state_check']
     assert "reconciliation" in definitions['dispatch_outcome_events_source_endpoint_check']
     assert "no_result" in definitions['dispatch_outcome_events_event_type_check']
+
+
+def test_m11_season_pack_schema_is_idempotent_append_only_and_populated_safe(database,library_repo):
+    library=library_repo.create({"name":"M11","type":"sonarr","url":"http://sonarr","api_key":"secret","enabled":True})
+    with database.connect() as conn:
+        conn.execute("INSERT INTO season_pack_settings(library_id,enabled,protocol,download_client_id) VALUES(%s,FALSE,NULL,NULL)",(library.id,))
+        row=conn.execute("""INSERT INTO season_pack_audit(library_id,series_id,season_number,series_title,state,episode_count,rejected_summary,confirmation_digest,settings_snapshot) VALUES(%s,7,2,'Show','previewed',2,'[]',%s,'{}') RETURNING id""",(library.id,"a"*64)).fetchone()
+    run_migrations(database)
+    with database.connect() as conn:
+        assert conn.execute("SELECT count(*) c FROM season_pack_audit WHERE id=%s",(row["id"],)).fetchone()["c"]==1
+        with pytest.raises(psycopg.errors.RaiseException):conn.execute("DELETE FROM season_pack_audit WHERE id=%s",(row["id"],))
+
+
+def test_m11_real_postgresql_upgrade_preserves_populated_append_only_audit(database):
+    schema="m11_probe_"+uuid4().hex
+    quoted=psycopg.sql.Identifier(schema)
+    with database.connect() as conn:
+        conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(quoted))
+        try:
+            conn.execute(psycopg.sql.SQL("SET search_path TO {}").format(quoted))
+            for migration in MIGRATIONS[:10]:conn.execute(migration.sql)
+            before=conn.execute("SELECT count(*) c FROM live_control_audit").fetchone()["c"]
+            conn.execute(MIGRATIONS[10].sql)
+            after=conn.execute("SELECT count(*) c FROM live_control_audit").fetchone()["c"]
+            assert before>0 and after==before
+            tables={r["table_name"] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema=%s",(schema,)).fetchall()}
+            assert {"season_pack_settings","season_pack_audit"}<=tables
+            assert conn.execute("SELECT count(*) c FROM season_pack_settings").fetchone()["c"]==0
+        finally:
+            conn.execute("SET search_path TO public")
+            conn.execute(psycopg.sql.SQL("DROP SCHEMA {} CASCADE").format(quoted))

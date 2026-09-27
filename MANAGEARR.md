@@ -4,7 +4,7 @@ Managearr is a standalone Flask/PostgreSQL rewrite beside the legacy Huntarr
 application (`main.py`, `src/`). It has its own image, database, port, API, and
 UI. Nothing in this application changes the legacy runtime.
 
-## Current milestone: definitive dispatch outcomes (M9)
+## Current milestone: strict manual Sonarr season packs (M11)
 
 M9 keeps the append-only `dispatch_outcome_events` ledger as the single source
 of item outcomes. For each dispatched item, effective evidence is selected by
@@ -999,6 +999,53 @@ replacement/recovery work. It never deletes or rescans files, grabs releases,
 searches a series/season, cancels commands, mutates profiles/custom formats/root
 folders, or changes a download client.
 
+## M11: strict manual Sonarr season packs
+
+M11 adds a separate, manual-only release path. It does not change the existing missing/upgrade EpisodeSearch planner or worker. The release path performs Sonarr's interactive GET /api/v3/release?seriesId=&seasonNumber=, selects one exact cached release, and only after a second confirmation sends POST /api/v3/release with that release's guid, indexerId, and configured downloadClientId. There is no SeasonSearch command and no fallback to episode, series, or broad season search.
+
+### Selection and v1 references
+
+managearr/app/domain/season_pack.py is a typed fail-closed boundary based on Sonarr v4 ReleaseResource, ReleaseEpisodeResource, QualityModel, Language, and DownloadProtocol shapes. It follows the proven legacy v1 implementation in src/primary/apps/sonarr/api.py (protocol normalization, release mapping, cutoff rejection allowlist, override payload), with stricter M11 rules:
+
+- exactly one positive non-special season from a standard series; daily/anime, cross-season, partial, duplicate, malformed, and episode-title results are rejected;
+- mapped episode IDs must equal Sonarr's complete authoritative target-season inventory; unknown completeness never qualifies;
+- Sonarr must explicitly allow and approve the release. All custom-format, size, age, indexer, parsing, protocol, and other rejection reasons remain authoritative and are shown in preview/audit;
+- optional cutoff override recognizes only the exact anchored Existing file meets cutoff: <quality> rejection in Sonarr's exact hard-rejected, non-temporary state. Every mapping, routing, shape, and rejection check still must pass;
+- an explicitly configured enabled download client and matching usenet or torrent protocol are proven at preview and again immediately before POST. Managearr never writes Sonarr download-client configuration.
+
+### Schema, API, and UI
+
+Schema v11 transactionally creates season_pack_settings (default disabled) and season_pack_audit. Audit identity, selected/rejected summaries, settings snapshot, and token digest are secret-free and immutable; only constrained state transitions are allowed, deletion is rejected, and deleting a library only nulls its audit foreign key. The migration creates new tables and is idempotent on populated databases, so existing append-only M4-M10 audit tables are never updated.
+
+Endpoints:
+
+- GET/PATCH /api/v1/libraries/:id/season-packs/settings
+- GET /api/v1/libraries/:id/season-packs/download-clients
+- POST /api/v1/libraries/:id/season-packs/preview
+- POST /api/v1/season-packs/:audit_id/confirm
+- GET /api/v1/activity/season-packs
+
+The Season Packs page exposes routing/limits, a read-only preview with selected and rejected reasons, and a separate checkbox/button confirmation. Raw release GUIDs, confirmation digests, API keys, and Sonarr payloads are never returned or stored in audit. Confirmation tokens expire after ten minutes and are stored only as SHA-256 digests. Repeated confirmation is idempotent and never sends a second POST.
+
+### Safety matrix
+
+| Condition | Preview | Exact grab |
+|---|---:|---:|
+| feature disabled / routing unproven | blocked | blocked |
+| scheduler off or simulation | allowed when configured | blocked |
+| Live paused / Emergency Stop | allowed | blocked |
+| Live running, authorization generation unchanged | allowed | manual confirmation only |
+| settings/client/release changed after preview | new facts shown | blocked on revalidation |
+| hourly cap, target cooldown, or pacing interval active | allowed | blocked atomically |
+| timeout/connection loss after POST attempt | n/a | durable ambiguous; never retried |
+
+M11 is not wired into the scheduler or LiveDispatchCoordinator; automatic Live season-pack grabbing is intentionally absent. Simulation never calls release search or grab methods. Existing individual EpisodeSearch behavior remains unchanged.
+
+### Explicit M12 destructive-replacement boundary
+
+M11 delegates the sanctioned release grab to Sonarr and performs no file deletion, move, backup, restore, rescan, import, queue cancellation, profile/custom-format/root-folder mutation, or direct replacement recovery. Transactional on-disk replacement, rollback/quarantine, import verification, and automatic Live season-pack dispatch are M12 work and must not be inferred from M11's narrow cutoff override.
+
+
 ## Current limitations
 
 - Sonarr only; other Arr types remain CRUD-only.
@@ -1008,7 +1055,7 @@ folders, or changes a download client.
   endpoint remains independent. Reconciliation runs on explicit operator
   request and a bounded automatic cadence, but terminal `resolved` and
   `no_result` batches leave that automatic sweep. No path retries a sent
-  search. No download-client write, grab, download, or import pipeline exists.
+  search. M11 adds only a confirmed manual exact-release grab; no download-client write, automatic season-pack, direct download, or import/replacement pipeline exists.
 - Managearr has no authentication/authorization yet; protect the service at the
   network/reverse-proxy layer.
 - A process crash after Sonarr accepts a command but before local finalization
