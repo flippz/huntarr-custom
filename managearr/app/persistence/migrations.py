@@ -1334,6 +1334,27 @@ MIGRATIONS: list[Migration] = [
               FOR EACH ROW EXECUTE FUNCTION protect_season_pack_attempt_started();
         """,
     ),
+    Migration(
+        version=13,
+        name="season_pack_markerless_reservation_recovery",
+        sql="""
+            CREATE OR REPLACE FUNCTION protect_season_pack_audit() RETURNS trigger AS $$
+            BEGIN
+              IF TG_OP='DELETE' THEN RAISE EXCEPTION 'season-pack audit rows cannot be deleted'; END IF;
+              IF NEW.library_id IS DISTINCT FROM OLD.library_id AND NOT (OLD.library_id IS NOT NULL AND NEW.library_id IS NULL) THEN RAISE EXCEPTION 'season-pack audit identity is immutable'; END IF;
+              IF OLD.library_id IS NOT NULL AND NEW.library_id IS NULL AND NEW.state IS NOT DISTINCT FROM OLD.state AND NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN RETURN NEW; END IF;
+              IF NEW.series_id IS DISTINCT FROM OLD.series_id OR NEW.season_number IS DISTINCT FROM OLD.season_number OR NEW.series_title IS DISTINCT FROM OLD.series_title OR NEW.selected_fingerprint IS DISTINCT FROM OLD.selected_fingerprint OR NEW.selected_title IS DISTINCT FROM OLD.selected_title OR NEW.selected_protocol IS DISTINCT FROM OLD.selected_protocol OR NEW.selected_indexer_id IS DISTINCT FROM OLD.selected_indexer_id OR NEW.episode_count IS DISTINCT FROM OLD.episode_count OR NEW.cutoff_override IS DISTINCT FROM OLD.cutoff_override OR NEW.rejected_summary IS DISTINCT FROM OLD.rejected_summary OR NEW.confirmation_digest IS DISTINCT FROM OLD.confirmation_digest OR NEW.settings_snapshot IS DISTINCT FROM OLD.settings_snapshot OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN RAISE EXCEPTION 'season-pack audit identity is immutable'; END IF;
+              IF OLD.state='dispatching' AND NEW.state='previewed' THEN
+                IF OLD.dispatch_started_at IS NULL OR OLD.dispatch_started_at >= now() - interval '5 minutes' THEN RAISE EXCEPTION 'season-pack reservation is not stale'; END IF;
+                IF EXISTS (SELECT 1 FROM season_pack_attempt_started WHERE audit_id=OLD.id) THEN RAISE EXCEPTION 'season-pack attempt marker forbids retry'; END IF;
+                IF NEW.live_generation IS NOT NULL OR NEW.dispatch_started_at IS NOT NULL THEN RAISE EXCEPTION 'season-pack recovery must clear reservation metadata'; END IF;
+              ELSIF NOT ((OLD.state='previewed' AND NEW.state='dispatching') OR (OLD.state='dispatching' AND NEW.state IN ('completed','blocked','ambiguous'))) THEN
+                RAISE EXCEPTION 'invalid season-pack audit transition';
+              END IF;
+              RETURN NEW;
+            END; $$ LANGUAGE plpgsql;
+        """,
+    ),
 ]
 
 

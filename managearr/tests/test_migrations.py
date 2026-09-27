@@ -602,7 +602,7 @@ def test_v6_live_control_bounds_are_enforced(database):
 
 
 def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(database):
-    assert [item.version for item in MIGRATIONS[-4:]] == [9, 10, 11, 12]
+    assert [item.version for item in MIGRATIONS[-5:]] == [9, 10, 11, 12, 13]
     migration = next(item for item in MIGRATIONS if item.version == 8)
     with database.connect() as conn:
         conn.execute(
@@ -680,6 +680,47 @@ def test_m9_constraints_allow_only_documented_no_result_shapes(database):
     assert "no_result" in definitions['dispatch_reconciliation_attempts_state_check']
     assert "reconciliation" in definitions['dispatch_outcome_events_source_endpoint_check']
     assert "no_result" in definitions['dispatch_outcome_events_event_type_check']
+
+
+def test_v13_recovery_transition_requires_stale_markerless_reservation(database,library_repo):
+    library=library_repo.create({"name":"M13","type":"sonarr","url":"http://sonarr","api_key":"secret","enabled":True})
+    def new_audit(conn,stale):
+        # dispatch_started_at must be set at INSERT time (not via a later
+        # same-state UPDATE): the v13 trigger only allows the enumerated
+        # state transitions, so a bare 'dispatching'->'dispatching' update
+        # that only touches dispatch_started_at is itself rejected.
+        age="now()-interval '6 minutes'" if stale else "now()"
+        return conn.execute(
+            f"""INSERT INTO season_pack_audit(library_id,series_id,season_number,series_title,state,
+               episode_count,rejected_summary,confirmation_digest,settings_snapshot,live_generation,dispatch_started_at)
+               VALUES(%s,7,2,'Show','dispatching',2,'[]',%s,'{{}}',1,{age}) RETURNING id""",
+            (library.id,"a"*64),
+        ).fetchone()["id"]
+
+    with database.connect() as conn:
+        not_stale=new_audit(conn,stale=False)
+    with pytest.raises(psycopg.errors.RaiseException,match="not stale"):
+        with database.connect() as conn:
+            conn.execute("UPDATE season_pack_audit SET state='previewed',live_generation=NULL,dispatch_started_at=NULL WHERE id=%s",(not_stale,))
+
+    with database.connect() as conn:
+        marked=new_audit(conn,stale=True)
+        conn.execute("INSERT INTO season_pack_attempt_started(audit_id) VALUES(%s)",(marked,))
+    with pytest.raises(psycopg.errors.RaiseException,match="forbids retry"):
+        with database.connect() as conn:
+            conn.execute("UPDATE season_pack_audit SET state='previewed',live_generation=NULL,dispatch_started_at=NULL WHERE id=%s",(marked,))
+
+    with database.connect() as conn:
+        dirty=new_audit(conn,stale=True)
+    with pytest.raises(psycopg.errors.RaiseException,match="clear reservation metadata"):
+        with database.connect() as conn:
+            conn.execute("UPDATE season_pack_audit SET state='previewed',dispatch_started_at=NULL WHERE id=%s",(dirty,))
+
+    with database.connect() as conn:
+        clean=new_audit(conn,stale=True)
+        conn.execute("UPDATE season_pack_audit SET state='previewed',live_generation=NULL,dispatch_started_at=NULL WHERE id=%s",(clean,))
+        row=conn.execute("SELECT state,live_generation,dispatch_started_at FROM season_pack_audit WHERE id=%s",(clean,)).fetchone()
+    assert row["state"]=="previewed" and row["live_generation"] is None and row["dispatch_started_at"] is None
 
 
 def test_m11_season_pack_schema_is_idempotent_append_only_and_populated_safe(database,library_repo):

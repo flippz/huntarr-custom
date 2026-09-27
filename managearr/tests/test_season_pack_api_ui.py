@@ -21,11 +21,14 @@ def test_season_pack_ui_states_manual_safety_boundary(client):
 
 
 import copy
+import json
+import os
 import threading
 import time
 import pytest
 
 from app.adapters.sonarr_client import SonarrPostAmbiguousError, SonarrPostRejectedError
+from app.persistence.database import Database
 from app.persistence.season_pack_repository import SeasonPackRepository
 from app.services.season_pack_service import SeasonPackService
 
@@ -123,6 +126,127 @@ class CrashAfterAcceptedClient(ExactClient):
     def grab_release(self,body):
         super().grab_release(body)
         raise SimulatedProcessDeath("process died after Sonarr accepted the POST")
+
+
+def test_restart_recovers_stale_markerless_pre_write_reservation(client,app,database,library_repo,monkeypatch):
+    _,preview=prepare(client,app,database,library_repo,monkeypatch)
+    audit_id=preview["audit"]["id"]
+    generation=app.extensions["managearr"]["live_repo"].get_control()["authorization_generation"]
+    with database.connect() as conn:
+        conn.execute("UPDATE season_pack_audit SET state='dispatching',live_generation=%s,dispatch_started_at=now()-interval '6 minutes',updated_at=now() WHERE id=%s",(generation,audit_id))
+        assert conn.execute("SELECT 1 FROM season_pack_attempt_started WHERE audit_id=%s",(audit_id,)).fetchone() is None
+
+    # A fresh repository/service models a process restart after reservation
+    # persistence but before the independently committed attempt marker.
+    restarted=SeasonPackService(SeasonPackRepository(database),library_repo,app.extensions["managearr"]["live_repo"],app.extensions["managearr"]["scheduler_repo"],client_factory=ChangingClient)
+    result,error=restarted.confirm(audit_id,{"confirm":True,"confirmation_token":preview["confirmation_token"]})
+    assert error is None and result["state"]=="completed"
+    assert len(ChangingClient.grabs)==1
+    with database.connect() as conn:
+        assert conn.execute("SELECT started_at FROM season_pack_attempt_started WHERE audit_id=%s",(audit_id,)).fetchone()["started_at"] is not None
+
+
+def test_restart_blocks_markerless_reservation_once_preview_also_expired(client,app,database,library_repo,monkeypatch):
+    _,preview=prepare(client,app,database,library_repo,monkeypatch)
+    generation=app.extensions["managearr"]["live_repo"].get_control()["authorization_generation"]
+    with database.connect() as conn:
+        row=dict(conn.execute("SELECT * FROM season_pack_audit WHERE id=%s",(preview["audit"]["id"],)).fetchone())
+        new_id=conn.execute(
+            """INSERT INTO season_pack_audit(library_id,series_id,season_number,series_title,state,
+               selected_fingerprint,selected_title,selected_protocol,selected_indexer_id,episode_count,
+               cutoff_override,rejected_summary,confirmation_digest,settings_snapshot,live_generation,
+               dispatch_started_at,created_at,updated_at)
+               VALUES(%s,%s,%s,%s,'dispatching',%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,
+               now()-interval '6 minutes',now()-interval '11 minutes',now()) RETURNING id""",
+            (row["library_id"],row["series_id"],row["season_number"],row["series_title"],
+             row["selected_fingerprint"],row["selected_title"],row["selected_protocol"],row["selected_indexer_id"],
+             row["episode_count"],row["cutoff_override"],json.dumps(row["rejected_summary"]),row["confirmation_digest"],
+             json.dumps(row["settings_snapshot"]),generation),
+        ).fetchone()["id"]
+        assert conn.execute("SELECT 1 FROM season_pack_attempt_started WHERE audit_id=%s",(new_id,)).fetchone() is None
+
+    # Markerless and stale, but the preview itself is also past its 10-minute
+    # window: recovering to 'previewed' would just fail the expiry check again
+    # on every retry, so this must land directly on a terminal 'blocked' state.
+    restarted=SeasonPackService(SeasonPackRepository(database),library_repo,app.extensions["managearr"]["live_repo"],app.extensions["managearr"]["scheduler_repo"],client_factory=ChangingClient)
+    result,error=restarted.confirm(new_id,{"confirm":True,"confirmation_token":preview["confirmation_token"]})
+    assert error is None and result["state"]=="blocked"
+    assert "create a new preview" in result["error_summary"]
+    assert ChangingClient.grabs==[]
+    with database.connect() as conn:
+        assert conn.execute("SELECT 1 FROM season_pack_attempt_started WHERE audit_id=%s",(new_id,)).fetchone() is None
+
+
+def test_dedicated_marker_connection_works_with_pool_max_size_one(client,app,database,library_repo,monkeypatch):
+    _,preview=prepare(client,app,database,library_repo,monkeypatch)
+    single=Database(
+        host=os.environ.get("MANAGEARR_TEST_DB_HOST","127.0.0.1"),
+        port=int(os.environ.get("MANAGEARR_TEST_DB_PORT","5432")),
+        dbname=os.environ.get("MANAGEARR_TEST_DB_NAME","managearr_test"),
+        user=os.environ.get("MANAGEARR_TEST_DB_USER","managearr_test"),
+        password=os.environ.get("MANAGEARR_TEST_DB_PASSWORD","testpass123"),
+        sslmode="disable",min_size=1,max_size=1,connect_timeout=2,
+    )
+    single.wait_ready(timeout_seconds=5)
+    try:
+        service=SeasonPackService(SeasonPackRepository(single),library_repo,app.extensions["managearr"]["live_repo"],app.extensions["managearr"]["scheduler_repo"],client_factory=ChangingClient)
+        result,error=service.confirm(preview["audit"]["id"],{"confirm":True,"confirmation_token":preview["confirmation_token"]})
+        assert error is None and result["state"]=="completed"
+        assert len(ChangingClient.grabs)==1
+    finally:
+        single.close()
+
+
+def test_dedicated_marker_connection_failure_blocks_before_post(client,app,database,library_repo,monkeypatch):
+    _,preview=prepare(client,app,database,library_repo,monkeypatch)
+    service=app.extensions["managearr"]["season_pack"]
+
+    def unavailable(**kwargs):
+        raise RuntimeError("dedicated marker connection unavailable")
+
+    monkeypatch.setattr(service.repo.db,"dedicated_transaction",unavailable)
+    result,error=service.confirm(preview["audit"]["id"],{"confirm":True,"confirmation_token":preview["confirmation_token"]})
+    assert error is None and result["state"]=="blocked"
+    assert result["error_summary"]=="unexpected error before grab attempt"
+    assert ChangingClient.grabs==[]
+
+
+def test_dedicated_marker_commits_despite_concurrent_pool_exhaustion(client,app,database,library_repo,monkeypatch):
+    _,preview=prepare(client,app,database,library_repo,monkeypatch)
+    audit_id=preview["audit"]["id"]
+    single=Database(
+        host=os.environ.get("MANAGEARR_TEST_DB_HOST","127.0.0.1"),
+        port=int(os.environ.get("MANAGEARR_TEST_DB_PORT","5432")),
+        dbname=os.environ.get("MANAGEARR_TEST_DB_NAME","managearr_test"),
+        user=os.environ.get("MANAGEARR_TEST_DB_USER","managearr_test"),
+        password=os.environ.get("MANAGEARR_TEST_DB_PASSWORD","testpass123"),
+        sslmode="disable",min_size=1,max_size=1,connect_timeout=2,
+    )
+    single.wait_ready(timeout_seconds=5)
+    BlockingAcceptedClient.entered=threading.Event();BlockingAcceptedClient.release=threading.Event();ExactClient.grabs=[]
+    try:
+        service=SeasonPackService(SeasonPackRepository(single),library_repo,app.extensions["managearr"]["live_repo"],app.extensions["managearr"]["scheduler_repo"],client_factory=BlockingAcceptedClient)
+        outcome={}
+        def confirm():
+            outcome["result"]=service.confirm(audit_id,{"confirm":True,"confirmation_token":preview["confirmation_token"]})
+        confirm_thread=threading.Thread(target=confirm);confirm_thread.start()
+        # authorized_write holds the pool's sole connection for the whole
+        # bounded POST (Fix 3). If the marker commit ever reused that same
+        # pool it would self-deadlock right here instead of reaching the
+        # POST at all - so simply getting past this wait proves the marker
+        # committed through a separate, dedicated connection.
+        assert BlockingAcceptedClient.entered.wait(3)
+        with database.connect() as conn:
+            marker=conn.execute("SELECT started_at FROM season_pack_attempt_started WHERE audit_id=%s",(audit_id,)).fetchone()
+        assert marker is not None and marker["started_at"] is not None
+        BlockingAcceptedClient.release.set()
+        confirm_thread.join(3)
+        assert not confirm_thread.is_alive()
+        result,error=outcome["result"]
+        assert error is None and result["state"]=="completed"
+        assert len(ExactClient.grabs)==1
+    finally:
+        single.close()
 
 
 def test_crash_after_accepted_post_is_durably_ambiguous_and_never_resent(client,app,database,library_repo,monkeypatch):

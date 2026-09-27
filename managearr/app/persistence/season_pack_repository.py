@@ -39,8 +39,14 @@ class SeasonPackRepository:
             attempt=c.execute("SELECT 1 FROM season_pack_attempt_started WHERE audit_id=%s",(audit_id,)).fetchone()
             if row["state"]=="dispatching" and attempt:
                 row=dict(c.execute("UPDATE season_pack_audit SET state='ambiguous',error_summary='grab attempt started but no terminal result was persisted; inspect Sonarr before any retry',updated_at=now() WHERE id=%s RETURNING *",(audit_id,)).fetchone())
-            if row["state"]=="dispatching" and row["dispatch_started_at"] and now-row["dispatch_started_at"]>timedelta(minutes=5):
-                row=dict(c.execute("UPDATE season_pack_audit SET state='ambiguous',error_summary='grab reservation expired; inspect Sonarr before any retry',updated_at=now() WHERE id=%s RETURNING *",(audit_id,)).fetchone())
+            if row["state"]=="dispatching" and not attempt and row["dispatch_started_at"] and now-row["dispatch_started_at"]>timedelta(minutes=5):
+                if now-row["created_at"]>timedelta(minutes=10):
+                    row=dict(c.execute("UPDATE season_pack_audit SET state='blocked',error_summary='preview expired after an unstarted reservation; create a new preview',updated_at=now() WHERE id=%s RETURNING *",(audit_id,)).fetchone())
+                else:
+                    # No durable marker proves the POST boundary was never
+                    # crossed. Returning to previewed makes every normal
+                    # digest/expiry/cap/pacing/cooldown check run again.
+                    row=dict(c.execute("UPDATE season_pack_audit SET state='previewed',live_generation=NULL,dispatch_started_at=NULL,error_summary='',updated_at=now() WHERE id=%s RETURNING *",(audit_id,)).fetchone())
             if row["state"]!="previewed":return row,None
             if row["library_id"] is None:return None,"preview library no longer exists"
             c.execute("SELECT pg_advisory_xact_lock(%s,%s)",(self.LOCK_CLASS,row["library_id"]))
@@ -84,7 +90,7 @@ class SeasonPackRepository:
             elif not settings or not settings["enabled"] or any(settings[k]!=snapshot.get(k) for k in ("protocol","download_client_id","allow_cutoff_override","hourly_grab_cap","cooldown_minutes","pacing_seconds")):
                 error="season-pack settings changed since preview"
             if error is None:
-                with self.db.connect() as marker_conn:
+                with self.db.dedicated_transaction(lock_timeout_seconds=5) as marker_conn:
                     marker_conn.execute("INSERT INTO season_pack_attempt_started(audit_id,started_at) VALUES(%s,now())",(audit_id,))
             yield c,error
     def finalize(self,audit_id,state,error="",conn=None):
