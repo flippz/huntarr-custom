@@ -30,13 +30,16 @@ def test_activity_ui_clear_preview_is_local_and_send_uses_exact_confirmation(cli
 
 def test_global_preview_banner_no_longer_claims_no_search_can_be_sent(client):
     html = client.get("/activity").get_data(as_text=True)
-    assert "Sonarr searches require an explicit preview and confirmation" in html
+    assert "Manual searches require preview and confirmation" in html
+    assert "scheduled Live episode automation can send searches after explicit enablement" in html
     assert "no searches are sent and nothing in Sonarr is changed" not in html
 
 
 def test_activity_ui_exposes_read_only_reconciliation_and_evidence_timeline(client):
     html = client.get("/activity").get_data(as_text=True)
-    assert "Outcome reconciliation is manual and read-only: it sends no search" in html
+    assert "Outcome reconciliation is read-only and sends no search" in html
+    assert "Live dispatches are reconciled automatically" in html
+    assert "manual reconciliation remains available" in html
     assert "not proof that Sonarr grabbed, downloaded, or imported" in html
     assert 'id="outcome-detail"' in html
     assert 'data-action="reconcile"' in html
@@ -59,5 +62,6 @@ def test_activity_ui_labels_missing_and_upgrade_candidate_kinds(client):
 def test_settings_explains_safe_individual_upgrade_search(client):
     html = client.get("/settings").get_data(as_text=True)
     assert "Search individual episode quality upgrades" in html
-    assert "No season packs, file deletion, or replacement" in html
+    assert "This episode policy does not dispatch season packs or delete or replace files" in html
+    assert "manual Season Packs page" in html
     assert "roughly 20% of shared capacity is reserved for upgrades" in html

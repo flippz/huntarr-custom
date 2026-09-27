@@ -4,7 +4,7 @@
 <h1>Activity</h1>
 <p class="muted">Durable scan, scheduled/manual dispatch, and Sonarr outcome history.</p>
 <p class="readonly-notice">Candidate scans only read Sonarr. Live or confirmed manual dispatch may send an EpisodeSearch command.</p>
-<p class="readonly-notice">Outcome reconciliation is manual and read-only: it sends no search. A completed EpisodeSearch command is not proof that Sonarr grabbed, downloaded, or imported an episode. Live dispatches are queued for prompt automatic read-only reconciliation.</p>
+<p class="readonly-notice">Outcome reconciliation is read-only and sends no search. Live dispatches are reconciled automatically, and manual reconciliation remains available for eligible attempts. A completed EpisodeSearch command alone is not proof that Sonarr grabbed, downloaded, or imported an episode.</p>
 
 <section class="card">
   <h2>Episode history</h2>

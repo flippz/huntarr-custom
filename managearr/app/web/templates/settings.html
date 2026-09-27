@@ -2,7 +2,7 @@
 {% block title %}Settings{% endblock %}
 {% block content %}
 <h1>Settings</h1>
-<p class="simulation-notice"><strong>Simulation sends no Sonarr commands.</strong> Live automation is not available.</p>
+<p class="simulation-notice"><strong>Simulation sends no Sonarr commands and remains read-only.</strong> Live automation below can send EpisodeSearch commands after explicit enablement.</p>
 <section class="card">
   <h2>Simulation scheduler</h2>
   <p>Mode: <strong id="scheduler-mode">-</strong> · Worker lease: <strong id="scheduler-lease">-</strong></p>
@@ -63,7 +63,7 @@
     <label class="checkbox">
       <input type="checkbox" id="p-upgrades">
       Search individual episode quality upgrades
-      <span class="muted">Uses Sonarr's below-cutoff list and EpisodeSearch only. When both modes have candidates, roughly 20% of shared capacity is reserved for upgrades, with at least one slot when the cap is two or more; unused capacity returns to either mode. No season packs, file deletion, or replacement.</span>
+      <span class="muted">Uses Sonarr's below-cutoff list and EpisodeSearch only. When both modes have candidates, roughly 20% of shared capacity is reserved for upgrades, with at least one slot when the cap is two or more; unused capacity returns to either mode. This episode policy does not dispatch season packs or delete or replace files; exact season-pack grabs are available separately on the manual Season Packs page.</span>
     </label>
     <label>Cycle interval / test cadence (minutes)
       <input type="number" id="p-cycle" min="5" max="1440" required>
