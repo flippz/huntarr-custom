@@ -434,11 +434,38 @@ def test_m10_real_postgresql_upgrade_backfills_existing_candidates(database):
                 "VALUES (%s,%s,1,'Show',1,1,1,'missing',now()) RETURNING id",
                 (job_id, library_id),
             ).fetchone()["id"]
+            cycle_id = conn.execute(
+                "INSERT INTO scheduler_cycle_runs (trigger,state,mode_snapshot,policy_snapshot,"
+                "random_seed,worker_owner,started_at,finished_at,library_count,"
+                "completed_library_count,considered_count,selected_count,excluded_count) "
+                "VALUES ('scheduled','completed','simulate','{}',1,'probe',now(),now(),1,1,1,1,0) "
+                "RETURNING id"
+            ).fetchone()["id"]
+            library_result_id = conn.execute(
+                "INSERT INTO scheduler_library_results (cycle_run_id,library_id,library_name,scan_job_id,"
+                "state,considered_count,selected_count,excluded_count,effective_cap,queue_occupancy,"
+                "recent_success_count,upgrades_state,safe_summary) "
+                "VALUES (%s,%s,'old',%s,'completed',1,1,0,1,0,0,'disabled','legacy') RETURNING id",
+                (cycle_id, library_id, job_id),
+            ).fetchone()["id"]
+            scheduler_candidate_id = conn.execute(
+                "INSERT INTO scheduler_candidate_results (cycle_run_id,library_result_id,candidate_id,"
+                "episode_id,series_id,series_title,season_number,episode_number,candidate_reason,"
+                "selected,order_position) VALUES (%s,%s,%s,1,1,'Show',1,1,'missing',TRUE,1) RETURNING id",
+                (cycle_id, library_result_id, candidate_id),
+            ).fetchone()["id"]
+            # The v4 append-only trigger is active here. M10 must backfill by
+            # adding a constant-default column, never by updating audit rows.
             conn.execute(MIGRATIONS[9].sql)
             row = conn.execute(
                 "SELECT candidate_kind FROM scan_candidates WHERE id=%s", (candidate_id,)
             ).fetchone()
             assert row["candidate_kind"] == "missing"
+            scheduler_row = conn.execute(
+                "SELECT candidate_kind FROM scheduler_candidate_results WHERE id=%s",
+                (scheduler_candidate_id,),
+            ).fetchone()
+            assert scheduler_row["candidate_kind"] == "missing"
             with pytest.raises(psycopg.errors.CheckViolation):
                 with conn.transaction():
                     conn.execute(

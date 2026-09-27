@@ -1247,20 +1247,19 @@ MIGRATIONS: list[Migration] = [
         version=10,
         name="sonarr_quality_upgrade_candidates",
         sql="""
-            ALTER TABLE scan_candidates ADD COLUMN candidate_kind TEXT;
-            UPDATE scan_candidates SET candidate_kind = 'missing' WHERE candidate_kind IS NULL;
-            ALTER TABLE scan_candidates ALTER COLUMN candidate_kind SET DEFAULT 'missing';
-            ALTER TABLE scan_candidates ALTER COLUMN candidate_kind SET NOT NULL;
+            -- A constant DEFAULT + NOT NULL adds and backfills this column without
+            -- issuing row UPDATEs. That is required for scheduler audit tables,
+            -- whose append-only trigger correctly rejects UPDATE statements.
+            ALTER TABLE scan_candidates
+                ADD COLUMN candidate_kind TEXT NOT NULL DEFAULT 'missing';
             ALTER TABLE scan_candidates
                 ADD CONSTRAINT scan_candidates_candidate_kind_check
                 CHECK (candidate_kind IN ('missing', 'upgrade'));
             CREATE INDEX idx_scan_candidates_job_kind
                 ON scan_candidates (job_id, candidate_kind, id);
 
-            ALTER TABLE scheduler_candidate_results ADD COLUMN candidate_kind TEXT;
-            UPDATE scheduler_candidate_results SET candidate_kind = 'missing' WHERE candidate_kind IS NULL;
-            ALTER TABLE scheduler_candidate_results ALTER COLUMN candidate_kind SET DEFAULT 'missing';
-            ALTER TABLE scheduler_candidate_results ALTER COLUMN candidate_kind SET NOT NULL;
+            ALTER TABLE scheduler_candidate_results
+                ADD COLUMN candidate_kind TEXT NOT NULL DEFAULT 'missing';
             ALTER TABLE scheduler_candidate_results
                 ADD CONSTRAINT scheduler_candidate_results_candidate_kind_check
                 CHECK (candidate_kind IN ('missing', 'upgrade'));
