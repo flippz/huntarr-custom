@@ -430,7 +430,7 @@ class LiveRepository:
                     e.safe_summary, e.batch_id, e.sonarr_command_id
                   FROM dispatch_outcome_events e
                   WHERE e.dispatch_item_id IS NOT NULL
-                    AND e.event_type IN ('grabbed','imported','download_failed',
+                    AND e.event_type IN ('no_result','grabbed','imported','download_failed',
                                          'import_failed','command_failed','command_aborted')
                   ORDER BY e.dispatch_item_id,
                     CASE WHEN e.event_type IN ('imported','download_failed','import_failed',
@@ -458,6 +458,7 @@ class LiveRepository:
                   UNION ALL
                   SELECT ('outcome:'||e.id)::text, e.observed_at,
                     CASE e.event_type
+                      WHEN 'no_result' THEN 'Search finished'
                       WHEN 'grabbed' THEN 'Download found'
                       WHEN 'imported' THEN 'Imported'
                       WHEN 'download_failed' THEN 'Download failed'
@@ -465,6 +466,7 @@ class LiveRepository:
                       ELSE 'Search failed'
                     END activity,
                     CASE
+                      WHEN e.event_type='no_result' THEN 'No result'
                       WHEN e.event_type='grabbed' THEN 'In progress'
                       WHEN e.event_type='imported' THEN 'Completed'
                       ELSE 'Failed'

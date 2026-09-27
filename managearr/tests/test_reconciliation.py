@@ -471,6 +471,11 @@ def test_no_result_grace_boundary_is_centralized_and_append_only(
     assert boundary["item_results"][0]["human_status"]["label"] == "No result"
     detail = client.get(f"/api/v1/dispatch-batches/{batch.id}/outcomes").get_json()["outcomes"]
     assert [e["event_type"] for e in detail["items"][0]["outcomes"]].count("no_result") == 1
+    timeline = client.get("/api/v1/activity/timeline").get_json()["events"]
+    no_result_events = [e for e in timeline if e["event_key"].startswith("outcome:")]
+    assert any(e["activity"] == "Search finished" and e["result"] == "No result"
+               and e["details"] == "No outcome evidence appeared within 15 minutes."
+               for e in no_result_events)
 
     repeated = client.post(f"/api/v1/dispatch-batches/{batch.id}/reconcile").get_json()["reconciliation"]
     assert repeated["batch"]["reconciliation_state"] == "no_result"
