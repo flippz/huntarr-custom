@@ -70,10 +70,10 @@
     <div class="table-scroll">
       <table class="data-table">
         <thead>
-          <tr><th class="candidate-select-column"></th><th>Series</th><th>Season</th><th>Episode</th><th>Air date</th><th>Reason</th></tr>
+          <tr><th class="candidate-select-column"></th><th>Kind</th><th>Series</th><th>Season</th><th>Episode</th><th>Air date</th><th>Reason</th></tr>
         </thead>
         <tbody id="job-modal-candidates">
-          <tr><td colspan="6">Loading...</td></tr>
+          <tr><td colspan="7">Loading...</td></tr>
         </tbody>
       </table>
     </div>
@@ -226,7 +226,7 @@ async function openJob(jobId) {
   clearPreview();
   document.getElementById('job-modal-title').textContent = `Job #${jobId}`;
   document.getElementById('job-modal-details').textContent = 'Loading...';
-  document.getElementById('job-modal-candidates').innerHTML = '<tr><td colspan="6">Loading...</td></tr>';
+  document.getElementById('job-modal-candidates').innerHTML = '<tr><td colspan="7">Loading...</td></tr>';
   document.getElementById('dispatch-audit').innerHTML = '<tr><td colspan="9">Loading...</td></tr>';
   document.getElementById('dispatch-controls').hidden = true;
   document.getElementById('outcome-detail').hidden = true;
@@ -247,13 +247,14 @@ async function openJob(jobId) {
     const tbody = document.getElementById('job-modal-candidates');
     tbody.innerHTML = '';
     if (candidatesData.candidates.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6">No candidates.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7">No candidates.</td></tr>';
       return;
     }
     candidatesData.candidates.forEach(c => {
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>${canDispatch ? `<input class="candidate-checkbox" type="checkbox" value="${c.id}" aria-label="Select ${escapeHtml(c.series_title)} season ${c.season_number} episode ${c.episode_number}">` : ''}</td>
+        <td><span class="state-pill">${escapeHtml(c.candidate_kind === 'upgrade' ? 'Upgrade' : 'Missing')}</span></td>
         <td>${escapeHtml(c.series_title)}</td><td>${c.season_number}</td><td>${c.episode_number}</td>
         <td>${escapeHtml(c.air_date || '')}</td><td>${escapeHtml(c.reason)}</td>`;
       tbody.appendChild(tr);

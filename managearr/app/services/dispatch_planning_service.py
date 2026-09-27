@@ -56,6 +56,9 @@ CANDIDATE_DUPLICATE_REASON = "duplicate candidate id in request"
 DUPLICATE_EPISODE_REASON = "another selected candidate refers to the same Sonarr episode"
 IN_FLIGHT_REASON = "episode has another dispatch in flight"
 CAPACITY_REASON = "hourly dispatch cap has no remaining capacity for this candidate"
+MISSING_DISABLED_REASON = "missing-item planning is disabled by policy"
+UPGRADES_DISABLED_REASON = "quality-upgrade planning is disabled by policy"
+UNKNOWN_KIND_REASON = "candidate kind is unknown and cannot be dispatched safely"
 
 
 def _cooldown_reason(minutes: int) -> str:
@@ -190,6 +193,15 @@ class DispatchPlanningService:
 
         eligible: list[ScanCandidate] = []
         for candidate in valid_candidates:
+            if candidate.candidate_kind == "missing" and not policy.missing_enabled:
+                excluded.append({"candidate_id": candidate.id, "reason": MISSING_DISABLED_REASON})
+                continue
+            if candidate.candidate_kind == "upgrade" and not policy.upgrades_enabled:
+                excluded.append({"candidate_id": candidate.id, "reason": UPGRADES_DISABLED_REASON})
+                continue
+            if candidate.candidate_kind not in ("missing", "upgrade"):
+                excluded.append({"candidate_id": candidate.id, "reason": UNKNOWN_KIND_REASON})
+                continue
             if candidate.episode_id in cooled:
                 excluded.append({"candidate_id": candidate.id, "reason": _cooldown_reason(policy.cooldown_minutes)})
                 continue

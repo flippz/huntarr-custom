@@ -581,9 +581,12 @@ ordering is deterministic:
 - `random`: a stored cycle seed combined with library ID, making the shuffle
   reproducible from the audit row.
 
-Missing candidates are excluded when `missing_enabled` is false. Every cycle
-explicitly records upgrades as `unsupported` when `upgrades_enabled` is true
-(or `disabled` otherwise); M4 never pretends to plan upgrades.
+Missing candidates are excluded when `missing_enabled` is false. Quality-upgrade
+candidates are excluded independently when `upgrades_enabled` is false. Under
+shared scan and planning caps, the configured order is retained within each kind
+but Missing always precedes Upgrade, so upgrade hunting cannot starve existing
+missing-item behavior. Audit rows snapshot the candidate kind and report upgrade
+planning as `enabled` or `disabled`.
 
 The planner conservatively reads the durable manual dispatch/outcome ledger to
 exclude duplicate episodes, imported outcomes, live reservations, and episodes
@@ -808,6 +811,7 @@ Read-only methods remain:
 - `GET /api/v3/system/status`
 - `GET /api/v3/series`
 - `GET /api/v3/episode?seriesId=<id>`
+- `GET /api/v3/wanted/cutoff` in at most five deterministic 100-record pages
 - `GET /api/v3/command/<known-command-id>`
 - `GET /api/v3/history` with validated page/page-size and optional episode ID
 - `GET /api/v3/queue/details` with validated page/page-size
@@ -966,6 +970,28 @@ bounds, crash ambiguity, cross-library rejection, idempotent reruns, append-only
 evidence, safe errors, and no secret/raw-payload leakage. Sonarr remains mocked.
 M4/M5 coverage (`test_scheduler.py`, `test_refresh.py`, and the v4/v5 sections
 of `test_migrations.py`) is summarized in their own sections above.
+
+## M10: safe Sonarr quality-upgrade candidates
+
+When `upgrades_enabled` is true, a read-only scan consumes Sonarr v4
+`wanted/cutoff` pages. A candidate is created only when that endpoint explicitly
+reports the episode below cutoff and the record also proves that the known,
+monitored series and episode are monitored, aired, and have a file. Unknown or
+malformed fields, future episodes, missing files, unmonitored records, and series
+not present in the scanned library fail closed. Existing rows are safely
+backfilled as `missing`; new API and audit snapshots expose `candidate_kind` as
+`missing` or `upgrade`.
+
+Manual preview/dispatch, simulation, and Live apply the missing and upgrade
+toggles independently. Eligible upgrades reuse the exact same individual
+`EpisodeSearch`, ledger, cooldown, hourly/queue/success caps, pacing, ambiguity,
+and definitive outcome reconciliation as missing episodes. M10 adds no other
+write-capable adapter method.
+
+M10 intentionally defers strict season-pack routing and all transactional
+replacement/recovery work. It never deletes or rescans files, grabs releases,
+searches a series/season, cancels commands, mutates profiles/custom formats/root
+folders, or changes a download client.
 
 ## Current limitations
 

@@ -11,7 +11,7 @@ future write method added to ``SonarrClient`` - raises
 from .sonarr_client import SonarrClient
 
 _ALLOWED_METHODS = frozenset({
-    "system_status", "get_series", "get_episodes",
+    "system_status", "get_series", "get_episodes", "get_cutoff_unmet_episodes",
     "get_command", "get_history", "get_queue_details",
 })
 

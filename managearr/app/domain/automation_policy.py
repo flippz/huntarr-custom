@@ -71,7 +71,7 @@ class AutomationPolicy:
         if self.missing_enabled:
             modes.append("missing items")
         if self.upgrades_enabled:
-            modes.append("upgrades")
+            modes.append("quality upgrades for individual episodes Sonarr explicitly reports below cutoff")
         modes_text = " and ".join(modes) if modes else "nothing (missing and upgrade search are both disabled)"
 
         order_text = self.search_order.replace("_", " ")

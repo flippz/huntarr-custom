@@ -27,6 +27,8 @@ class StubSonarrClient:
         series_error=None,
         episodes_by_series=None,
         episode_errors=None,
+        cutoff_pages=None,
+        cutoff_error=None,
     ):
         self._status = status or {"version": "4.0.1", "instance_name": "Sonarr"}
         self._status_error = status_error
@@ -34,6 +36,9 @@ class StubSonarrClient:
         self._series_error = series_error
         self._episodes_by_series = episodes_by_series or {}
         self._episode_errors = episode_errors or {}
+        self._cutoff_pages = cutoff_pages or {}
+        self._cutoff_error = cutoff_error
+        self.cutoff_calls = []
 
     def system_status(self):
         if self._status_error:
@@ -49,6 +54,14 @@ class StubSonarrClient:
         if series_id in self._episode_errors:
             raise self._episode_errors[series_id]
         return self._episodes_by_series.get(series_id, [])
+
+    def get_cutoff_unmet_episodes(self, *, page=1, page_size=100):
+        self.cutoff_calls.append((page, page_size))
+        if self._cutoff_error:
+            raise self._cutoff_error
+        records = self._cutoff_pages.get(page, [])
+        total = sum(len(items) for items in self._cutoff_pages.values())
+        return {"records": records, "total_records": total}
 
 
 def make_factory(stub: StubSonarrClient):
@@ -282,3 +295,80 @@ def test_scan_truncates_at_max_candidates_and_notes_it(library_repo, activity_re
     assert job.candidate_count == 2
     assert "truncated" in job.details.lower()
     assert len(candidate_repo.list_for_job(job.id)) == 2
+
+
+def cutoff_episode(id, series_id=1, *, monitored=True, has_file=True, air_date="2026-01-01"):
+    value = episode(id, 2, id, monitored=monitored, has_file=has_file, air_date=air_date)
+    value["seriesId"] = series_id
+    return value
+
+
+def test_scan_persists_explicit_cutoff_upgrades_after_missing_candidates(
+    library_repo, activity_repo, candidate_repo
+):
+    lib = create_sonarr_library(library_repo)
+    stub = StubSonarrClient(
+        series=[series(1, "Show A")],
+        episodes_by_series={1: [episode(11, 1, 1)]},
+        cutoff_pages={1: [cutoff_episode(12)]},
+    )
+    job, error = make_service(library_repo, activity_repo, candidate_repo, stub).run_scan(lib.id)
+    assert error is None
+    candidates = candidate_repo.list_for_job(job.id)
+    assert [(c.episode_id, c.candidate_kind) for c in candidates] == [(11, "missing"), (12, "upgrade")]
+    assert "1 missing" in job.details
+    assert "1 monitored aired quality-upgrade" in job.details
+    assert stub.cutoff_calls == [(1, 100)]
+
+
+@pytest.mark.parametrize("record", [
+    cutoff_episode(20, monitored=False), cutoff_episode(21, has_file=False),
+    cutoff_episode(22, air_date="2099-01-01"), cutoff_episode(23, series_id=999),
+    {"id": 24, "seriesId": 1, "monitored": True, "hasFile": True},
+])
+def test_scan_upgrade_boundaries_fail_closed(
+    library_repo, activity_repo, candidate_repo, record
+):
+    lib = create_sonarr_library(library_repo)
+    stub = StubSonarrClient(series=[series(1, "Show")], cutoff_pages={1: [record]})
+    job, _ = make_service(library_repo, activity_repo, candidate_repo, stub).run_scan(lib.id)
+    assert candidate_repo.list_for_job(job.id) == []
+
+
+def test_scan_policy_toggles_missing_and_upgrade_independently(
+    library_repo, activity_repo, candidate_repo, policy_repo
+):
+    lib = create_sonarr_library(library_repo)
+    stub = StubSonarrClient(
+        series=[series(1, "Show")], episodes_by_series={1: [episode(31, 1, 1)]},
+        cutoff_pages={1: [cutoff_episode(32)]},
+    )
+    policy_repo.update({"missing_enabled": False, "upgrades_enabled": True})
+    service = SonarrScanService(
+        library_repo, activity_repo, candidate_repo, policy_repo,
+        client_factory=make_factory(stub),
+    )
+    first, _ = service.run_scan(lib.id)
+    assert [(c.episode_id, c.candidate_kind) for c in candidate_repo.list_for_job(first.id)] == [(32, "upgrade")]
+
+    policy_repo.update({"missing_enabled": True, "upgrades_enabled": False})
+    second, _ = service.run_scan(lib.id)
+    assert [(c.episode_id, c.candidate_kind) for c in candidate_repo.list_for_job(second.id)] == [(31, "missing")]
+
+
+def test_shared_scan_cap_prioritizes_missing_without_reading_cutoff(
+    library_repo, activity_repo, candidate_repo, monkeypatch
+):
+    monkeypatch.setattr(scan_service_module, "MAX_CANDIDATES_PER_SCAN", 2)
+    lib = create_sonarr_library(library_repo)
+    stub = StubSonarrClient(
+        series=[series(1, "Show")],
+        episodes_by_series={1: [episode(41, 1, 1), episode(42, 1, 2), episode(43, 1, 3)]},
+        cutoff_pages={1: [cutoff_episode(44)]},
+    )
+    job, _ = make_service(library_repo, activity_repo, candidate_repo, stub).run_scan(lib.id)
+    assert [(c.episode_id, c.candidate_kind) for c in candidate_repo.list_for_job(job.id)] == [
+        (41, "missing"), (42, "missing")
+    ]
+    assert stub.cutoff_calls == []
+    assert "truncated" in job.details.lower()

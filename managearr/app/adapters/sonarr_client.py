@@ -135,6 +135,29 @@ class SonarrClient:
             raise SonarrDataError("Sonarr episode response was not a list")
         return data
 
+    def get_cutoff_unmet_episodes(self, *, page: int = 1, page_size: int = 100) -> dict:
+        """Read one bounded deterministic page from wanted/cutoff."""
+        params = self._page_params(page, page_size)
+        params.update({
+            "includeSeries": True,
+            "monitored": True,
+            "sortKey": "airDateUtc",
+            "sortDirection": "ascending",
+        })
+        data = self._get("/api/v3/wanted/cutoff", params=params)
+        if not isinstance(data, dict) or not isinstance(data.get("records"), list):
+            raise SonarrDataError("Sonarr cutoff response was missing a records list")
+        records = data["records"]
+        total_records = data.get("totalRecords")
+        if (
+            len(records) > page_size
+            or not isinstance(total_records, int)
+            or isinstance(total_records, bool)
+            or total_records < 0
+        ):
+            raise SonarrDataError("Sonarr cutoff response had invalid pagination")
+        return {"records": records, "total_records": total_records}
+
     @staticmethod
     def _positive_int(value, field: str) -> int:
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:

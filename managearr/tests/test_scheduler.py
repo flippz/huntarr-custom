@@ -129,7 +129,7 @@ def test_manual_simulation_runs_while_off_and_never_dispatches(
     assert scheduler_repo.get_settings().mode == "off"
     assert cycle["state"] == "completed"
     assert cycle["selected_count"] == 3
-    assert cycle["libraries"][0]["upgrades_state"] == "unsupported"
+    assert cycle["libraries"][0]["upgrades_state"] == "enabled"
     assert "no Sonarr commands" in cycle["safe_summary"]
 
 
@@ -188,6 +188,46 @@ def test_random_order_is_seeded_and_auditable(
     selected = [c for c in cycle["libraries"][0]["candidates"] if c["selected"]]
     selected.sort(key=lambda c: c["order_position"])
     assert [c["candidate_id"] for c in selected] == [c["id"] for c in expected]
+
+
+def test_mixed_simulation_prioritizes_missing_under_shared_cap(
+    scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo
+):
+    library, job, _ = _library_scan(library_repo, activity_repo, candidate_repo, count=3)
+    candidate_repo.create_many(job.id, library.id, [
+        {"series_id": 50 + i, "series_title": f"A Upgrade {i}", "episode_id": 500 + i,
+         "season_number": 1, "episode_number": i + 1, "air_date": f"2023-01-0{i+1}",
+         "candidate_kind": "upgrade", "reason": "below cutoff"}
+        for i in range(3)
+    ])
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="mixed-kinds")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    selected = sorted(
+        (c for c in cycle["libraries"][0]["candidates"] if c["selected"]),
+        key=lambda c: c["order_position"],
+    )
+    assert [c["candidate_kind"] for c in selected] == [
+        "missing", "missing", "missing", "upgrade", "upgrade"
+    ]
+    assert "3 missing and 3 upgrade" in cycle["libraries"][0]["safe_summary"]
+
+
+def test_simulation_can_select_upgrades_while_missing_is_disabled(
+    scheduler_repo, policy_repo, library_repo, activity_repo, candidate_repo
+):
+    library, job, missing = _library_scan(library_repo, activity_repo, candidate_repo, count=1)
+    candidate_repo.create_many(job.id, library.id, [{
+        "series_id": 99, "series_title": "Upgrade", "episode_id": 999,
+        "season_number": 1, "episode_number": 1, "air_date": "2024-01-01",
+        "candidate_kind": "upgrade", "reason": "below cutoff",
+    }])
+    policy_repo.update({"missing_enabled": False, "upgrades_enabled": True})
+    worker = SchedulerWorker(scheduler_repo, policy_repo, owner_id="upgrade-only")
+    _, cycle = _run_manual(worker, scheduler_repo)
+    selected = [c for c in cycle["libraries"][0]["candidates"] if c["selected"]]
+    assert len(selected) == 1 and selected[0]["candidate_kind"] == "upgrade"
+    excluded = {c["candidate_id"]: c["exclusion_reason"] for c in cycle["libraries"][0]["candidates"]}
+    assert "missing-item" in excluded[missing[0].id]
 
 
 def test_planning_applies_cooldown_and_inflight(

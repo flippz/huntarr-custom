@@ -35,6 +35,9 @@ class StubSonarrClient:
     def get_episodes(self, series_id):
         return self._episodes_by_series.get(series_id, [])
 
+    def get_cutoff_unmet_episodes(self, *, page=1, page_size=100):
+        return {"records": [], "total_records": 0}
+
 
 def use_stub(app, stub: StubSonarrClient):
     def factory(base_url, api_key, timeout=None):
@@ -157,6 +160,7 @@ def test_scan_endpoint_success_persists_job_and_candidates(app, client):
     assert len(candidates) == 1
     assert candidates[0]["series_title"] == "Show A"
     assert candidates[0]["episode_number"] == 2
+    assert candidates[0]["candidate_kind"] == "missing"
 
 
 def test_scan_endpoint_library_not_found(client):

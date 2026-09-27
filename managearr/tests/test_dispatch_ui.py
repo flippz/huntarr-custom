@@ -45,3 +45,15 @@ def test_activity_ui_exposes_read_only_reconciliation_and_evidence_timeline(clie
     assert "item.human_status" in html
     assert "status.label" in html
     assert "status.explanation" in html
+
+
+def test_activity_ui_labels_missing_and_upgrade_candidate_kinds(client):
+    html = client.get("/activity").get_data(as_text=True)
+    assert "<th>Kind</th>" in html
+    assert "'Upgrade' : 'Missing'" in html
+
+
+def test_settings_explains_safe_individual_upgrade_search(client):
+    html = client.get("/settings").get_data(as_text=True)
+    assert "Search individual episode quality upgrades" in html
+    assert "no season packs, file deletion, or replacement" in html

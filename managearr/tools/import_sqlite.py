@@ -218,8 +218,8 @@ def _import_data(conn, source: dict) -> dict:
             """
             INSERT INTO scan_candidates (
                 id, job_id, library_id, series_id, series_title, episode_id,
-                season_number, episode_number, air_date, reason, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                season_number, episode_number, candidate_kind, air_date, reason, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 candidate["id"],
@@ -230,6 +230,7 @@ def _import_data(conn, source: dict) -> dict:
                 candidate["episode_id"],
                 candidate["season_number"],
                 candidate["episode_number"],
+                candidate.get("candidate_kind", "missing"),
                 candidate["air_date"],
                 candidate["reason"],
                 _parse_ts(candidate["created_at"]),

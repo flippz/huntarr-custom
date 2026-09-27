@@ -60,7 +60,9 @@ class SchedulerService:
             return sorted(base, key=lambda c: (c["air_date"] is not None, c["air_date"] or "", -c["id"]), reverse=True)
         if order == "random":
             Random(seed ^ library_id).shuffle(base)
-        return base
+        # Stable partition preserves the selected ordering within each kind
+        # while ensuring the shared safety cap cannot starve missing items.
+        return sorted(base, key=lambda c: 0 if c.get("candidate_kind") == "missing" else 1)
 
     @staticmethod
     def _cap_reason(*, hourly: int, queue: int, success: int, safety: int) -> str:
@@ -124,7 +126,7 @@ class SchedulerService:
                         {
                             "library_id": library["id"], "library_name": library["name"],
                             "state": "failed", "safe_summary": "Simulation planning failed safely; no command was sent.",
-                            "upgrades_state": "unsupported" if policy["upgrades_enabled"] else "disabled",
+                            "upgrades_state": "enabled" if policy["upgrades_enabled"] else "disabled",
                         },
                         [],
                     )
@@ -160,10 +162,10 @@ class SchedulerService:
         self.scheduler_repo.finish_cycle(cycle_id, state, totals, summary)
 
     def _plan_library(self, cycle: dict, library: dict, policy: dict) -> tuple[dict, list[dict]]:
-        upgrades_state = "unsupported" if policy["upgrades_enabled"] else "disabled"
+        upgrades_state = "enabled" if policy["upgrades_enabled"] else "disabled"
         upgrade_note = (
-            "Upgrade planning is unsupported in M4 and was skipped."
-            if policy["upgrades_enabled"] else "Upgrade planning is disabled."
+            "Quality-upgrade planning is enabled."
+            if policy["upgrades_enabled"] else "Quality-upgrade planning is disabled."
         )
         scan = self.scheduler_repo.latest_completed_scan(library["id"])
         max_age_minutes = self.refresh_repo.get_settings().scan_max_age_minutes
@@ -207,8 +209,13 @@ class SchedulerService:
         for candidate in ordered:
             reason = None
             episode_id = candidate["episode_id"]
-            if not policy["missing_enabled"]:
+            kind = candidate.get("candidate_kind", "missing")
+            if kind == "missing" and not policy["missing_enabled"]:
                 reason = "missing-item planning is disabled by policy"
+            elif kind == "upgrade" and not policy["upgrades_enabled"]:
+                reason = "quality-upgrade planning is disabled by policy"
+            elif kind not in ("missing", "upgrade"):
+                reason = "candidate kind is unknown and cannot be planned safely"
             elif episode_id in seen_episodes:
                 reason = "duplicate Sonarr episode in scan snapshot"
             elif episode_id in facts["imported"]:
@@ -242,9 +249,12 @@ class SchedulerService:
         results.sort(key=lambda r: (not r["selected"], r["order_position"] or 10**9, r["candidate_id"]))
         selected_count = len(selected)
         considered = len(candidates)
-        state = "completed" if policy["missing_enabled"] else "skipped"
+        state = "completed" if policy["missing_enabled"] or policy["upgrades_enabled"] else "skipped"
+        missing_count = sum(c.get("candidate_kind", "missing") == "missing" for c in candidates)
+        upgrade_count = sum(c.get("candidate_kind") == "upgrade" for c in candidates)
         summary = (
             f"Latest completed scan {scan['id']} ({age_seconds // 60} minute(s) old): "
+            f"considered {missing_count} missing and {upgrade_count} upgrade candidate(s); "
             f"selected {selected_count} of {considered}; "
             f"effective cap {effective_cap} = min(safety {MAX_SIMULATION_SELECTION}, "
             f"hourly remaining {hourly_remaining}, queue remaining {queue_remaining}, "
@@ -269,5 +279,6 @@ class SchedulerService:
             "series_id": candidate["series_id"], "series_title": candidate["series_title"],
             "season_number": candidate["season_number"], "episode_number": candidate["episode_number"],
             "air_date": candidate["air_date"], "candidate_reason": candidate["reason"],
+            "candidate_kind": candidate.get("candidate_kind", "missing"),
             "selected": selected, "exclusion_reason": reason, "order_position": position,
         }

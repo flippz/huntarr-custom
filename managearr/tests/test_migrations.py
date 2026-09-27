@@ -1,6 +1,7 @@
 """Tests for the deterministic, transactional schema migration runner."""
 import psycopg
 import pytest
+from uuid import uuid4
 
 from app.persistence import migrations as migration_module
 from app.persistence.migrations import MIGRATIONS, current_version, run_migrations
@@ -54,7 +55,7 @@ def test_expected_tables_and_columns_exist(database):
     }
     assert columns_by_table["scan_candidates"] == {
         "id", "job_id", "library_id", "series_id", "series_title", "episode_id",
-        "season_number", "episode_number", "air_date", "reason", "created_at",
+        "season_number", "episode_number", "candidate_kind", "air_date", "reason", "created_at",
     }
 
 
@@ -101,6 +102,7 @@ def test_expected_indexes_exist(database):
     assert "idx_activity_jobs_library_id" in index_names
     assert "idx_scan_candidates_job_id" in index_names
     assert "idx_scan_candidates_library_id" in index_names
+    assert "idx_scan_candidates_job_kind" in index_names
     assert "idx_dispatch_batches_scan_job_id" in index_names
     assert "idx_dispatch_batches_library_id" in index_names
     assert "idx_dispatch_batches_updated_at" in index_names
@@ -371,6 +373,85 @@ def test_scheduler_library_results_gained_snapshot_columns(database):
     assert {"snapshot_taken_at", "snapshot_age_seconds"} <= columns
 
 
+def test_m10_candidate_kind_defaults_backfill_and_constraints(
+    database, library_repo, activity_repo, candidate_repo
+):
+    library = library_repo.create({
+        "name": "M10", "type": "sonarr", "url": "http://sonarr", "api_key": "k", "enabled": True,
+    })
+    job = activity_repo.create({
+        "library_id": library.id, "library_name": library.name, "job_type": "sonarr_scan",
+        "state": "completed", "title": "scan",
+    })
+    candidate_repo.create_many(job.id, library.id, [{
+        "series_id": 1, "series_title": "Show", "episode_id": 1,
+        "season_number": 1, "episode_number": 1, "reason": "legacy missing",
+    }])
+    assert candidate_repo.list_for_job(job.id)[0].candidate_kind == "missing"
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with database.connect() as conn:
+            conn.execute("UPDATE scan_candidates SET candidate_kind = 'unknown' WHERE job_id = %s", (job.id,))
+
+
+def test_m10_scheduler_kind_snapshot_and_upgrade_state_constraints(database):
+    with database.connect() as conn:
+        candidate_columns = {
+            row["column_name"] for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='scheduler_candidate_results'"
+            ).fetchall()
+        }
+        indexes = {
+            row["indexname"] for row in conn.execute(
+                "SELECT indexname FROM pg_indexes WHERE schemaname='public'"
+            ).fetchall()
+        }
+    assert "candidate_kind" in candidate_columns
+    assert "idx_scheduler_candidate_results_kind" in indexes
+
+
+def test_m10_real_postgresql_upgrade_backfills_existing_candidates(database):
+    schema = "m10_probe_" + uuid4().hex
+    quoted = psycopg.sql.Identifier(schema)
+    with database.connect() as conn:
+        conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(quoted))
+        try:
+            conn.execute(psycopg.sql.SQL("SET search_path TO {}").format(quoted))
+            for migration in MIGRATIONS[:9]:
+                conn.execute(migration.sql)
+            library_id = conn.execute(
+                "INSERT INTO arr_libraries (name,type,url,api_key,enabled,created_at,updated_at) "
+                "VALUES ('old','sonarr','http://sonarr','k',TRUE,now(),now()) RETURNING id"
+            ).fetchone()["id"]
+            job_id = conn.execute(
+                "INSERT INTO activity_jobs (library_id,library_name,job_type,state,title,created_at,updated_at) "
+                "VALUES (%s,'old','sonarr_scan','completed','old scan',now(),now()) RETURNING id",
+                (library_id,),
+            ).fetchone()["id"]
+            candidate_id = conn.execute(
+                "INSERT INTO scan_candidates (job_id,library_id,series_id,series_title,episode_id,"
+                "season_number,episode_number,reason,created_at) "
+                "VALUES (%s,%s,1,'Show',1,1,1,'missing',now()) RETURNING id",
+                (job_id, library_id),
+            ).fetchone()["id"]
+            conn.execute(MIGRATIONS[9].sql)
+            row = conn.execute(
+                "SELECT candidate_kind FROM scan_candidates WHERE id=%s", (candidate_id,)
+            ).fetchone()
+            assert row["candidate_kind"] == "missing"
+            with pytest.raises(psycopg.errors.CheckViolation):
+                with conn.transaction():
+                    conn.execute(
+                        "INSERT INTO scan_candidates (job_id,library_id,series_id,series_title,episode_id,"
+                        "season_number,episode_number,candidate_kind,reason,created_at) "
+                        "VALUES (%s,%s,1,'Show',2,1,2,'unknown','bad',now())",
+                        (job_id, library_id),
+                    )
+        finally:
+            conn.execute("SET search_path TO public")
+            conn.execute(psycopg.sql.SQL("DROP SCHEMA {} CASCADE").format(quoted))
+
+
 def test_refresh_settings_seeded_with_conservative_defaults(database):
     with database.connect() as conn:
         row = conn.execute("SELECT * FROM refresh_settings WHERE id = 1").fetchone()
@@ -494,7 +575,8 @@ def test_v6_live_control_bounds_are_enforced(database):
 
 
 def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(database):
-    assert MIGRATIONS[-1].version == 9
+    assert MIGRATIONS[-2].version == 9
+    assert MIGRATIONS[-1].version == 10
     migration = next(item for item in MIGRATIONS if item.version == 8)
     with database.connect() as conn:
         conn.execute(

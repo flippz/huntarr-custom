@@ -46,7 +46,7 @@ def make_completed_scan_job(activity_repo, library):
     )
 
 
-def make_candidate(candidate_repo, job_id, library_id, *, episode_id, season=1, ep=1, series_id=1, title="Show A"):
+def make_candidate(candidate_repo, job_id, library_id, *, episode_id, season=1, ep=1, series_id=1, title="Show A", candidate_kind="missing"):
     candidate_repo.create_many(
         job_id,
         library_id,
@@ -58,7 +58,8 @@ def make_candidate(candidate_repo, job_id, library_id, *, episode_id, season=1, 
                 "season_number": season,
                 "episode_number": ep,
                 "air_date": "2026-01-01",
-                "reason": "monitored episode aired with no file on disk",
+                "candidate_kind": candidate_kind,
+                "reason": "below cutoff" if candidate_kind == "upgrade" else "monitored episode aired with no file on disk",
             }
         ],
     )
@@ -243,7 +244,9 @@ def test_compute_excludes_episode_dispatched_within_cooldown(
 ):
     lib = make_library(library_repo)
     job = make_completed_scan_job(activity_repo, lib)
-    c = make_candidate(candidate_repo, job.id, lib.id, episode_id=77)
+    c = make_candidate(
+        candidate_repo, job.id, lib.id, episode_id=77, candidate_kind="upgrade"
+    )
 
     with dispatch_repo.db.connect() as conn:
         batch_id = dispatch_repo.create_batch(
@@ -447,3 +450,26 @@ def test_compute_reports_zero_remaining_capacity_when_cap_already_used(
     assert result.remaining_capacity == 0
     assert result.selected == []
     assert [c.id for c in result.eligible] == [other.id]
+
+
+def test_compute_applies_missing_and_upgrade_toggles_independently(
+    dispatch_planning_service, library_repo, activity_repo, candidate_repo, policy_repo
+):
+    lib = make_library(library_repo)
+    job = make_completed_scan_job(activity_repo, lib)
+    missing = make_candidate(candidate_repo, job.id, lib.id, episode_id=901)
+    upgrade = make_candidate(
+        candidate_repo, job.id, lib.id, episode_id=902, ep=2, candidate_kind="upgrade"
+    )
+
+    policy_repo.update({"missing_enabled": False, "upgrades_enabled": True})
+    plan, error = dispatch_planning_service.compute(job.id, [missing.id, upgrade.id])
+    assert error is None
+    assert [candidate.id for candidate in plan.selected] == [upgrade.id]
+    assert any(item["candidate_id"] == missing.id and "missing-item" in item["reason"] for item in plan.excluded)
+
+    policy_repo.update({"missing_enabled": True, "upgrades_enabled": False})
+    plan, error = dispatch_planning_service.compute(job.id, [missing.id, upgrade.id])
+    assert error is None
+    assert [candidate.id for candidate in plan.selected] == [missing.id]
+    assert any(item["candidate_id"] == upgrade.id and "quality-upgrade" in item["reason"] for item in plan.excluded)

@@ -82,7 +82,7 @@ def create_app(config: dict | None = None) -> Flask:
         "activity": ActivityService(activity_repo),
         "status": StatusService(db, library_repo),
         "sonarr_scan": SonarrScanService(
-            library_repo, activity_repo, candidate_repo, timeout=sonarr_timeout
+            library_repo, activity_repo, candidate_repo, policy_repo, timeout=sonarr_timeout
         ),
         "scan_candidate": ScanCandidateService(candidate_repo),
         "dispatch_repo": dispatch_repo,

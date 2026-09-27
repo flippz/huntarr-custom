@@ -76,6 +76,32 @@ def test_get_episodes_success_passes_series_id_param():
     assert session.calls[0]["params"] == {"seriesId": 42}
 
 
+def test_get_cutoff_unmet_reads_bounded_deterministic_page():
+    payload = {"records": [{"id": 1}], "totalRecords": 1}
+    session = FakeSession(FakeResponse(200, payload))
+    result = make_client(session).get_cutoff_unmet_episodes(page=1, page_size=25)
+    assert result == {"records": [{"id": 1}], "total_records": 1}
+    call = session.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"].endswith("/api/v3/wanted/cutoff")
+    assert call["params"] == {
+        "page": 1, "pageSize": 25, "includeSeries": True, "monitored": True,
+        "sortKey": "airDateUtc", "sortDirection": "ascending",
+    }
+
+
+@pytest.mark.parametrize("payload", [
+    [], {}, {"records": {}, "totalRecords": 0},
+    {"records": [], "totalRecords": None}, {"records": [], "totalRecords": True},
+    {"records": [{"id": 1}, {"id": 2}], "totalRecords": 2},
+])
+def test_get_cutoff_unmet_rejects_malformed_or_oversized_pages(payload):
+    session = FakeSession(FakeResponse(200, payload))
+    size = 1 if isinstance(payload, dict) and isinstance(payload.get("records"), list) else 100
+    with pytest.raises(SonarrDataError):
+        make_client(session).get_cutoff_unmet_episodes(page=1, page_size=size)
+
+
 def test_request_never_leaks_api_key_into_url():
     session = FakeSession(FakeResponse(200, {"version": "4.0.1"}))
     client = make_client(session)

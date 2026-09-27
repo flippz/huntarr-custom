@@ -47,7 +47,7 @@ class FakeClock:
         self.now += seconds
 
 
-def _library_scan(library_repo, activity_repo, candidate_repo, count=3):
+def _library_scan(library_repo, activity_repo, candidate_repo, count=3, candidate_kind="missing"):
     library = library_repo.create({
         "name": "Shows", "type": "sonarr", "url": "http://sonarr.invalid:8989",
         "api_key": "super-secret", "enabled": True,
@@ -59,7 +59,8 @@ def _library_scan(library_repo, activity_repo, candidate_repo, count=3):
     candidate_repo.create_many(job.id, library.id, [
         {"series_id": 10 + i, "series_title": f"Show {count-i}", "episode_id": 100 + i,
          "season_number": 1, "episode_number": i + 1, "air_date": f"2024-01-{i+1:02d}",
-         "reason": "monitored episode aired with no file on disk"}
+         "candidate_kind": candidate_kind,
+         "reason": "below cutoff" if candidate_kind == "upgrade" else "monitored episode aired with no file on disk"}
         for i in range(count)
     ])
     return library, job, candidate_repo.list_for_job(job.id)
@@ -400,9 +401,11 @@ def test_live_armed_dispatches_selected_candidate_and_records_ledger(
     database, scheduler_repo, policy_repo, live_repo, library_repo, activity_repo, candidate_repo,
     dispatch_repo, dispatch_planning_service,
 ):
-    # A single candidate avoids any dependency on deterministic ordering
-    # between multiple candidates (already covered by test_scheduler.py).
-    library, job, candidates = _library_scan(library_repo, activity_repo, candidate_repo, count=1)
+    # A single upgrade candidate proves Live reuses the same dispatch path
+    # without any dependency on mixed-candidate ordering.
+    library, job, candidates = _library_scan(
+        library_repo, activity_repo, candidate_repo, count=1, candidate_kind="upgrade"
+    )
     live_repo.enable_live_mode(actor="t", reason="t")
     live_repo.arm(actor="t", reason="t", ttl_minutes=15)
     stub = StubSonarrClient()

@@ -1,6 +1,12 @@
 from datetime import date
+import pytest
 
-from app.domain.scan_candidate import MISSING_MONITORED_AIRED_REASON, derive_missing_candidate
+from app.domain.scan_candidate import (
+    MISSING_MONITORED_AIRED_REASON,
+    UPGRADE_CUTOFF_NOT_MET_REASON,
+    derive_missing_candidate,
+    derive_upgrade_candidate,
+)
 
 TODAY = date(2026, 9, 24)
 
@@ -32,6 +38,7 @@ def test_missing_monitored_aired_episode_is_a_candidate():
         "episode_id": 10,
         "season_number": 1,
         "episode_number": 2,
+        "candidate_kind": "missing",
         "air_date": "2026-01-01",
         "reason": MISSING_MONITORED_AIRED_REASON,
     }
@@ -86,3 +93,31 @@ def test_missing_required_ids_excluded():
 def test_missing_series_title_falls_back_to_unknown():
     candidate = derive_missing_candidate(make_series(title=None), make_episode(), today=TODAY)
     assert candidate["series_title"] == "Unknown"
+
+
+def make_upgrade_episode(**overrides):
+    value = make_episode(hasFile=True)
+    value["seriesId"] = 1
+    value.update(overrides)
+    return value
+
+
+def test_explicit_cutoff_record_with_file_is_upgrade_candidate():
+    candidate = derive_upgrade_candidate(make_series(), make_upgrade_episode(), today=TODAY)
+    assert candidate["candidate_kind"] == "upgrade"
+    assert candidate["reason"] == UPGRADE_CUTOFF_NOT_MET_REASON
+
+
+@pytest.mark.parametrize("overrides", [
+    {"hasFile": False}, {"hasFile": None}, {"monitored": False},
+    {"airDate": None, "airDateUtc": None}, {"airDate": "bad"},
+    {"airDate": "2099-01-01"}, {"seriesId": 2}, {"seriesId": None},
+    {"id": True}, {"seasonNumber": None}, {"episodeNumber": None},
+])
+def test_upgrade_candidate_unknown_or_ineligible_fields_fail_closed(overrides):
+    assert derive_upgrade_candidate(make_series(), make_upgrade_episode(**overrides), today=TODAY) is None
+
+
+def test_upgrade_candidate_accepts_valid_utc_air_timestamp():
+    episode = make_upgrade_episode(airDate=None, airDateUtc="2026-01-01T20:00:00Z")
+    assert derive_upgrade_candidate(make_series(), episode, today=TODAY)["air_date"] == "2026-01-01"

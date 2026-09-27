@@ -515,13 +515,14 @@ class SchedulerRepository:
                     """
                     INSERT INTO scheduler_candidate_results (
                         cycle_run_id, library_result_id, candidate_id, episode_id, series_id,
-                        series_title, season_number, episode_number, air_date, candidate_reason,
+                        series_title, season_number, episode_number, candidate_kind, air_date, candidate_reason,
                         selected, exclusion_reason, order_position
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         cycle_id, result_id, item["candidate_id"], item["episode_id"], item["series_id"],
                         item["series_title"][:500], item["season_number"], item["episode_number"],
+                        item.get("candidate_kind", "missing"),
                         item.get("air_date"), item["candidate_reason"][:100], item["selected"],
                         item.get("exclusion_reason"), item.get("order_position"),
                     ),

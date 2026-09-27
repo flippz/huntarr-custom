@@ -8,9 +8,10 @@ and no Sonarr state is ever mutated.
 from datetime import date
 
 from ..adapters.sonarr_client import SonarrClient, SonarrError
-from ..domain.scan_candidate import derive_missing_candidate
+from ..domain.scan_candidate import derive_missing_candidate, derive_upgrade_candidate
 from ..persistence.activity_repository import ActivityRepository
 from ..persistence.library_repository import LibraryRepository
+from ..persistence.policy_repository import PolicyRepository
 from ..persistence.scan_candidate_repository import ScanCandidateRepository
 from .library_readiness import (
     LIBRARY_DISABLED_ERROR,
@@ -25,6 +26,8 @@ from .library_readiness import (
 # truncated rather than unbounded; the job's ``details`` text says so
 # when it happens (see ``run_scan`` below).
 MAX_CANDIDATES_PER_SCAN = 500
+UPGRADE_PAGE_SIZE = 100
+MAX_UPGRADE_PAGES = 5
 
 # Re-exported here (rather than only in library_readiness) so existing
 # imports of these names from this module keep working unchanged.
@@ -45,6 +48,7 @@ class SonarrScanService:
         library_repo: LibraryRepository,
         activity_repo: ActivityRepository,
         candidate_repo: ScanCandidateRepository,
+        policy_repo: PolicyRepository | None = None,
         *,
         client_factory=SonarrClient,
         timeout: int | None = None,
@@ -52,6 +56,7 @@ class SonarrScanService:
         self.library_repo = library_repo
         self.activity_repo = activity_repo
         self.candidate_repo = candidate_repo
+        self.policy_repo = policy_repo or PolicyRepository(library_repo.db)
         self._client_factory = client_factory
         self._timeout = timeout
 
@@ -109,15 +114,23 @@ class SonarrScanService:
             return failed, None
 
         today = date.today()
+        policy = self.policy_repo.get()
         candidates: list[dict] = []
+        missing_count = 0
+        upgrade_count = 0
         skipped_series = 0
         truncated = False
 
+        known_series: dict[int, dict] = {}
         for series in series_list:
             if not isinstance(series, dict):
                 continue
             series_id = series.get("id")
             if series_id is None:
+                continue
+            known_series[series_id] = series
+
+            if not policy.missing_enabled:
                 continue
 
             try:
@@ -135,16 +148,61 @@ class SonarrScanService:
                 candidate = derive_missing_candidate(series, episode, today=today)
                 if candidate is not None:
                     candidates.append(candidate)
+                    missing_count += 1
 
             if truncated:
                 break
+
+        # Preserve existing missing ordering and reserve the shared cap for
+        # missing candidates first. Upgrade records only fill remaining slots.
+        upgrade_error = False
+        if policy.upgrades_enabled and not truncated:
+            seen_episode_ids = {candidate["episode_id"] for candidate in candidates}
+            for page in range(1, MAX_UPGRADE_PAGES + 1):
+                try:
+                    result = client.get_cutoff_unmet_episodes(
+                        page=page, page_size=UPGRADE_PAGE_SIZE
+                    )
+                except SonarrError:
+                    upgrade_error = True
+                    break
+                records = result["records"]
+                for episode in records:
+                    if not isinstance(episode, dict):
+                        continue
+                    if len(candidates) >= MAX_CANDIDATES_PER_SCAN:
+                        truncated = True
+                        break
+                    series = known_series.get(episode.get("seriesId"))
+                    if series is None:
+                        continue
+                    candidate = derive_upgrade_candidate(series, episode, today=today)
+                    if candidate is None or candidate["episode_id"] in seen_episode_ids:
+                        continue
+                    candidates.append(candidate)
+                    seen_episode_ids.add(candidate["episode_id"])
+                    upgrade_count += 1
+                if truncated or not records or page * UPGRADE_PAGE_SIZE >= result["total_records"]:
+                    break
+            else:
+                # There may be additional cutoff records beyond our bounded
+                # five-page read, even if malformed/ineligible records meant
+                # the persisted candidate cap was not reached.
+                truncated = True
 
         if candidates:
             self.candidate_repo.create_many(job.id, library.id, candidates)
 
         details_parts = [
-            f"Found {len(candidates)} missing monitored aired episode(s) across {len(series_list)} series."
+            f"Found {missing_count} missing monitored aired episode(s) and "
+            f"{upgrade_count} monitored aired quality-upgrade episode(s) across {len(series_list)} series."
         ]
+        if not policy.missing_enabled:
+            details_parts.append("Missing candidate hunting was disabled by policy.")
+        if not policy.upgrades_enabled:
+            details_parts.append("Quality-upgrade hunting was disabled by policy.")
+        if upgrade_error:
+            details_parts.append("Quality-upgrade candidates were skipped after a Sonarr read error.")
         if skipped_series:
             details_parts.append(f"{skipped_series} series were skipped due to Sonarr errors.")
         if truncated:

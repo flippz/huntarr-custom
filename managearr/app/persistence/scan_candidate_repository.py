@@ -26,6 +26,7 @@ def _row_to_candidate(row) -> ScanCandidate:
         episode_id=row["episode_id"],
         season_number=row["season_number"],
         episode_number=row["episode_number"],
+        candidate_kind=row["candidate_kind"],
         air_date=row["air_date"],
         reason=row["reason"],
         created_at=row["created_at"].isoformat(),
@@ -46,8 +47,8 @@ class ScanCandidateRepository:
                     """
                     INSERT INTO scan_candidates (
                         job_id, library_id, series_id, series_title, episode_id,
-                        season_number, episode_number, air_date, reason, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        season_number, episode_number, candidate_kind, air_date, reason, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     [
                         (
@@ -58,6 +59,7 @@ class ScanCandidateRepository:
                             c["episode_id"],
                             c["season_number"],
                             c["episode_number"],
+                            c.get("candidate_kind", "missing"),
                             c.get("air_date"),
                             c["reason"],
                             now,

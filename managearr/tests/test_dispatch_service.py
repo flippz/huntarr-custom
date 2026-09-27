@@ -61,7 +61,7 @@ def make_completed_scan_job(activity_repo, library):
     )
 
 
-def make_candidate(candidate_repo, job_id, library_id, *, episode_id, season=1, ep=1, series_id=1, title="Show A"):
+def make_candidate(candidate_repo, job_id, library_id, *, episode_id, season=1, ep=1, series_id=1, title="Show A", candidate_kind="missing"):
     candidate_repo.create_many(
         job_id,
         library_id,
@@ -73,7 +73,8 @@ def make_candidate(candidate_repo, job_id, library_id, *, episode_id, season=1, 
                 "season_number": season,
                 "episode_number": ep,
                 "air_date": "2026-01-01",
-                "reason": "monitored episode aired with no file on disk",
+                "candidate_kind": candidate_kind,
+                "reason": "below cutoff" if candidate_kind == "upgrade" else "monitored episode aired with no file on disk",
             }
         ],
     )
@@ -396,3 +397,20 @@ def test_manual_audit_keeps_excluded_items(
     assert by_candidate[first.id].state == "dispatched"
     assert by_candidate[capped.id].state == "excluded"
     assert "hourly dispatch cap" in by_candidate[capped.id].reason
+
+
+def test_confirmed_upgrade_dispatch_reuses_single_episode_search_path(
+    dispatch_planning_service, dispatch_repo, library_repo, activity_repo, candidate_repo
+):
+    lib = make_library(library_repo)
+    job = make_completed_scan_job(activity_repo, lib)
+    candidate = make_candidate(
+        candidate_repo, job.id, lib.id, episode_id=909, candidate_kind="upgrade"
+    )
+    stub = StubSonarrClient()
+    service = make_service(dispatch_planning_service, dispatch_repo, library_repo, stub)
+    outcome, error = service.dispatch(job.id, [candidate.id], confirm=True)
+    assert error is None
+    assert stub.calls == [[909]]
+    assert outcome.batch.state == "completed"
+    assert outcome.plan.selected[0].candidate_kind == "upgrade"

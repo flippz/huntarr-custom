@@ -36,6 +36,9 @@ class StubScanClient:
     def get_episodes(self, series_id):
         return self._episodes_by_series.get(series_id, [])
 
+    def get_cutoff_unmet_episodes(self, *, page=1, page_size=100):
+        return {"records": [], "total_records": 0}
+
 
 class StubReconcileClient:
     def __init__(self, *, command=None, history=None, queue=None, command_error=None):
