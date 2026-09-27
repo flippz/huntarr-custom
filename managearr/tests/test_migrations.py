@@ -602,9 +602,7 @@ def test_v6_live_control_bounds_are_enforced(database):
 
 
 def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(database):
-    assert MIGRATIONS[-3].version == 9
-    assert MIGRATIONS[-2].version == 10
-    assert MIGRATIONS[-1].version == 11
+    assert [item.version for item in MIGRATIONS[-4:]] == [9, 10, 11, 12]
     migration = next(item for item in MIGRATIONS if item.version == 8)
     with database.connect() as conn:
         conn.execute(
@@ -622,6 +620,14 @@ def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(datab
     assert row["authorization_state"] == "running"
     assert row["authorization_generation"] == 41
     assert row["authorization_reason"] == "keep running"
+
+
+def test_season_pack_attempt_markers_are_append_only(database):
+    with database.connect() as conn:
+        tables = {r["table_name"] for r in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+        ).fetchall()}
+    assert "season_pack_attempt_started" in tables
 
 
 def test_v6_live_challenge_kind_shape_is_enforced(database):

@@ -43,7 +43,7 @@ _DATA_TABLES = (
     "scheduler_candidate_results, scheduler_library_results, scheduler_cycle_runs, "
     "scheduler_run_requests, scheduler_mode_audit, "
     "refresh_run_reconciled_batches, refresh_runs, refresh_requests, "
-    "live_dispatch_ledger, live_control_audit, live_challenges, season_pack_audit, season_pack_settings"
+    "live_dispatch_ledger, live_control_audit, live_challenges, season_pack_attempt_started, season_pack_audit, season_pack_settings"
 )
 
 

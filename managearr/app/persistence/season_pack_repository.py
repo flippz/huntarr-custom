@@ -22,9 +22,13 @@ class SeasonPackRepository:
         with self.db.connect() as c:row=c.execute("""INSERT INTO season_pack_audit(library_id,series_id,season_number,series_title,state,selected_fingerprint,selected_title,selected_protocol,selected_indexer_id,episode_count,cutoff_override,rejected_summary,confirmation_digest,settings_snapshot,created_at,updated_at) VALUES(%s,%s,%s,%s,'previewed',%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,now(),now()) RETURNING id""",(d["library_id"],d["series_id"],d["season_number"],d["series_title"],d.get("selected_fingerprint"),d.get("selected_title"),d.get("selected_protocol"),d.get("selected_indexer_id"),d.get("episode_count",0),d.get("cutoff_override",False),json.dumps(d["rejected_summary"]),d["confirmation_digest"],json.dumps(d["settings_snapshot"]))).fetchone()
         return self.get(row["id"])
     def get(self,audit_id,conn=None):
-        if conn:row=conn.execute("SELECT * FROM season_pack_audit WHERE id=%s",(audit_id,)).fetchone()
+        query="""SELECT a.*, m.started_at AS attempt_started_at,
+                 CASE WHEN a.state='dispatching' AND m.audit_id IS NOT NULL THEN 'ambiguous' ELSE a.state END AS state,
+                 CASE WHEN a.state='dispatching' AND m.audit_id IS NOT NULL THEN 'grab attempt started but no terminal result was persisted; inspect Sonarr before any retry' ELSE a.error_summary END AS error_summary
+                 FROM season_pack_audit a LEFT JOIN season_pack_attempt_started m ON m.audit_id=a.id WHERE a.id=%s"""
+        if conn:row=conn.execute(query,(audit_id,)).fetchone()
         else:
-            with self.db.connect() as c:row=c.execute("SELECT * FROM season_pack_audit WHERE id=%s",(audit_id,)).fetchone()
+            with self.db.connect() as c:row=c.execute(query,(audit_id,)).fetchone()
         return dict(row) if row else None
     def claim(self,audit_id,digest,live_generation):
         now=datetime.now(timezone.utc)
@@ -32,6 +36,9 @@ class SeasonPackRepository:
             row=c.execute("SELECT * FROM season_pack_audit WHERE id=%s FOR UPDATE",(audit_id,)).fetchone()
             if not row:return None,"season-pack preview not found"
             row=dict(row)
+            attempt=c.execute("SELECT 1 FROM season_pack_attempt_started WHERE audit_id=%s",(audit_id,)).fetchone()
+            if row["state"]=="dispatching" and attempt:
+                row=dict(c.execute("UPDATE season_pack_audit SET state='ambiguous',error_summary='grab attempt started but no terminal result was persisted; inspect Sonarr before any retry',updated_at=now() WHERE id=%s RETURNING *",(audit_id,)).fetchone())
             if row["state"]=="dispatching" and row["dispatch_started_at"] and now-row["dispatch_started_at"]>timedelta(minutes=5):
                 row=dict(c.execute("UPDATE season_pack_audit SET state='ambiguous',error_summary='grab reservation expired; inspect Sonarr before any retry',updated_at=now() WHERE id=%s RETURNING *",(audit_id,)).fetchone())
             if row["state"]!="previewed":return row,None
@@ -53,11 +60,15 @@ class SeasonPackRepository:
         """Linearize the last authorization check with the release POST.
 
         Shared row locks prevent mode, Live authorization, settings, or library
-        routing changes from committing between this check and the write. The
-        transaction is deliberately held only around this single bounded POST.
+        routing changes from committing between this check and the write. After
+        the final checks, a separate transaction commits an immutable attempt
+        marker before the bounded POST. If this transaction rolls back or the
+        process dies, that durable marker makes every later read fail closed.
         """
         with self.db.connect() as c:
-            row=c.execute("SELECT * FROM season_pack_audit WHERE id=%s FOR UPDATE",(audit_id,)).fetchone()
+            # NO KEY UPDATE still serializes confirmations/finalization while
+            # allowing the marker transaction's foreign-key KEY SHARE lock.
+            row=c.execute("SELECT * FROM season_pack_audit WHERE id=%s FOR NO KEY UPDATE",(audit_id,)).fetchone()
             if not row or row["state"]!="dispatching":yield c,"season-pack reservation is no longer dispatching";return
             row=dict(row);c.execute("SELECT pg_advisory_xact_lock(%s,%s)",(self.LOCK_CLASS,row["library_id"]))
             scheduler=c.execute("SELECT mode FROM scheduler_settings WHERE id=1 FOR SHARE").fetchone()
@@ -72,6 +83,9 @@ class SeasonPackRepository:
                 error="library routing identity changed since preview"
             elif not settings or not settings["enabled"] or any(settings[k]!=snapshot.get(k) for k in ("protocol","download_client_id","allow_cutoff_override","hourly_grab_cap","cooldown_minutes","pacing_seconds")):
                 error="season-pack settings changed since preview"
+            if error is None:
+                with self.db.connect() as marker_conn:
+                    marker_conn.execute("INSERT INTO season_pack_attempt_started(audit_id,started_at) VALUES(%s,now())",(audit_id,))
             yield c,error
     def finalize(self,audit_id,state,error="",conn=None):
         if conn is not None:
@@ -79,5 +93,6 @@ class SeasonPackRepository:
         with self.db.connect() as c:c.execute("UPDATE season_pack_audit SET state=%s,error_summary=%s,updated_at=now() WHERE id=%s AND state='dispatching'",(state,error[:500],audit_id))
         return self.get(audit_id)
     def recent(self,limit=50):
-        with self.db.connect() as c:rows=c.execute("SELECT * FROM season_pack_audit ORDER BY id DESC LIMIT %s",(limit,)).fetchall()
-        return [dict(x) for x in rows]
+        with self.db.connect() as c:
+            ids=c.execute("SELECT id FROM season_pack_audit ORDER BY id DESC LIMIT %s",(limit,)).fetchall()
+            return [self.get(x["id"],conn=c) for x in ids]

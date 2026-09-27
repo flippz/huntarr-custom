@@ -1317,6 +1317,23 @@ MIGRATIONS: list[Migration] = [
             CREATE TRIGGER trg_protect_season_pack_audit BEFORE UPDATE OR DELETE ON season_pack_audit FOR EACH ROW EXECUTE FUNCTION protect_season_pack_audit();
         """,
     ),
+    Migration(
+        version=12,
+        name="season_pack_attempt_started_boundary",
+        sql="""
+            CREATE TABLE season_pack_attempt_started (
+                audit_id BIGINT PRIMARY KEY REFERENCES season_pack_audit(id) ON DELETE RESTRICT,
+                started_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE OR REPLACE FUNCTION protect_season_pack_attempt_started() RETURNS trigger AS $$
+            BEGIN
+              RAISE EXCEPTION 'season-pack attempt-started markers are append-only';
+            END; $$ LANGUAGE plpgsql;
+            CREATE TRIGGER trg_protect_season_pack_attempt_started
+              BEFORE UPDATE OR DELETE ON season_pack_attempt_started
+              FOR EACH ROW EXECUTE FUNCTION protect_season_pack_attempt_started();
+        """,
+    ),
 ]
 
 

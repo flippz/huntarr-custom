@@ -21,9 +21,13 @@ def test_season_pack_ui_states_manual_safety_boundary(client):
 
 
 import copy
+import threading
+import time
 import pytest
 
 from app.adapters.sonarr_client import SonarrPostAmbiguousError, SonarrPostRejectedError
+from app.persistence.season_pack_repository import SeasonPackRepository
+from app.services.season_pack_service import SeasonPackService
 
 class ExactClient:
     grabs=[]
@@ -109,3 +113,76 @@ def test_typed_post_outcome_persists_safe_terminal_state(client,app,database,lib
         newer=client.post(f"/api/v1/libraries/{result['library_id']}/season-packs/preview",json={"series_id":7,"season_number":2}).get_json()
         blocked=client.post(f"/api/v1/season-packs/{newer['audit']['id']}/confirm",json={"confirm":True,"confirmation_token":newer["confirmation_token"]})
         assert blocked.status_code==422 and "cap" in blocked.get_json()["errors"][0]
+
+
+class SimulatedProcessDeath(BaseException):
+    pass
+
+
+class CrashAfterAcceptedClient(ExactClient):
+    def grab_release(self,body):
+        super().grab_release(body)
+        raise SimulatedProcessDeath("process died after Sonarr accepted the POST")
+
+
+def test_crash_after_accepted_post_is_durably_ambiguous_and_never_resent(client,app,database,library_repo,monkeypatch):
+    _,preview=prepare(client,app,database,library_repo,monkeypatch)
+    service=app.extensions["managearr"]["season_pack"]
+    monkeypatch.setattr(service,"client_factory",CrashAfterAcceptedClient)
+    ExactClient.grabs=[]
+
+    with pytest.raises(SimulatedProcessDeath):
+        service.confirm(preview["audit"]["id"],{"confirm":True,"confirmation_token":preview["confirmation_token"]})
+
+    with database.connect() as conn:
+        stored=conn.execute("SELECT state FROM season_pack_audit WHERE id=%s",(preview["audit"]["id"],)).fetchone()
+        marker=conn.execute("SELECT started_at FROM season_pack_attempt_started WHERE audit_id=%s",(preview["audit"]["id"],)).fetchone()
+    assert stored["state"]=="dispatching" and marker["started_at"] is not None
+
+    # A new repository/service instance models restart: the committed marker,
+    # not process memory or a stale timeout, must make the result ambiguous.
+    restarted=SeasonPackService(SeasonPackRepository(database),library_repo,app.extensions["managearr"]["live_repo"],app.extensions["managearr"]["scheduler_repo"],client_factory=CrashAfterAcceptedClient)
+    result,error=restarted.confirm(preview["audit"]["id"],{"confirm":True,"confirmation_token":preview["confirmation_token"]})
+    assert error is None and result["state"]=="ambiguous"
+    assert "no terminal result" in result["error_summary"]
+    assert len(ExactClient.grabs)==1
+
+    with pytest.raises(Exception,match="append-only"):
+        with database.connect() as conn:
+            conn.execute("UPDATE season_pack_attempt_started SET started_at=now() WHERE audit_id=%s",(preview["audit"]["id"],))
+    with pytest.raises(Exception,match="append-only"):
+        with database.connect() as conn:
+            conn.execute("DELETE FROM season_pack_attempt_started WHERE audit_id=%s",(preview["audit"]["id"],))
+
+
+class BlockingAcceptedClient(ExactClient):
+    entered=threading.Event();release=threading.Event()
+    def grab_release(self,body):
+        type(self).entered.set()
+        assert type(self).release.wait(3)
+        return super().grab_release(body)
+
+
+def test_pause_waits_for_attempt_boundary_and_bounded_post(client,app,database,library_repo,monkeypatch):
+    _,preview=prepare(client,app,database,library_repo,monkeypatch)
+    service=app.extensions["managearr"]["season_pack"]
+    monkeypatch.setattr(service,"client_factory",BlockingAcceptedClient)
+    BlockingAcceptedClient.entered=threading.Event();BlockingAcceptedClient.release=threading.Event();ExactClient.grabs=[]
+    outcome={};pause_done=threading.Event()
+
+    def confirm():
+        outcome["confirm"]=service.confirm(preview["audit"]["id"],{"confirm":True,"confirmation_token":preview["confirmation_token"]})
+    def pause():
+        app.extensions["managearr"]["live_repo"].set_authorization_state("paused",actor="test",reason="race")
+        pause_done.set()
+
+    confirm_thread=threading.Thread(target=confirm);confirm_thread.start()
+    assert BlockingAcceptedClient.entered.wait(3)
+    pause_thread=threading.Thread(target=pause);pause_thread.start()
+    time.sleep(.1)
+    assert not pause_done.is_set()
+    BlockingAcceptedClient.release.set()
+    confirm_thread.join(3);pause_thread.join(3)
+    assert not confirm_thread.is_alive() and not pause_thread.is_alive()
+    assert outcome["confirm"][0]["state"]=="completed"
+    assert pause_done.is_set() and len(ExactClient.grabs)==1
