@@ -12,12 +12,16 @@ def test_season_pack_api_preview_and_explicit_confirm(client,app,monkeypatch):
     response=client.post("/api/v1/season-packs/4/confirm",json={"confirm":True,"confirmation_token":"once"})
     assert response.status_code==200 and response.get_json()["audit"]["state"]=="completed"
 
+def test_season_packs_redirects_into_sonarr_workspace(client):
+    response=client.get("/season-packs")
+    assert response.status_code==302 and response.headers["Location"]=="/sonarr?tab=season-packs"
+
 def test_season_pack_ui_states_manual_safety_boundary(client):
-    html=client.get("/season-packs").get_data(as_text=True)
+    html=client.get("/sonarr").get_data(as_text=True)
     assert "Manual only" in html and "never sends broad SeasonSearch" in html
-    assert "manual preview performs read-only interactive release GETs" in html and "automatic scheduler runs never search releases or grab" in html
+    assert "automatic scheduler runs never search releases or grab" in html
     assert 'id="sp-confirm-check"' in html and 'confirm:true' in html
-    assert "Emergency Stop block confirmation" in html
+    assert "Emergency Stop" in html and "Pause" in html and "block confirmation" in html
 
 
 import copy

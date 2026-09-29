@@ -3,26 +3,45 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Managearr v1 (Preview) - {% block title %}{% endblock %}</title>
+  <title>Managearr - {% block title %}{% endblock %}</title>
+  <script>
+    (function () {
+      var stored = localStorage.getItem('managearr-theme');
+      document.documentElement.setAttribute('data-theme', stored === 'light' ? 'light' : 'dark');
+    })();
+  </script>
   <link rel="stylesheet" href="{{ url_for('web.static', filename='style.css') }}">
 </head>
 <body>
-  <div class="preview-banner">
-    Managearr v1 - Development Preview. Candidate scans and simulations are read-only. Manual searches require preview and confirmation; scheduled Live episode automation can send searches after explicit enablement.
+  <div class="app-shell">
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-brand">
+        Managearr
+        <button type="button" id="nav-close" class="hamburger nav-close-btn" aria-label="Close navigation">&times;</button>
+      </div>
+      <nav class="sidebar-nav" aria-label="Primary">
+        <a href="{{ url_for('web.overview') }}" class="{{ 'active' if active == 'home' else '' }}"><span class="nav-icon">&#8962;</span> Home</a>
+        <a href="{{ url_for('web.sonarr') }}" class="{{ 'active' if active == 'sonarr' else '' }}"><span class="nav-icon">&#128225;</span> Sonarr</a>
+        <a href="{{ url_for('web.activity') }}" class="{{ 'active' if active == 'activity' else '' }}"><span class="nav-icon">&#9679;</span> Activity</a>
+        <a href="{{ url_for('web.settings') }}" class="{{ 'active' if active == 'settings' else '' }}"><span class="nav-icon">&#9881;</span> Settings</a>
+      </nav>
+      <div class="sidebar-footer">
+        <button type="button" id="theme-toggle" class="theme-toggle">Light theme</button>
+        <span class="status-badge" title="Managearr version">v1</span>
+      </div>
+    </aside>
+    <div class="shell-main">
+      <header class="mobile-header">
+        <button type="button" id="nav-open" class="hamburger" aria-label="Open navigation">&#9776;</button>
+        <strong>Managearr</strong>
+        <span class="status-badge">v1</span>
+      </header>
+      <main class="content">
+        {% block content %}{% endblock %}
+      </main>
+    </div>
   </div>
-  <header class="topbar">
-    <div class="brand">Managearr <span class="v1-badge">v1</span></div>
-    <nav>
-      <a href="{{ url_for('web.overview') }}" class="{{ 'active' if active == 'overview' else '' }}">Overview</a>
-      <a href="{{ url_for('web.libraries') }}" class="{{ 'active' if active == 'libraries' else '' }}">Libraries</a>
-      <a href="{{ url_for('web.season_packs') }}" class="{{ 'active' if active == 'season_packs' else '' }}">Season Packs</a>
-      <a href="{{ url_for('web.activity') }}" class="{{ 'active' if active == 'activity' else '' }}">Activity</a>
-      <a href="{{ url_for('web.settings') }}" class="{{ 'active' if active == 'settings' else '' }}">Settings</a>
-    </nav>
-  </header>
-  <main class="content">
-    {% block content %}{% endblock %}
-  </main>
   <div id="toast" class="toast" hidden></div>
   <script src="{{ url_for('web.static', filename='app.js') }}"></script>
   {% block scripts %}{% endblock %}

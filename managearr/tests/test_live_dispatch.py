@@ -767,7 +767,7 @@ def test_live_ui_inline_scripts_have_valid_js_syntax(client, tmp_path):
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not available to syntax-check inline <script> blocks")
-    for path in ("/settings", "/"):
+    for path in ("/settings", "/", "/sonarr", "/activity"):
         html = client.get(path).get_data(as_text=True)
         for i, script in enumerate(re.findall(r"<script>(.*?)</script>", html, re.S)):
             js_file = tmp_path / f"{path.strip('/')  or 'overview'}_{i}.js"
@@ -784,9 +784,12 @@ def test_ui_exposes_danger_zone_two_step_flow(client):
     assert 'id="live-emergency-stop"' in settings_html
     assert "button-danger" in settings_html
 
-    overview_html = client.get("/").get_data(as_text=True)
-    assert 'id="ov-live-banner"' in overview_html
-    assert 'id="ov-live-emergency-stop"' in overview_html
+    home_html = client.get("/").get_data(as_text=True)
+    assert 'id="home-live-state"' in home_html
+    assert 'id="home-live-pause"' in home_html
+    assert 'id="home-live-resume"' in home_html
+    assert 'id="home-live-run-now"' in home_html
+    assert 'id="home-live-emergency-stop"' in home_html
 
 
 def test_live_dispatch_makes_reconciliation_due_immediately(database, live_repo):
@@ -803,7 +806,7 @@ def test_activity_recent_dispatches_api_and_ui(client, dispatch_repo):
     assert response.status_code == 200
     assert "batches" in response.get_json()
     html = client.get("/activity").get_data(as_text=True)
-    assert "Episode history" in html
+    assert "Hunt activity" in html
     assert "formatLocalTime" in html
     assert "loadTimeline" in html
 
@@ -816,7 +819,7 @@ def test_activity_live_attempts_api_and_ui(client):
     assert timeline.status_code == 200
     assert "events" in timeline.get_json()
     html = client.get("/activity").get_data(as_text=True)
-    assert "Episode history" in html
-    assert "Searches and their real download or import results" in html
+    assert "Hunt activity" in html
+    assert "Missing, upgrade, and season-pack attempts with their outcome" in html
     assert "Batch-level evidence" not in html
     assert "loadTimeline" in html

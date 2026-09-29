@@ -1,0 +1,377 @@
+{% extends "base.html" %}
+{% block title %}Sonarr{% endblock %}
+{% block content %}
+<h1>Sonarr</h1>
+
+<div class="tab-bar" role="tablist">
+  <button type="button" class="tab-button" id="tab-instances" data-tab="instances" role="tab" aria-controls="panel-instances" aria-selected="false">Instances</button>
+  <button type="button" class="tab-button" id="tab-hunting-policy" data-tab="hunting-policy" role="tab" aria-controls="panel-hunting-policy" aria-selected="false">Hunting policy</button>
+  <button type="button" class="tab-button" id="tab-season-packs" data-tab="season-packs" role="tab" aria-controls="panel-season-packs" aria-selected="false">Season packs</button>
+</div>
+
+<!-- ============================== Instances ============================== -->
+<section class="tab-panel" id="panel-instances" data-tab="instances" role="tabpanel" aria-labelledby="tab-instances">
+  <p class="muted">API keys are never shown here once saved - only whether one is configured.</p>
+  <p class="hint-notice">Test checks connectivity only. Scan reads Sonarr library and wanted data to refresh missing and upgrade candidates; it sends no searches and changes nothing in Sonarr.</p>
+
+  <section class="card">
+    <h2 id="form-title">Add Sonarr instance</h2>
+    <form id="library-form" class="form-grid">
+      <input type="hidden" id="lib-id" value="">
+      <input type="hidden" id="lib-type" value="sonarr">
+      <label>Name
+        <input type="text" id="lib-name" required>
+      </label>
+      <label>URL
+        <input type="text" id="lib-url" placeholder="http://host:port" required>
+      </label>
+      <label>API key
+        <input type="password" id="lib-api-key" placeholder="Required for new instances; leave blank to keep current">
+      </label>
+      <label class="checkbox">
+        <input type="checkbox" id="lib-enabled" checked>
+        Enabled
+      </label>
+      <div class="form-actions">
+        <button type="submit">Save</button>
+        <button type="button" id="cancel-edit" hidden>Cancel</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Configured Sonarr instances</h2>
+    <table class="data-table">
+      <thead>
+        <tr><th>Name</th><th>URL</th><th>API key</th><th>Enabled</th><th>Sonarr status</th><th></th></tr>
+      </thead>
+      <tbody id="library-rows">
+        <tr><td colspan="6">Loading...</td></tr>
+      </tbody>
+    </table>
+  </section>
+</section>
+
+<!-- =========================== Hunting policy ============================ -->
+<section class="tab-panel" id="panel-hunting-policy" data-tab="hunting-policy" role="tabpanel" aria-labelledby="tab-hunting-policy" hidden>
+  <p id="policy-summary" class="muted">Loading...</p>
+  <section class="card">
+    <h2>Missing and upgrades</h2>
+    <form id="policy-form" class="form-grid">
+      <label class="checkbox">
+        <input type="checkbox" id="p-missing">
+        Hunt missing episodes
+      </label>
+      <label class="checkbox">
+        <input type="checkbox" id="p-upgrades">
+        Hunt individual episode quality upgrades
+        <span class="muted">Uses Sonarr's below-cutoff list and EpisodeSearch only. When both are enabled, roughly 20% of shared capacity is reserved for upgrades (at least one slot when the cap is two or more); unused capacity returns to either kind. This does not dispatch season packs or delete/replace files - exact season-pack grabs live on the Season packs tab.</span>
+      </label>
+      <label>Cycle interval / test cadence (minutes)
+        <input type="number" id="p-cycle" min="5" max="1440" required>
+      </label>
+      <label>Hourly API cap
+        <input type="number" id="p-cap" min="1" max="1000" required>
+      </label>
+      <label>Successful grab target
+        <input type="number" id="p-grab-target" min="1" max="100" required>
+      </label>
+      <label>Dispatch interval (seconds)
+        <input type="number" id="p-dispatch" min="5" max="3600" required>
+      </label>
+      <label>Queue target
+        <input type="number" id="p-queue" min="1" max="100" required>
+      </label>
+      <label>Episode retry cooldown (minutes)
+        <input type="number" id="p-cooldown" min="0" max="1440" required>
+        <span class="muted">Use 1440 (24 hours) for normal Live operation. Lower values may repeatedly search episodes whose downloads fail.</span>
+      </label>
+      <label>Search order
+        <select id="p-order">
+          {% for o in search_orders %}
+          <option value="{{ o }}">{{ o }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="form-actions">
+        <button type="submit">Save hunting policy</button>
+      </div>
+    </form>
+  </section>
+</section>
+
+<!-- ============================= Season packs ============================= -->
+<section class="tab-panel" id="panel-season-packs" data-tab="season-packs" role="tabpanel" aria-labelledby="tab-season-packs" hidden>
+  <p class="hint-notice"><strong>Manual only, disabled by default.</strong> Preview uses read-only GET requests; a grab requires an exact release preview plus a second explicit confirmation and active Live authorization. Managearr never sends broad SeasonSearch, and automatic scheduler runs never search releases or grab.</p>
+  <section class="card">
+    <h2>Routing and limits</h2>
+    <label>Sonarr instance <select id="sp-library"></select></label>
+    <label>Protocol <select id="sp-protocol"><option value="usenet">Usenet</option><option value="torrent">Torrent</option></select></label>
+    <label>Preferred enabled client <select id="sp-client"></select></label>
+    <label><input id="sp-enabled" type="checkbox"> Enable manual strict season packs</label>
+    <label><input id="sp-cutoff" type="checkbox"> Allow exact existing-file-meets-cutoff override</label>
+    <label>Hourly cap <input id="sp-cap" type="number" min="1" max="10" value="1"></label>
+    <label>Cooldown minutes <input id="sp-cooldown" type="number" min="1" max="10080" value="1440"></label>
+    <label>Pacing seconds <input id="sp-pacing" type="number" min="5" max="3600" value="30"></label>
+    <div class="form-actions"><button type="button" id="sp-save">Save settings</button></div>
+  </section>
+  <section class="card">
+    <h2>Preview one exact non-special season</h2>
+    <label>Series ID <input id="sp-series" type="number" min="1"></label>
+    <label>Season <input id="sp-season" type="number" min="1"></label>
+    <div class="form-actions"><button type="button" id="sp-preview">Preview releases</button></div>
+    <pre id="sp-result"></pre>
+    <label id="sp-confirm-wrap" hidden><input id="sp-confirm-check" type="checkbox"> I confirm one exact release grab using the previewed protocol and client.</label>
+    <button id="sp-confirm" hidden class="button-danger">Confirm exact grab</button>
+    <p class="muted">Emergency Stop and Pause both block confirmation; Live must be running to complete a grab.</p>
+  </section>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+function selectSonarrTab(name) {
+  document.querySelectorAll('.tab-button').forEach(btn => {
+    const active = btn.dataset.tab === name;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', String(active));
+    btn.tabIndex = active ? 0 : -1;
+  });
+  document.querySelectorAll('.tab-panel').forEach(panel => { panel.hidden = panel.dataset.tab !== name; });
+}
+document.querySelectorAll('.tab-button').forEach(btn => btn.addEventListener('click', () => selectSonarrTab(btn.dataset.tab)));
+selectSonarrTab(new URLSearchParams(location.search).get('tab') || 'instances');
+
+// --- Instances ------------------------------------------------------------
+const form = document.getElementById('library-form');
+const cancelBtn = document.getElementById('cancel-edit');
+
+function statusBadge(text, kind) {
+  return `<span class="state-pill status-${kind}">${escapeHtml(text)}</span>`;
+}
+
+function libraryRow(lib) {
+  const tr = document.createElement('tr');
+  tr.dataset.id = lib.id;
+  tr.innerHTML = `
+    <td>${escapeHtml(lib.name)}</td>
+    <td>${escapeHtml(lib.url)}</td>
+    <td>${lib.has_api_key ? 'configured' : 'not set'}</td>
+    <td>${lib.enabled ? 'yes' : 'no'}</td>
+    <td class="sonarr-status">${statusBadge('Untested', 'unknown')}</td>
+    <td class="row-actions">
+      <button data-action="test" data-id="${lib.id}">Test</button>
+      <button data-action="scan" data-id="${lib.id}">Scan</button>
+      <button data-action="edit" data-id="${lib.id}">Edit</button>
+      <button data-action="delete" data-id="${lib.id}">Delete</button>
+    </td>
+  `;
+  return tr;
+}
+
+async function loadLibraries() {
+  const data = await api('/api/v1/libraries');
+  const sonarrLibraries = data.libraries.filter(lib => lib.type === 'sonarr');
+  const tbody = document.getElementById('library-rows');
+  tbody.innerHTML = '';
+  if (sonarrLibraries.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6">No Sonarr instances configured yet.</td></tr>';
+    return;
+  }
+  sonarrLibraries.forEach(lib => tbody.appendChild(libraryRow(lib)));
+}
+
+function resetForm() {
+  form.reset();
+  document.getElementById('lib-id').value = '';
+  document.getElementById('form-title').textContent = 'Add Sonarr instance';
+  document.getElementById('lib-api-key').required = true;
+  document.getElementById('lib-api-key').placeholder = 'Required for new instances';
+  cancelBtn.hidden = true;
+}
+
+cancelBtn.addEventListener('click', resetForm);
+
+document.getElementById('library-rows').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  const id = btn.dataset.id;
+  const row = btn.closest('tr');
+  const statusCell = row ? row.querySelector('.sonarr-status') : null;
+
+  if (btn.dataset.action === 'delete') {
+    if (!confirm('Delete this Sonarr instance?')) return;
+    await api(`/api/v1/libraries/${id}`, { method: 'DELETE' });
+    toast('Sonarr instance deleted');
+    loadLibraries();
+    return;
+  }
+
+  if (btn.dataset.action === 'edit') {
+    const data = await api(`/api/v1/libraries/${id}`);
+    const lib = data.library;
+    document.getElementById('lib-id').value = lib.id;
+    document.getElementById('lib-name').value = lib.name;
+    document.getElementById('lib-url').value = lib.url;
+    document.getElementById('lib-api-key').value = '';
+    document.getElementById('lib-api-key').required = false;
+    document.getElementById('lib-api-key').placeholder = 'Leave blank to keep current key';
+    document.getElementById('lib-enabled').checked = lib.enabled;
+    document.getElementById('form-title').textContent = `Edit ${lib.name}`;
+    cancelBtn.hidden = false;
+    return;
+  }
+
+  if (btn.dataset.action === 'test') {
+    if (statusCell) statusCell.innerHTML = statusBadge('Testing...', 'unknown');
+    try {
+      const data = await api(`/api/v1/libraries/${id}/test`, { method: 'POST' });
+      const version = data.status && data.status.version ? ` (v${data.status.version})` : '';
+      if (statusCell) statusCell.innerHTML = statusBadge('Reachable' + version, 'ok');
+      toast('Connection test succeeded');
+    } catch (err) {
+      if (statusCell) statusCell.innerHTML = statusBadge('Unreachable', 'error');
+      toast('Connection test failed: ' + err.message);
+    }
+    return;
+  }
+
+  if (btn.dataset.action === 'scan') {
+    if (statusCell) statusCell.innerHTML = statusBadge('Scanning...', 'unknown');
+    try {
+      const data = await api(`/api/v1/libraries/${id}/scan`, { method: 'POST' });
+      const job = data.job;
+      if (job.state === 'completed') {
+        if (statusCell) statusCell.innerHTML = statusBadge(`${job.candidate_count} candidate(s)`, 'ok');
+        toast(`Scan complete: ${job.candidate_count} candidate(s). See Activity for details.`);
+      } else {
+        if (statusCell) statusCell.innerHTML = statusBadge('Scan failed', 'error');
+        toast('Scan failed: ' + job.details);
+      }
+    } catch (err) {
+      if (statusCell) statusCell.innerHTML = statusBadge('Scan failed', 'error');
+      toast('Scan failed: ' + err.message);
+    }
+    return;
+  }
+});
+
+form.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const id = document.getElementById('lib-id').value;
+  const payload = {
+    name: document.getElementById('lib-name').value,
+    type: 'sonarr',
+    url: document.getElementById('lib-url').value,
+    enabled: document.getElementById('lib-enabled').checked,
+  };
+  const apiKey = document.getElementById('lib-api-key').value;
+  if (apiKey) payload.api_key = apiKey;
+
+  try {
+    if (id) {
+      await api(`/api/v1/libraries/${id}`, { method: 'PUT', body: payload });
+      toast('Sonarr instance updated');
+    } else {
+      await api('/api/v1/libraries', { method: 'POST', body: payload });
+      toast('Sonarr instance added');
+    }
+    resetForm();
+    loadLibraries();
+  } catch (err) {
+    toast('Save failed: ' + err.message);
+  }
+});
+
+loadLibraries().catch(err => toast('Failed to load Sonarr instances: ' + err.message));
+
+// --- Hunting policy ---------------------------------------------------------
+function fillForm(policy) {
+  document.getElementById('p-missing').checked = policy.missing_enabled;
+  document.getElementById('p-upgrades').checked = policy.upgrades_enabled;
+  document.getElementById('p-cycle').value = policy.cycle_interval_minutes;
+  document.getElementById('p-cap').value = policy.hourly_api_cap;
+  document.getElementById('p-grab-target').value = policy.successful_grab_target;
+  document.getElementById('p-dispatch').value = policy.dispatch_interval_seconds;
+  document.getElementById('p-queue').value = policy.queue_target;
+  document.getElementById('p-cooldown').value = policy.cooldown_minutes;
+  document.getElementById('p-order').value = policy.search_order;
+}
+
+async function loadPolicy() {
+  const data = await api('/api/v1/policy');
+  fillForm(data.policy);
+  setText('policy-summary', data.summary);
+}
+
+document.getElementById('policy-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const payload = {
+    missing_enabled: document.getElementById('p-missing').checked,
+    upgrades_enabled: document.getElementById('p-upgrades').checked,
+    cycle_interval_minutes: parseInt(document.getElementById('p-cycle').value, 10),
+    hourly_api_cap: parseInt(document.getElementById('p-cap').value, 10),
+    successful_grab_target: parseInt(document.getElementById('p-grab-target').value, 10),
+    dispatch_interval_seconds: parseInt(document.getElementById('p-dispatch').value, 10),
+    queue_target: parseInt(document.getElementById('p-queue').value, 10),
+    cooldown_minutes: parseInt(document.getElementById('p-cooldown').value, 10),
+    search_order: document.getElementById('p-order').value,
+  };
+  try {
+    const data = await api('/api/v1/policy', { method: 'PUT', body: payload });
+    fillForm(data.policy);
+    setText('policy-summary', data.summary);
+    toast('Hunting policy saved');
+  } catch (err) {
+    toast('Save failed: ' + err.message);
+  }
+});
+
+loadPolicy().catch(err => toast('Failed to load hunting policy: ' + err.message));
+
+// --- Season packs -----------------------------------------------------------
+(() => {
+  const $ = id => document.getElementById(id);
+  let token = null, auditId = null, libraries = [];
+  async function spApi(url, options = {}) {
+    const response = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
+    const body = await response.json();
+    if (!response.ok) throw new Error((body.errors || ['Request failed']).join('; '));
+    return body;
+  }
+  async function loadSpLibraries() {
+    const body = await spApi('/api/v1/libraries');
+    libraries = body.libraries.filter(x => x.type === 'sonarr' && x.enabled);
+    $('sp-library').innerHTML = libraries.map(x => '<option value="' + x.id + '">' + x.name + '</option>').join('');
+    if (libraries.length) await loadSpSettings();
+  }
+  async function loadSpSettings() {
+    const id = $('sp-library').value;
+    const [settingsBody, clientsBody] = await Promise.all([spApi('/api/v1/libraries/' + id + '/season-packs/settings'), spApi('/api/v1/libraries/' + id + '/season-packs/download-clients')]);
+    const s = settingsBody.settings;
+    $('sp-enabled').checked = s.enabled; $('sp-cutoff').checked = s.allow_cutoff_override;
+    $('sp-protocol').value = s.protocol || 'usenet'; $('sp-cap').value = s.hourly_grab_cap; $('sp-cooldown').value = s.cooldown_minutes; $('sp-pacing').value = s.pacing_seconds;
+    $('sp-client').innerHTML = clientsBody.clients.filter(x => x.enabled).map(x => '<option data-protocol="' + x.protocol + '" value="' + x.id + '">' + x.name + ' (' + x.protocol + ')</option>').join('');
+    if (s.download_client_id) $('sp-client').value = String(s.download_client_id);
+  }
+  $('sp-library').addEventListener('change', () => loadSpSettings().catch(showSp));
+  $('sp-save').addEventListener('click', async () => {
+    const payload = { enabled: $('sp-enabled').checked, protocol: $('sp-protocol').value, download_client_id: Number($('sp-client').value), allow_cutoff_override: $('sp-cutoff').checked, hourly_grab_cap: Number($('sp-cap').value), cooldown_minutes: Number($('sp-cooldown').value), pacing_seconds: Number($('sp-pacing').value) };
+    await spApi('/api/v1/libraries/' + $('sp-library').value + '/season-packs/settings', { method: 'PATCH', body: JSON.stringify(payload) });
+    showSp('Settings saved.');
+  });
+  $('sp-preview').addEventListener('click', async () => {
+    token = null; auditId = null; $('sp-confirm').hidden = true; $('sp-confirm-wrap').hidden = true;
+    const body = await spApi('/api/v1/libraries/' + $('sp-library').value + '/season-packs/preview', { method: 'POST', body: JSON.stringify({ series_id: Number($('sp-series').value), season_number: Number($('sp-season').value) }) });
+    $('sp-result').textContent = JSON.stringify({ selected: body.selected, rejected: body.rejected, audit: body.audit }, null, 2);
+    if (body.selected) { token = body.confirmation_token; auditId = body.audit.id; $('sp-confirm').hidden = false; $('sp-confirm-wrap').hidden = false; }
+  });
+  $('sp-confirm').addEventListener('click', async () => {
+    if (!$('sp-confirm-check').checked) return showSp('Tick the explicit confirmation first.');
+    const body = await spApi('/api/v1/season-packs/' + auditId + '/confirm', { method: 'POST', body: JSON.stringify({confirm:true, confirmation_token: token}) });
+    token = null; $('sp-confirm').hidden = true; $('sp-confirm-wrap').hidden = true; $('sp-result').textContent = JSON.stringify(body.audit, null, 2);
+  });
+  function showSp(value) { $('sp-result').textContent = value instanceof Error ? value.message : value; }
+  loadSpLibraries().catch(showSp);
+})();
+</script>
+{% endblock %}

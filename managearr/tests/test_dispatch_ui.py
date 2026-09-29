@@ -28,11 +28,12 @@ def test_activity_ui_clear_preview_is_local_and_send_uses_exact_confirmation(cli
     assert "Any selection change clears the preview" in html
 
 
-def test_global_preview_banner_no_longer_claims_no_search_can_be_sent(client):
+def test_no_global_preview_banner_claims_no_search_can_be_sent(client):
     html = client.get("/activity").get_data(as_text=True)
-    assert "Manual searches require preview and confirmation" in html
-    assert "scheduled Live episode automation can send searches after explicit enablement" in html
+    assert "preview-banner" not in html
+    assert "Development Preview" not in html
     assert "no searches are sent and nothing in Sonarr is changed" not in html
+    assert "automated hunting is not active" not in html
 
 
 def test_activity_ui_exposes_read_only_reconciliation_and_evidence_timeline(client):
@@ -59,9 +60,9 @@ def test_activity_ui_labels_missing_and_upgrade_candidate_kinds(client):
     assert "kind-pill kind-${escapeHtml(c.candidate_kind)}" in html
 
 
-def test_settings_explains_safe_individual_upgrade_search(client):
-    html = client.get("/settings").get_data(as_text=True)
-    assert "Search individual episode quality upgrades" in html
-    assert "This episode policy does not dispatch season packs or delete or replace files" in html
-    assert "manual Season Packs page" in html
+def test_sonarr_hunting_policy_explains_safe_individual_upgrade_search(client):
+    html = client.get("/sonarr").get_data(as_text=True)
+    assert "Hunt individual episode quality upgrades" in html
+    assert "does not dispatch season packs" in html
+    assert "Season packs tab" in html
     assert "roughly 20% of shared capacity is reserved for upgrades" in html

@@ -1,8 +1,79 @@
-# Managearr v1 (Development Preview)
+# Managearr v1
 
 Managearr is a standalone Flask/PostgreSQL rewrite beside the legacy Huntarr
 application (`main.py`, `src/`). It has its own image, database, port, API, and
-UI. Nothing in this application changes the legacy runtime.
+UI. Nothing in this application changes the legacy runtime. Managearr is
+Sonarr-only for now; Radarr, Lidarr, Readarr, Whisparr, and Eros are not part
+of the current UI or roadmap.
+
+## Huntarr-aligned navigation and information architecture
+
+The UI is organized around hunting rather than infrastructure. A left sidebar
+(a mobile header/drawer below 860px) replaces the old horizontal top bar, with
+exactly four primary destinations - Home, Sonarr, Activity, Settings - plus a
+theme toggle persisted in `localStorage` (dark by default) via CSS custom
+properties, applied synchronously in `<head>` before first paint to avoid a
+theme flash. The old `/libraries` and `/season-packs` routes still work; they
+redirect (302) into the Sonarr workspace (`/sonarr` and `/sonarr?tab=season-
+packs`) so existing bookmarks keep working. No new frontend framework or CDN
+dependency was added - the shell is server-rendered Jinja plus the existing
+vanilla `app.js`.
+
+**Home** is a hunting-first dashboard, not an infrastructure dashboard: a
+card per configured Sonarr instance (enabled/disabled, URL, missing/upgrade
+candidate counts from the latest completed scan, latest hunt time, and most
+recent dispatch outcome), a prominent Live hunting card with Pause/confirmed-
+Resume/Emergency Stop/Run now wired to the exact same gated APIs and
+confirmation semantics as before, the simulation scheduler's next-due/latest-
+cycle, a one-line read-only-refresh notice, and a concise recent-activity
+table. An empty state guides an operator with no Sonarr instance yet straight
+to the Sonarr workspace. All of this is computed by the browser from existing
+read-only `/api/v1/*` endpoints (libraries, policy, scheduler, live status,
+refresh status, activity, activity/dispatches, activity/timeline) - **no new
+backend endpoint, schema change, or write path was added** for Home.
+
+**Sonarr** replaces the generic Libraries page with a single workspace with
+three tabs: Instances (the same add/edit/test/scan/delete flows, minus any
+generic Arr-type picker - creating an instance always sends `type: "sonarr"`;
+the backend `ARR_TYPES` enum is unchanged for API compatibility, but the UI
+never renders it), Hunting policy (the automation-policy form - missing/
+upgrades, order, cooldown, caps, queue target, pacing - moved here from
+Settings since it is entirely about hunting behavior), and Season packs (the
+exact M11 manual-only strict season-pack flow, unchanged behavior, integrated
+as a tab instead of a standalone page).
+
+**Activity** now leads with a human-readable hunt-activity table (type,
+episode/season, state, when, result) before the full scan/dispatch audit
+table. Batch IDs, command IDs, and raw evidence for each dispatch attempt are
+collapsed into a per-row expandable "Details" toggle rather than dedicated
+always-visible columns; the Evidence/Reconcile controls and all reconciliation
+behavior are unchanged.
+
+**Settings** puts routine controls first - theme, the simulation scheduler's
+mode/cadence, and read-only refresh cadence - followed by the unchanged Live
+automation danger zone (mode-enable challenge, Pause/Resume/Run now/Emergency
+Stop), then a collapsed `<details>` "Advanced / System" disclosure holding
+health (app version, database connectivity, schema version), worker lease
+state, the live policy digest, and the authorization generation - technical
+detail that used to be mixed into the main Overview/Settings views.
+
+The old full-width "Development Preview" warning banner is gone from every
+page; a small `v1 preview` status badge lives in the sidebar/mobile header
+instead. Existing safety-relevant copy (Live/simulation/refresh "sends no
+Sonarr commands" notices, the M9-M11 reconciliation/season-pack safety
+language) is preserved verbatim or near-verbatim where tests already locked it
+in - only consolidated so it appears once per page instead of in repeated
+boxes.
+
+No safety gate, confirmation, or API contract changed: every control on Home
+and the Sonarr workspace calls the same endpoints, with the same payloads and
+confirmation requirements, as the page it replaced. `managearr/tests/
+test_ui_copy.py`, `test_huntarr_alignment_ui.py`, `test_dispatch_ui.py`,
+`test_live_dispatch.py`, and `test_season_pack_api_ui.py` cover the sidebar
+shell/theme wiring, the redirects, Sonarr-only instance creation, Home's
+empty/summary state, Activity's detail-row collapsing, Settings' routine-
+first/Advanced-disclosure layout, and the continued absence of Radarr/Lidarr/
+Readarr/Whisparr/Eros anywhere in rendered UI.
 
 ## Current milestone: strict manual Sonarr season packs (M11)
 
@@ -902,7 +973,9 @@ The Activity scan-detail modal now provides:
 
 The dispatch audit also shows the latest observed command state,
 reconciliation state/summary/time, and read-only **Reconcile**/**Evidence**
-controls. Evidence detail renders batch command observations and each
+controls, now behind a per-row **Details** toggle alongside the batch/command
+IDs (see "Huntarr-aligned navigation" above) rather than as always-visible
+columns. Evidence detail renders batch command observations and each
 candidate's latest outcome plus timeline. The UI repeats that reconciliation
 sends no search and command completion is not proof of a grab or import.
 
@@ -1055,7 +1128,10 @@ M11 delegates the sanctioned release grab to Sonarr and performs no file deletio
 
 ## Current limitations
 
-- Sonarr only; other Arr types remain CRUD-only.
+- Sonarr only. The UI only ever creates/edits `type: "sonarr"` instances; the
+  `ARR_TYPES` enum still accepts other legacy values through the API for
+  backward compatibility, but no page renders them or offers them as a
+  choice, and none of Radarr/Lidarr/Readarr/Whisparr/Eros are on the roadmap.
 - Automatic dispatch exists only through the M7-M8 persistent, paced Live
   scheduler path (`mode = live` plus authorization state `running`, rechecked
   before every send); fresh deployments still default to `off`. The M2 manual

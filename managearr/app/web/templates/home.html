@@ -1,0 +1,211 @@
+{% extends "base.html" %}
+{% block title %}Home{% endblock %}
+{% block content %}
+<h1>Home</h1>
+
+<section id="home-empty" class="card empty-state" hidden>
+  <p>No Sonarr instance is configured yet. Add one to start hunting for missing episodes and quality upgrades.</p>
+  <a href="{{ url_for('web.sonarr') }}"><button type="button">Add a Sonarr instance</button></a>
+</section>
+
+<div id="home-body" hidden>
+  <section id="home-instances"></section>
+
+  <section class="card danger-zone" id="home-live-card">
+    <h2>Live hunting</h2>
+    <p class="live-state-line" id="home-live-state">-</p>
+    <p class="muted" id="home-live-reason">-</p>
+    <p class="muted" id="home-live-allowance">-</p>
+    <p class="muted" id="home-live-last">Last dispatch: none</p>
+    <p class="hint-notice" id="home-live-enable-hint" hidden>Live hunting has not been enabled yet. <a href="{{ url_for('web.settings') }}#live-automation">Enable it safely in Settings</a> before using Resume or Run now.</p>
+    <label>Reason <input type="text" id="home-live-reason-input" maxlength="500" placeholder="Reason for this control action"></label>
+    <div class="form-actions">
+      <button type="button" id="home-live-pause" class="button-secondary">Pause</button>
+      <button type="button" id="home-live-resume">Resume (confirm)</button>
+      <button type="button" id="home-live-run-now" class="button-secondary">Run now</button>
+      <button type="button" id="home-live-emergency-stop" class="button-danger">Emergency Stop</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Simulation scheduler</h2>
+    <p class="hint-notice">Simulation sends no Sonarr commands and remains read-only.</p>
+    <p><strong>Next due:</strong> <span id="home-next-due">-</span> · <strong>Latest cycle:</strong> <span id="home-latest-cycle">none</span></p>
+  </section>
+
+  <section class="card">
+    <h2>Read-only refresh automation</h2>
+    <p class="hint-notice">Read-only refresh automation never sends Sonarr commands - it only runs scans and reconciliation reads.</p>
+    <p><strong>Latest scan:</strong> <span id="home-refresh-scan">none</span> · <strong>Latest reconciliation:</strong> <span id="home-refresh-reconcile">none</span></p>
+  </section>
+
+  <section class="card">
+    <h2>Recent activity</h2>
+    <div class="table-scroll"><table class="data-table">
+      <thead><tr><th>When</th><th>Episode</th><th>Type</th><th>Result</th></tr></thead>
+      <tbody id="home-recent-activity"><tr><td colspan="4">Loading...</td></tr></tbody>
+    </table></div>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function liveStateClass(banner) {
+  if (banner.includes('RUNNING')) return 'live-state-running';
+  if (banner.includes('PAUSED')) return 'live-state-paused';
+  if (banner.includes('STOPPED')) return 'live-state-stopped';
+  return 'live-state-off';
+}
+
+function libraryCard(lib, info) {
+  const statusText = lib.enabled ? 'Enabled' : 'Disabled';
+  const scan = info.latestJob
+    ? `${formatLocalTime(info.latestJob.updated_at)} - ${info.latestJob.state} (${info.latestJob.candidate_count} candidate(s))`
+    : 'never scanned';
+  const outcome = info.latestBatch
+    ? `#${info.latestBatch.id} ${info.latestBatch.state} - ${info.latestBatch.outcome_human_state}`
+    : 'no dispatch attempts yet';
+  return `
+    <div class="card">
+      <h2>${escapeHtml(lib.name)} <span class="state-pill status-${lib.enabled ? 'ok' : 'unknown'}">${statusText}</span></h2>
+      <p class="muted">${escapeHtml(lib.url)}</p>
+      <div class="card-grid" style="margin:12px 0 6px">
+        <div class="card"><h2>Missing</h2><p class="metric">${info.missingCount}</p></div>
+        <div class="card"><h2>Upgrades</h2><p class="metric">${info.upgradeCount}</p></div>
+      </div>
+      <p><strong>Latest hunt:</strong> ${escapeHtml(scan)}</p>
+      <p><strong>Recent outcome:</strong> ${escapeHtml(outcome)}</p>
+      <div class="form-actions">
+        <a href="{{ url_for('web.sonarr') }}"><button type="button" class="button-secondary">Manage</button></a>
+      </div>
+    </div>`;
+}
+
+async function candidateCounts(jobId) {
+  try {
+    const data = await api(`/api/v1/activity/${jobId}/candidates`);
+    let missing = 0, upgrade = 0;
+    data.candidates.forEach(c => { if (c.candidate_kind === 'upgrade') upgrade += 1; else missing += 1; });
+    return { missingCount: missing, upgradeCount: upgrade };
+  } catch (err) {
+    return { missingCount: 0, upgradeCount: 0 };
+  }
+}
+
+function renderHomeLive(liveInfo, policyInfo) {
+  let banner = 'OFF';
+  if (liveInfo.mode === 'live') {
+    if (liveInfo.control.state === 'emergency_stopped') banner = 'STOPPED';
+    else if (liveInfo.control.state === 'running') banner = 'RUNNING';
+    else banner = 'PAUSED';
+  }
+  const stateEl = document.getElementById('home-live-state');
+  stateEl.textContent = `Live hunting: ${banner}`;
+  stateEl.className = `live-state-line ${liveStateClass(banner)}`;
+  setText('home-live-reason', liveInfo.dispatch_allowed ? `Running: ${liveInfo.control.authorization_reason || ''}` : `Blocked: ${liveInfo.blocked_reasons.join('; ')}`);
+  const effectiveLiveMax = Math.min(5, liveInfo.control.max_dispatches_per_cycle, policyInfo.successful_grab_target);
+  const effectiveLiveDelay = Math.max(liveInfo.control.min_delay_seconds_between_dispatches, policyInfo.dispatch_interval_seconds);
+  setText('home-live-allowance', `Up to ${effectiveLiveMax} eligible search(es) per cycle, at least ${effectiveLiveDelay} second(s) apart; ${liveInfo.pending_live_cycles} cycle(s) pending.`);
+  setText('home-live-last', liveInfo.control.last_dispatch_at ? `Last dispatch: ${liveInfo.control.last_dispatch_at} - ${liveInfo.control.last_dispatch_summary}` : 'Last dispatch: none');
+  document.getElementById('home-live-enable-hint').hidden = liveInfo.mode === 'live';
+  document.getElementById('home-live-resume').disabled = liveInfo.mode !== 'live';
+  document.getElementById('home-live-run-now').disabled = liveInfo.mode !== 'live';
+}
+
+async function refreshHomeLive() {
+  const [live, policy] = await Promise.all([
+    api('/api/v1/scheduler/live/status'),
+    api('/api/v1/policy'),
+  ]);
+  renderHomeLive(live.live, policy.policy);
+}
+
+async function loadHome() {
+  const [librariesData, policy, scheduler, live, jobsData, dispatchesData, timeline, refresh] = await Promise.all([
+    api('/api/v1/libraries'),
+    api('/api/v1/policy'),
+    api('/api/v1/scheduler'),
+    api('/api/v1/scheduler/live/status'),
+    api('/api/v1/activity?state=completed&limit=200'),
+    api('/api/v1/activity/dispatches?limit=50'),
+    api('/api/v1/activity/timeline?limit=8'),
+    api('/api/v1/refresh'),
+  ]);
+
+  const sonarrLibraries = librariesData.libraries.filter(l => l.type === 'sonarr');
+  document.getElementById('home-empty').hidden = sonarrLibraries.length > 0;
+  document.getElementById('home-body').hidden = sonarrLibraries.length === 0;
+  if (sonarrLibraries.length === 0) return;
+
+  const scanJobs = jobsData.jobs.filter(j => j.job_type === 'sonarr_scan');
+  const instancesRoot = document.getElementById('home-instances');
+  instancesRoot.innerHTML = '<div class="card-grid" id="home-instance-grid"></div>';
+  const grid = document.getElementById('home-instance-grid');
+
+  for (const lib of sonarrLibraries) {
+    const jobsForLib = scanJobs.filter(j => j.library_id === lib.id);
+    const latestJob = jobsForLib.length
+      ? jobsForLib.reduce((a, b) => (new Date(a.updated_at) > new Date(b.updated_at) ? a : b))
+      : null;
+    const latestBatch = dispatchesData.batches.find(b => b.library_id === lib.id) || null;
+    const counts = latestJob ? await candidateCounts(latestJob.id) : { missingCount: 0, upgradeCount: 0 };
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = libraryCard(lib, { latestJob, latestBatch, ...counts });
+    grid.appendChild(wrapper.firstElementChild);
+  }
+
+  const schedulerInfo = scheduler.scheduler;
+  setText('home-next-due', schedulerInfo.settings.next_due_at || 'not scheduled');
+  const latestCycle = schedulerInfo.latest_cycle;
+  setText('home-latest-cycle', latestCycle ? `#${latestCycle.id} ${latestCycle.state} (${latestCycle.trigger})` : 'none');
+
+  renderHomeLive(live.live, policy.policy);
+
+  const refreshInfo = refresh.refresh;
+  const scan = refreshInfo.latest_scan;
+  const reconcile = refreshInfo.latest_reconcile;
+  setText('home-refresh-scan', scan ? `#${scan.id} ${scan.state} (${scan.library_name})` : 'none');
+  setText('home-refresh-reconcile', reconcile ? `#${reconcile.id} ${reconcile.state}` : 'none');
+
+  const recentBody = document.getElementById('home-recent-activity');
+  recentBody.innerHTML = '';
+  if (!timeline.events.length) {
+    recentBody.innerHTML = '<tr><td colspan="4">No episode activity yet.</td></tr>';
+  } else {
+    timeline.events.forEach(event => {
+      const tr = document.createElement('tr');
+      const episode = `${escapeHtml(event.series_title)} S${String(event.season_number).padStart(2, '0')}E${String(event.episode_number).padStart(2, '0')}`;
+      tr.innerHTML = `
+        <td>${escapeHtml(formatLocalTime(event.occurred_at))}</td>
+        <td>${episode}</td>
+        <td><span class="kind-pill kind-${escapeHtml(event.candidate_kind)}">${escapeHtml(event.candidate_kind === 'upgrade' ? 'Upgrade' : 'Missing')}</span></td>
+        <td><span class="state-pill state-${escapeHtml(resultClass(event.result))}">${escapeHtml(event.result)}</span></td>`;
+      recentBody.appendChild(tr);
+    });
+  }
+}
+
+async function homeLiveAction(action, defaultReason) {
+  const reason = document.getElementById('home-live-reason-input').value.trim() || defaultReason;
+  try {
+    await api(`/api/v1/scheduler/live/${action}`, { method: 'POST', body: { reason, confirm: true } });
+    toast(`Live ${action} applied`);
+    await loadHome();
+  } catch (err) { toast(`${action} failed: ` + err.message); }
+}
+document.getElementById('home-live-pause').addEventListener('click', () => homeLiveAction('pause', 'operator pause from Home'));
+document.getElementById('home-live-resume').addEventListener('click', () => homeLiveAction('resume', 'operator confirmed resume from Home'));
+document.getElementById('home-live-emergency-stop').addEventListener('click', () => homeLiveAction('emergency-stop', 'operator emergency stop from Home'));
+document.getElementById('home-live-run-now').addEventListener('click', async () => {
+  if (!confirm('Queue one Live planning cycle now? Eligible items may send real Sonarr searches.')) return;
+  try {
+    await api('/api/v1/scheduler/live/run-now', { method: 'POST', body: { reason: 'operator requested immediate Live run from Home', confirm: true } });
+    toast('Live cycle requested');
+    await loadHome();
+  } catch (err) { toast('Run now failed: ' + err.message); }
+});
+
+loadHome().catch(err => toast('Failed to load Home: ' + err.message));
+setInterval(() => refreshHomeLive().catch(() => {}), 5000);
+</script>
+{% endblock %}

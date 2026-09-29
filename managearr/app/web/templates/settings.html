@@ -2,10 +2,19 @@
 {% block title %}Settings{% endblock %}
 {% block content %}
 <h1>Settings</h1>
-<p class="simulation-notice"><strong>Simulation sends no Sonarr commands and remains read-only.</strong> Live automation below can send EpisodeSearch commands after explicit enablement.</p>
+
+<section class="card">
+  <h2>Theme</h2>
+  <p>Current theme: <strong id="settings-theme-current">Dark</strong></p>
+  <div class="form-actions">
+    <button type="button" id="settings-theme-toggle" class="button-secondary">Toggle theme</button>
+  </div>
+</section>
+
 <section class="card">
   <h2>Simulation scheduler</h2>
-  <p>Mode: <strong id="scheduler-mode">-</strong> · Worker lease: <strong id="scheduler-lease">-</strong></p>
+  <p class="hint-notice">Simulation sends no Sonarr commands and remains read-only.</p>
+  <p>Mode: <strong id="scheduler-mode">-</strong></p>
   <p>Next due: <span id="scheduler-next-due">-</span></p>
   <label class="danger-confirm">
     <input type="checkbox" id="scheduler-confirm">
@@ -18,13 +27,25 @@
   </div>
   <p class="muted" id="scheduler-latest">Latest cycle: none</p>
 </section>
+
+<section class="card">
+  <h2>Read-only refresh automation</h2>
+  <p class="hint-notice">Read-only refresh automation never sends Sonarr commands - it only runs scans and reconciliation reads.</p>
+  <p>Scan freshness window: <strong id="refresh-scan-age">-</strong> minute(s) · Reconcile every <strong id="refresh-reconcile-interval">-</strong> minute(s), up to <strong id="refresh-reconcile-max">-</strong> per pass</p>
+  <p>Latest scan: <span id="refresh-latest-scan">none</span></p>
+  <p>Latest reconciliation: <span id="refresh-latest-reconcile">none</span></p>
+  <p>Queued/running refreshes: <span id="refresh-active">0</span></p>
+  <div class="form-actions">
+    <button type="button" id="refresh-run-now" class="button-secondary">Run scan refresh now (all enabled instances)</button>
+  </div>
+</section>
+
 <section class="card danger-zone" id="live-dispatch-card">
-  <h2>Live automation</h2>
-  <p class="simulation-notice"><strong>Live sends real Sonarr EpisodeSearch commands.</strong> Authorization is persistent until explicitly paused or stopped.</p>
+  <h2 id="live-automation">Live automation</h2>
+  <p class="hint-notice"><strong>Live sends real Sonarr EpisodeSearch commands.</strong> Authorization is persistent until explicitly paused or stopped. Pause/Resume/Emergency Stop are also available on Home.</p>
   <p>Status: <strong id="live-state">-</strong> · Scheduler mode: <strong id="live-mode">-</strong></p>
   <p id="live-reason" class="muted">-</p>
   <p class="muted">Runs every <strong id="live-cycle-interval">-</strong> minute(s). Up to <strong id="live-max-dispatches">-</strong> eligible search(es) per cycle, at least <strong id="live-min-delay">-</strong> second(s) apart.</p>
-  <p class="muted">Changing the cycle interval below immediately recalculates Next due. Pause/Resume preserves that schedule.</p>
   <p class="muted" id="live-last-dispatch">Last dispatch: none</p>
   <div id="live-first-enable">
     <h3>Enable Live (first time)</h3>
@@ -41,83 +62,33 @@
     <button type="button" id="live-emergency-stop" class="button-danger">Emergency Stop</button>
   </div>
 </section>
-<section class="card">
-  <h2>Read-only refresh automation</h2>
-  <p class="simulation-notice"><strong>Read-only refresh automation never sends Sonarr commands.</strong> It only runs scans and reconciliation reads.</p>
-  <p>Scan freshness window: <strong id="refresh-scan-age">-</strong> minute(s) · Reconcile every <strong id="refresh-reconcile-interval">-</strong> minute(s), up to <strong id="refresh-reconcile-max">-</strong> per pass</p>
-  <p>Latest scan: <span id="refresh-latest-scan">none</span></p>
-  <p>Latest reconciliation: <span id="refresh-latest-reconcile">none</span></p>
-  <p>Queued/running refreshes: <span id="refresh-active">0</span></p>
-  <div class="form-actions">
-    <button type="button" id="refresh-run-now" class="button-secondary">Run scan refresh now (all enabled libraries)</button>
-  </div>
-</section>
-<section class="card">
-  <h2>Automation policy</h2>
-  <p id="policy-summary" class="muted">Loading...</p>
-  <form id="policy-form" class="form-grid">
-    <label class="checkbox">
-      <input type="checkbox" id="p-missing">
-      Search missing items
-    </label>
-    <label class="checkbox">
-      <input type="checkbox" id="p-upgrades">
-      Search individual episode quality upgrades
-      <span class="muted">Uses Sonarr's below-cutoff list and EpisodeSearch only. When both modes have candidates, roughly 20% of shared capacity is reserved for upgrades, with at least one slot when the cap is two or more; unused capacity returns to either mode. This episode policy does not dispatch season packs or delete or replace files; exact season-pack grabs are available separately on the manual Season Packs page.</span>
-    </label>
-    <label>Cycle interval / test cadence (minutes)
-      <input type="number" id="p-cycle" min="5" max="1440" required>
-    </label>
-    <label>Hourly API cap
-      <input type="number" id="p-cap" min="1" max="1000" required>
-    </label>
-    <label>Successful grab target
-      <input type="number" id="p-grab-target" min="1" max="100" required>
-    </label>
-    <label>Dispatch interval (seconds)
-      <input type="number" id="p-dispatch" min="5" max="3600" required>
-    </label>
-    <label>Queue target
-      <input type="number" id="p-queue" min="1" max="100" required>
-    </label>
-    <label>Episode retry cooldown (minutes)
-      <input type="number" id="p-cooldown" min="0" max="1440" required>
-      <span class="muted">Use 1440 (24 hours) for normal Live operation. Lower values may repeatedly search episodes whose downloads fail.</span>
-    </label>
-    <label>Search order
-      <select id="p-order">
-        {% for o in search_orders %}
-        <option value="{{ o }}">{{ o }}</option>
-        {% endfor %}
-      </select>
-    </label>
-    <div class="form-actions">
-      <button type="submit">Save policy</button>
-    </div>
-  </form>
-</section>
+
+<details class="advanced-disclosure">
+  <summary>Advanced / System</summary>
+
+  <section class="card">
+    <h2>Health</h2>
+    <p>Status: <strong id="adv-status">-</strong> · Version: <strong id="adv-version">-</strong></p>
+    <p>Database connected: <strong id="adv-db">-</strong> · Schema version: <strong id="adv-schema">-</strong></p>
+    <p>Worker lease: <strong id="adv-lease">-</strong></p>
+  </section>
+
+  <section class="card">
+    <h2>Authorization</h2>
+    <p>Policy digest: <code id="adv-policy-digest">-</code></p>
+    <p>Authorization generation: <strong id="adv-authorization-generation">-</strong></p>
+  </section>
+</details>
 {% endblock %}
 {% block scripts %}
 <script>
-function fillForm(policy) {
-  document.getElementById('p-missing').checked = policy.missing_enabled;
-  document.getElementById('p-upgrades').checked = policy.upgrades_enabled;
-  document.getElementById('p-cycle').value = policy.cycle_interval_minutes;
-  document.getElementById('p-cap').value = policy.hourly_api_cap;
-  document.getElementById('p-grab-target').value = policy.successful_grab_target;
-  document.getElementById('p-dispatch').value = policy.dispatch_interval_seconds;
-  document.getElementById('p-queue').value = policy.queue_target;
-  document.getElementById('p-cooldown').value = policy.cooldown_minutes;
-  document.getElementById('p-order').value = policy.search_order;
-}
-
 async function loadScheduler() {
   const scheduler = (await api('/api/v1/scheduler')).scheduler;
   setText('scheduler-mode', scheduler.settings.mode);
-  setText('scheduler-lease', scheduler.lease.healthy ? 'healthy' : 'stale / absent');
   setText('scheduler-next-due', scheduler.settings.next_due_at || 'not scheduled');
   const latest = scheduler.latest_cycle;
   setText('scheduler-latest', latest ? `Latest cycle: #${latest.id} ${latest.state} (${latest.trigger})` : 'Latest cycle: none');
+  setText('adv-lease', scheduler.lease.healthy ? 'healthy' : 'stale / absent');
 }
 
 async function loadRefresh() {
@@ -136,44 +107,21 @@ document.getElementById('refresh-run-now').addEventListener('click', async () =>
   try {
     const data = await api('/api/v1/refresh/run-now', { method: 'POST', body: {} });
     const created = data.requests.filter(r => r.created).length;
-    toast(created ? `Queued ${created} read-only scan refresh(es)` : 'A scan refresh is already queued for every enabled library');
+    toast(created ? `Queued ${created} read-only scan refresh(es)` : 'A scan refresh is already queued for every enabled instance');
     await loadRefresh();
   } catch (err) { toast('Refresh queue failed: ' + err.message); }
 });
 
 loadRefresh().catch(err => toast('Failed to load refresh automation: ' + err.message));
 
-async function loadPolicy() {
-  const data = await api('/api/v1/policy');
-  fillForm(data.policy);
-  setText('policy-summary', data.summary);
+async function loadHealth() {
+  const status = await api('/api/v1/status');
+  setText('adv-status', status.status);
+  setText('adv-version', status.version);
+  setText('adv-db', status.database.connected ? 'yes' : 'no');
+  setText('adv-schema', status.database.schema_version ?? 'unknown');
 }
-
-document.getElementById('policy-form').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  const payload = {
-    missing_enabled: document.getElementById('p-missing').checked,
-    upgrades_enabled: document.getElementById('p-upgrades').checked,
-    cycle_interval_minutes: parseInt(document.getElementById('p-cycle').value, 10),
-    hourly_api_cap: parseInt(document.getElementById('p-cap').value, 10),
-    successful_grab_target: parseInt(document.getElementById('p-grab-target').value, 10),
-    dispatch_interval_seconds: parseInt(document.getElementById('p-dispatch').value, 10),
-    queue_target: parseInt(document.getElementById('p-queue').value, 10),
-    cooldown_minutes: parseInt(document.getElementById('p-cooldown').value, 10),
-    search_order: document.getElementById('p-order').value,
-  };
-  try {
-    const data = await api('/api/v1/policy', { method: 'PUT', body: payload });
-    fillForm(data.policy);
-    setText('policy-summary', data.summary);
-    toast('Policy saved');
-  } catch (err) {
-    toast('Save failed: ' + err.message);
-  }
-});
-
-loadPolicy().catch(err => toast('Failed to load policy: ' + err.message));
-loadScheduler().catch(err => toast('Failed to load scheduler: ' + err.message));
+loadHealth().catch(() => {});
 
 document.getElementById('scheduler-confirm').addEventListener('change', (ev) => {
   document.getElementById('scheduler-enable').disabled = !ev.target.checked;
@@ -203,6 +151,8 @@ document.getElementById('scheduler-run').addEventListener('click', async () => {
   } catch (err) { toast('Queue failed: ' + err.message); }
 });
 
+loadScheduler().catch(err => toast('Failed to load scheduler: ' + err.message));
+
 // --- Persistent live authorization --------------------------------------
 let liveModeChallenge = null;
 async function loadLive() {
@@ -212,11 +162,14 @@ async function loadLive() {
   const live = liveResponse.live;
   setText('live-mode', live.mode); setText('live-state', live.control.state);
   setText('live-reason', live.dispatch_allowed ? `Running: ${live.control.authorization_reason}` : `Blocked: ${live.blocked_reasons.join('; ')}. ${live.control.authorization_reason || ''}`);
-  setText('live-cycle-interval', policy.cycle_interval_minutes);
-  setText('live-max-dispatches', Math.min(5, live.control.max_dispatches_per_cycle, policy.successful_grab_target));
-  setText('live-min-delay', Math.max(live.control.min_delay_seconds_between_dispatches, policy.dispatch_interval_seconds));
+  const policyValues = policy.policy;
+  setText('live-cycle-interval', policyValues.cycle_interval_minutes);
+  setText('live-max-dispatches', Math.min(5, live.control.max_dispatches_per_cycle, policyValues.successful_grab_target));
+  setText('live-min-delay', Math.max(live.control.min_delay_seconds_between_dispatches, policyValues.dispatch_interval_seconds));
   setText('live-last-dispatch', live.control.last_dispatch_at ? `Last dispatch: ${live.control.last_dispatch_at} - ${live.control.last_dispatch_summary}` : 'Last dispatch: none');
   document.getElementById('live-first-enable').hidden = live.mode === 'live';
+  setText('adv-policy-digest', live.policy_digest);
+  setText('adv-authorization-generation', live.control.authorization_generation);
 }
 document.getElementById('live-mode-request').addEventListener('click', async () => {
   try { liveModeChallenge = await api('/api/v1/scheduler/live/mode-challenge',{method:'POST',body:{}}); setText('live-mode-phrase',liveModeChallenge.required_phrase); document.getElementById('live-mode-challenge-box').hidden=false; }

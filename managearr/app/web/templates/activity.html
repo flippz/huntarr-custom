@@ -2,20 +2,20 @@
 {% block title %}Activity{% endblock %}
 {% block content %}
 <h1>Activity</h1>
-<p class="muted">Durable scan, scheduled/manual dispatch, and Sonarr outcome history.</p>
-<p class="readonly-notice">Candidate scans only read Sonarr. Live or confirmed manual dispatch may send an EpisodeSearch command.</p>
-<p class="readonly-notice">Outcome reconciliation is read-only and sends no search. Live dispatches are reconciled automatically, and manual reconciliation remains available for eligible attempts. A completed EpisodeSearch command alone is not proof that Sonarr grabbed, downloaded, or imported an episode.</p>
+<p class="muted">Human-readable hunt history first; full audit evidence stays available in detail rows below.</p>
+<p class="hint-notice">Candidate scans only read Sonarr. Live or confirmed manual dispatch may send an EpisodeSearch command. Outcome reconciliation is read-only and sends no search: Live dispatches are reconciled automatically, and manual reconciliation remains available for eligible attempts. A completed command alone is not proof that Sonarr grabbed, downloaded, or imported an episode.</p>
 
 <section class="card">
-  <h2>Episode history</h2>
-  <p class="muted">Searches and their real download or import results. Newest activity appears first.</p>
+  <h2>Hunt activity</h2>
+  <p class="muted">Missing, upgrade, and season-pack attempts with their outcome. Newest first.</p>
   <div class="table-scroll"><table class="data-table">
-    <thead><tr><th>Time</th><th>Episode</th><th>Search type</th><th>Activity</th><th>Result</th><th>Details</th></tr></thead>
-    <tbody id="activity-timeline"><tr><td colspan="6">Loading...</td></tr></tbody>
+    <thead><tr><th>When</th><th>Episode/Season</th><th>Search type</th><th>Activity</th><th>Result</th></tr></thead>
+    <tbody id="activity-timeline"><tr><td colspan="5">Loading...</td></tr></tbody>
   </table></div>
 </section>
 
 <section class="card">
+  <h2>Scans and dispatch attempts</h2>
   <label>Filter by state
     <select id="state-filter">
       <option value="">All</option>
@@ -27,10 +27,10 @@
   <div class="table-scroll">
     <table class="data-table">
       <thead>
-        <tr><th>ID</th><th>Library</th><th>Type</th><th>Title</th><th>State</th><th>Candidates</th><th>Updated</th><th></th></tr>
+        <tr><th>Instance</th><th>Type</th><th>Title</th><th>State</th><th>Candidates</th><th>Updated</th><th></th></tr>
       </thead>
       <tbody id="activity-rows">
-        <tr><td colspan="8">Loading...</td></tr>
+        <tr><td colspan="7">Loading...</td></tr>
       </tbody>
     </table>
   </div>
@@ -80,10 +80,11 @@
 
     <section class="audit-section">
       <h3>Dispatch audit</h3>
+      <p class="muted">Batch IDs, command IDs, and raw evidence are in the expandable Details row for each attempt.</p>
       <div class="table-scroll">
         <table class="data-table">
-          <thead><tr><th>ID</th><th>Mode</th><th>Dispatch</th><th>Counts</th><th>Command</th><th>Reconciliation</th><th>Last read</th><th>Result</th><th></th></tr></thead>
-          <tbody id="dispatch-audit"><tr><td colspan="9">Loading...</td></tr></tbody>
+          <thead><tr><th>Mode</th><th>State</th><th>Counts</th><th>Result</th><th></th></tr></thead>
+          <tbody id="dispatch-audit"><tr><td colspan="5">Loading...</td></tr></tbody>
         </table>
       </div>
       <div id="outcome-detail" class="dispatch-preview" hidden>
@@ -100,23 +101,12 @@
 let currentJobId = null;
 let previewCandidateIds = [];
 
-function formatLocalTime(value) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value || '-';
-  const pad = number => String(number).padStart(2, '0');
-  return `${pad(date.getDate())}-${pad(date.getMonth() + 1)}-${String(date.getFullYear()).slice(-2)} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
-}
-
-function resultClass(result) {
-  return String(result || '').toLowerCase().replaceAll(' ', '-');
-}
-
 async function loadTimeline() {
   const data = await api('/api/v1/activity/timeline?limit=200');
   const tbody = document.getElementById('activity-timeline');
   tbody.innerHTML = '';
   if (!data.events.length) {
-    tbody.innerHTML = '<tr><td colspan="6">No episode activity yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5">No episode activity yet.</td></tr>';
     return;
   }
   data.events.forEach(event => {
@@ -127,8 +117,7 @@ async function loadTimeline() {
       <td><strong>${episode}</strong></td>
       <td><span class="kind-pill kind-${escapeHtml(event.candidate_kind)}">${escapeHtml(event.candidate_kind === 'upgrade' ? 'Upgrade' : 'Missing')}</span></td>
       <td>${escapeHtml(event.activity)}</td>
-      <td><span class="state-pill state-${escapeHtml(resultClass(event.result))}">${escapeHtml(event.result)}</span></td>
-      <td>${escapeHtml(event.details || '')}</td>`;
+      <td><span class="state-pill state-${escapeHtml(resultClass(event.result))}">${escapeHtml(event.result)}</span> ${escapeHtml(event.details || '')}</td>`;
     tbody.appendChild(tr);
   });
 }
@@ -140,13 +129,12 @@ async function loadActivity() {
   const tbody = document.getElementById('activity-rows');
   tbody.innerHTML = '';
   if (data.jobs.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8">No activity yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7">No activity yet.</td></tr>';
     return;
   }
   data.jobs.forEach(job => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td>${job.id}</td>
       <td>${escapeHtml(job.library_name)}</td>
       <td>${escapeHtml(job.job_type)}</td>
       <td>${escapeHtml(job.title)}</td>
@@ -182,24 +170,36 @@ async function loadDispatchAudit(jobId) {
   const tbody = document.getElementById('dispatch-audit');
   tbody.innerHTML = '';
   if (data.batches.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9">No previews or dispatch attempts yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5">No previews or dispatch attempts yet.</td></tr>';
     return;
   }
   data.batches.forEach(batch => {
-    const tr = document.createElement('tr');
-    const command = batch.sonarr_command_id ? `#${batch.sonarr_command_id} ${batch.sonarr_command_status || ''}` : '-';
     const canReconcile = batch.mode === 'manual' && ['completed', 'partial', 'ambiguous'].includes(batch.state) && batch.sonarr_command_id;
-    tr.innerHTML = `
-      <td>${batch.id}</td><td>${escapeHtml(batch.mode)}</td>
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td>${escapeHtml(batch.mode)}</td>
       <td><span class="state-pill state-${escapeHtml(batch.state)}">${escapeHtml(batch.state)}</span></td>
       <td>${batch.requested_count}/${batch.selected_count}/${batch.dispatched_count}</td>
-      <td>${escapeHtml(command)}<br><span class="muted">${escapeHtml(batch.command_observed_state || '')}</span></td>
-      <td>${escapeHtml(batch.outcome_human_state)}<br><span class="muted">${escapeHtml(batch.reconciliation_summary || '')}</span></td>
-      <td>${escapeHtml(batch.last_reconciled_at || 'never')}</td>
-      <td>${escapeHtml(batch.error_summary || '')}</td>
-      <td><button type="button" data-action="outcomes" data-batch-id="${batch.id}">Evidence</button>
-      ${canReconcile ? `<button type="button" data-action="reconcile" data-batch-id="${batch.id}">Reconcile (read-only)</button>` : ''}</td>`;
-    tbody.appendChild(tr);
+      <td>${escapeHtml(batch.outcome_human_state)}</td>
+      <td><button type="button" class="detail-toggle" data-action="toggle-detail" data-batch-id="${batch.id}">Details</button></td>`;
+    tbody.appendChild(row);
+
+    const command = batch.sonarr_command_id ? `#${batch.sonarr_command_id} ${batch.sonarr_command_status || ''}` : '-';
+    const detailRow = document.createElement('tr');
+    detailRow.className = 'detail-row';
+    detailRow.hidden = true;
+    detailRow.dataset.batchId = batch.id;
+    detailRow.innerHTML = `
+      <td colspan="5"><div class="detail-box">
+        <p><strong>Batch #${batch.id}</strong> · Command: ${escapeHtml(command)} <span class="muted">${escapeHtml(batch.command_observed_state || '')}</span></p>
+        <p>Reconciliation: ${escapeHtml(batch.reconciliation_summary || 'none')} · Last read: ${escapeHtml(batch.last_reconciled_at || 'never')}</p>
+        ${batch.error_summary ? `<p>${escapeHtml(batch.error_summary)}</p>` : ''}
+        <div class="form-actions">
+          <button type="button" data-action="outcomes" data-batch-id="${batch.id}">Evidence</button>
+          ${canReconcile ? `<button type="button" data-action="reconcile" data-batch-id="${batch.id}">Reconcile (read-only)</button>` : ''}
+        </div>
+      </div></td>`;
+    tbody.appendChild(detailRow);
   });
 }
 
@@ -228,7 +228,7 @@ async function openJob(jobId) {
   document.getElementById('job-modal-title').textContent = `Job #${jobId}`;
   document.getElementById('job-modal-details').textContent = 'Loading...';
   document.getElementById('job-modal-candidates').innerHTML = '<tr><td colspan="7">Loading...</td></tr>';
-  document.getElementById('dispatch-audit').innerHTML = '<tr><td colspan="9">Loading...</td></tr>';
+  document.getElementById('dispatch-audit').innerHTML = '<tr><td colspan="5">Loading...</td></tr>';
   document.getElementById('dispatch-controls').hidden = true;
   document.getElementById('outcome-detail').hidden = true;
   document.getElementById('job-modal').hidden = false;
@@ -296,6 +296,12 @@ document.getElementById('select-all-candidates').addEventListener('click', () =>
   clearPreview();
 });
 document.getElementById('dispatch-audit').addEventListener('click', async ev => {
+  const toggleBtn = ev.target.closest('button[data-action="toggle-detail"]');
+  if (toggleBtn) {
+    const detailRow = document.querySelector(`tr.detail-row[data-batch-id="${toggleBtn.dataset.batchId}"]`);
+    if (detailRow) detailRow.hidden = !detailRow.hidden;
+    return;
+  }
   const btn = ev.target.closest('button[data-batch-id]');
   if (!btn) return;
   try {
