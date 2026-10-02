@@ -314,19 +314,123 @@ class SonarrClient:
             status = self._bounded_text(record.get("status"), "queue status", required=True, limit=64)
             tracked_state = self._bounded_text(record.get("trackedDownloadState"), "queue tracked state", limit=64)
             added = self._timestamp_text(record.get("added"), "queue added date")
-            download_id = record.get("downloadId", record.get("id"))
+            download_id = record.get("downloadId")
             if download_id is not None:
                 download_id = self._bounded_text(str(download_id), "queue download id", limit=255)
+            # The queue record's own positive integer id is the identity
+            # used for the destructive DELETE below. It is deliberately
+            # retained separately from downloadId (the client download
+            # identity, which Sonarr may reuse/rotate across queue records
+            # and is never a valid DELETE target). Fail closed if it is not
+            # a strictly positive integer.
+            queue_id = self._positive_int(record.get("id"), "queue record id")
+            title = self._bounded_text(record.get("title"), "queue title", limit=500) or ""
+            size = record.get("size")
+            if size is not None and (not isinstance(size, (int, float)) or isinstance(size, bool) or size < 0):
+                raise SonarrDataError("Sonarr queue record had an invalid size")
+            sizeleft = record.get("sizeleft")
+            if sizeleft is not None and (
+                not isinstance(sizeleft, (int, float)) or isinstance(sizeleft, bool) or sizeleft < 0
+            ):
+                raise SonarrDataError("Sonarr queue record had an invalid sizeleft")
+            timeleft = self._bounded_text(record.get("timeleft"), "queue timeleft", limit=32)
+            error_message = self._bounded_text(record.get("errorMessage"), "queue error message", limit=500)
+            status_messages = record.get("statusMessages")
+            safe_status_messages = []
+            if isinstance(status_messages, list):
+                for entry in status_messages[:20]:
+                    if isinstance(entry, dict):
+                        title_text = entry.get("title")
+                        messages = entry.get("messages")
+                        safe_status_messages.append(
+                            {
+                                "title": title_text[:255] if isinstance(title_text, str) else None,
+                                "messages": [m[:500] for m in messages if isinstance(m, str)][:10]
+                                if isinstance(messages, list)
+                                else [],
+                            }
+                        )
             safe_records.append(
                 {
+                    "queue_id": queue_id,
                     "episode_ids": episode_ids,
                     "status": status.lower(),
                     "tracked_state": tracked_state.lower() if tracked_state else None,
                     "download_id": download_id,
                     "added": added,
+                    "title": title,
+                    "size": int(size) if size is not None else None,
+                    "sizeleft": int(sizeleft) if sizeleft is not None else None,
+                    "timeleft": timeleft,
+                    "error_message": error_message,
+                    "status_messages": safe_status_messages,
                 }
             )
         return {"page": page, "page_size": page_size, "total_records": total_records, "records": safe_records}
+
+    def delete_queue_record(
+        self, queue_id: int, *, remove_from_client: bool, blocklist: bool, skip_redownload: bool = False
+    ) -> None:
+        """Remove one Sonarr queue record via ``DELETE /api/v3/queue/{id}``.
+
+        ``queue_id`` must be the queue record's own positive integer id (see
+        ``get_queue_details`` above) - never ``downloadId``. This method
+        narrowly distinguishes three outcomes so callers can fail closed on
+        uncertainty:
+
+        * returns normally only on a definite HTTP 2xx/404 (404 means the
+          record is already gone, which is an acceptable terminal state for
+          a removal request - not an error);
+        * raises ``SonarrPostRejectedError`` on a definite 4xx (401/403 is
+          surfaced as ``SonarrAuthError``, not treated as ambiguous, since
+          it is also a definite non-2xx outcome and no DELETE could have
+          been accepted);
+        * raises ``SonarrPostAmbiguousError`` for anything else where
+          acceptance cannot be disproved: connection errors, timeouts, and
+          5xx responses. Callers must never automatically retry after this.
+
+        Never includes the configured base URL or API key in any raised
+        message.
+        """
+        if not isinstance(queue_id, int) or isinstance(queue_id, bool) or queue_id <= 0:
+            raise ValueError("queue_id must be a positive integer")
+        if not isinstance(remove_from_client, bool) or not isinstance(blocklist, bool) or not isinstance(skip_redownload, bool):
+            raise ValueError("remove_from_client, blocklist, and skip_redownload must be booleans")
+        url = _safe_join(self._base_url, f"/api/v3/queue/{queue_id}")
+        headers = {"X-Api-Key": self._api_key}
+        params = {
+            "removeFromClient": "true" if remove_from_client else "false",
+            "blocklist": "true" if blocklist else "false",
+            "skipRedownload": "true" if skip_redownload else "false",
+        }
+        try:
+            response = self._session.delete(url, headers=headers, params=params, timeout=self._timeout)
+        except requests.exceptions.RequestException as exc:
+            raise SonarrPostAmbiguousError("Sonarr queue removal outcome is unknown") from exc
+        if response.status_code == 404:
+            # Already gone - treat as a successful terminal removal.
+            return
+        if response.status_code in (401, 403):
+            raise SonarrAuthError("Sonarr rejected the configured API key")
+        if 400 <= response.status_code < 500:
+            reason = ""
+            try:
+                problem = response.json()
+                if isinstance(problem, dict):
+                    text = problem.get("message")
+                    if isinstance(text, str) and 0 < len(text) <= 300:
+                        reason = text
+                elif isinstance(problem, list):
+                    texts = [x.get("errorMessage") for x in problem if isinstance(x, dict)]
+                    texts = [x for x in texts if isinstance(x, str) and 0 < len(x) <= 300]
+                    reason = "; ".join(texts[:5])
+            except (ValueError, TypeError):
+                pass
+            suffix = f": {reason}" if reason else ""
+            raise SonarrPostRejectedError(f"Sonarr definitely rejected the queue removal with HTTP {response.status_code}{suffix}")
+        if not response.ok:
+            raise SonarrPostAmbiguousError(f"Sonarr queue removal outcome is unknown after HTTP {response.status_code}")
+        return
 
     def get_series_detail(self, series_id: int) -> dict:
         series_id = self._positive_int(series_id, "series id")

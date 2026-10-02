@@ -37,6 +37,8 @@ from .services.dispatch_service import DispatchService
 from .services.live_dispatch_coordinator import LiveDispatchCoordinator
 from .services.refresh_service import RefreshService
 from .services.scheduler_service import SchedulerService
+from .services.slow_download_service import SlowDownloadService
+from .persistence.slow_download_repository import SlowDownloadRepository
 
 LOG = logging.getLogger("managearr.worker")
 
@@ -50,6 +52,7 @@ class SchedulerWorker:
         refresh_service: RefreshService | None = None,
         live_repository: LiveRepository | None = None,
         live_coordinator: LiveDispatchCoordinator | None = None,
+        slow_download_service: SlowDownloadService | None = None,
         *,
         owner_id: str | None = None,
         lease_seconds: int = 30,
@@ -83,6 +86,17 @@ class SchedulerWorker:
         # time run_once() actually has a mode_snapshot='live' cycle to
         # process, and never before.
         self._live_coordinator = live_coordinator
+        # Monitoring-only by construction: SlowDownloadService.poll_library
+        # never calls anything but GET, so this is safe to hold
+        # unconditionally, unlike the write-capable live dispatch
+        # coordinator above. Gated removal (attempt_removals) still
+        # requires auto_removal_enabled AND a live, running, matching-
+        # generation, non-emergency-stopped Live authorization, re-checked
+        # immediately before each DELETE - see SlowDownloadService.
+        self.slow_download_service = slow_download_service or SlowDownloadService(
+            SlowDownloadRepository(repository.db), LibraryRepository(repository.db),
+            self.live_repository, repository, timeout=sonarr_timeout,
+        )
         self.owner_id = owner_id or f"worker-{uuid.uuid4()}"
         self.lease_seconds = max(10, lease_seconds)
         self.poll_seconds = max(0.5, poll_seconds)
@@ -114,6 +128,7 @@ class SchedulerWorker:
         # dispatched to again.
         for library in self.repository.enabled_sonarr_libraries():
             self.dispatch_repository.expire_stale_reservations(library["id"])
+
         policy = self.policy_repository.get()
         self.repository.claim_manual_request(self.owner_id, policy)
         self.repository.enqueue_scheduled_if_due(policy)
@@ -132,6 +147,17 @@ class SchedulerWorker:
         if self.repository.current_mode() in ("simulate", "live"):
             self.refresh_service.ensure_freshness()
             self.refresh_service.enqueue_reconcile_if_due()
+            # Slow-download guard monitoring is read-only GET polling, same
+            # kill-switch as refresh above: it runs in simulate or live
+            # (i.e. "regardless of Live hunting/armed state"), never while
+            # mode is off. Automatic removal is attempted at most once per
+            # iteration and is independently gated inside
+            # SlowDownloadService.attempt_removals on auto_removal_enabled
+            # AND a live/running/matching-generation/non-emergency-stopped
+            # Live authorization, re-checked immediately before each
+            # bounded DELETE.
+            self.slow_download_service.poll_all()
+            self.slow_download_service.attempt_removals(max_removals=1)
         refresh_run = self.refresh_repository.start_next_run(self.owner_id)
         if refresh_run is not None:
             if not self._heartbeat():

@@ -83,6 +83,24 @@ def test_no_page_claims_unimplemented_m12_capabilities(client):
             assert phrase not in html, f"{path} unexpectedly references M12-only capability {phrase!r}"
 
 
+def test_slow_download_guard_tab_states_sonarr_only_safe_defaults(client):
+    html = client.get("/sonarr").get_data(as_text=True)
+    assert "Slow-download guard" in html
+    assert "Sonarr-only" in html
+    assert "Automatic removal defaults to disabled" in html
+    assert "Monitoring is enabled by default" in html
+    assert 'id="sdg-confirm-check"' in html
+    # Legacy Swaparr is a migration/context note only - never its own
+    # product module or something the Slow-download guard tab is "part of".
+    assert "Swaparr" not in html
+
+
+def test_home_shows_sonarr_downloads_status_card(client):
+    html = client.get("/").get_data(as_text=True)
+    assert "Sonarr downloads" in html
+    assert 'id="home-slow-download-rows"' in html
+
+
 def test_no_dropped_arr_names_appear_in_rendered_ui(client):
     dropped_names = ("radarr", "lidarr", "readarr", "whisparr", "eros")
     for path in PAGES:

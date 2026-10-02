@@ -1355,6 +1355,152 @@ MIGRATIONS: list[Migration] = [
             END; $$ LANGUAGE plpgsql;
         """,
     ),
+    Migration(
+        version=14,
+        name="slow_download_guard",
+        sql="""
+            -- Sonarr-only slow-download guard. Monitoring is enabled by
+            -- default for every library; automatic removal is disabled by
+            -- default and stays disabled across this migration for any
+            -- existing library, matching the product requirement that a
+            -- fresh deploy/migration never starts deleting downloads.
+            CREATE TABLE slow_download_settings (
+                library_id BIGINT PRIMARY KEY REFERENCES arr_libraries(id) ON DELETE CASCADE,
+                monitoring_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                auto_removal_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                poll_seconds INTEGER NOT NULL DEFAULT 60 CHECK (poll_seconds BETWEEN 15 AND 3600),
+                initial_grace_minutes INTEGER NOT NULL DEFAULT 30 CHECK (initial_grace_minutes BETWEEN 0 AND 1440),
+                no_progress_window_minutes INTEGER NOT NULL DEFAULT 30 CHECK (no_progress_window_minutes BETWEEN 5 AND 1440),
+                no_progress_min_observations INTEGER NOT NULL DEFAULT 3 CHECK (no_progress_min_observations BETWEEN 2 AND 100),
+                progress_epsilon_bytes BIGINT NOT NULL DEFAULT 1048576 CHECK (progress_epsilon_bytes BETWEEN 65536 AND 1073741824),
+                very_slow_rate_bytes_per_second INTEGER NOT NULL DEFAULT 51200 CHECK (very_slow_rate_bytes_per_second BETWEEN 1024 AND 104857600),
+                very_slow_window_minutes INTEGER NOT NULL DEFAULT 90 CHECK (very_slow_window_minutes BETWEEN 15 AND 2880),
+                very_slow_min_remaining_bytes BIGINT NOT NULL DEFAULT 536870912 CHECK (very_slow_min_remaining_bytes BETWEEN 0 AND 1099511627776),
+                very_slow_min_observations INTEGER NOT NULL DEFAULT 4 CHECK (very_slow_min_observations BETWEEN 2 AND 200),
+                strikes_required INTEGER NOT NULL DEFAULT 2 CHECK (strikes_required BETWEEN 1 AND 10),
+                remove_from_client BOOLEAN NOT NULL DEFAULT TRUE,
+                blocklist BOOLEAN NOT NULL DEFAULT TRUE,
+                skip_redownload BOOLEAN NOT NULL DEFAULT FALSE,
+                revision BIGINT NOT NULL DEFAULT 1 CHECK (revision >= 1),
+                last_polled_at TIMESTAMPTZ NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                CHECK (
+                    NOT auto_removal_enabled OR (remove_from_client OR blocklist)
+                )
+            );
+
+            -- Durable current queue-item tracking, keyed by the library plus
+            -- the immutable Sonarr queue record id (never downloadId, which
+            -- Sonarr may reuse/rotate across queue records for the same
+            -- underlying client download).
+            CREATE TABLE slow_download_queue_items (
+                id BIGSERIAL PRIMARY KEY,
+                library_id BIGINT NOT NULL REFERENCES arr_libraries(id) ON DELETE CASCADE,
+                sonarr_queue_id BIGINT NOT NULL CHECK (sonarr_queue_id > 0),
+                download_id TEXT NULL CHECK (download_id IS NULL OR length(download_id) <= 255),
+                title TEXT NOT NULL DEFAULT '' CHECK (length(title) <= 500),
+                status TEXT NOT NULL DEFAULT '' CHECK (length(status) <= 64),
+                tracked_state TEXT NULL CHECK (tracked_state IS NULL OR length(tracked_state) <= 64),
+                size_bytes BIGINT NULL CHECK (size_bytes IS NULL OR size_bytes >= 0),
+                sizeleft_bytes BIGINT NULL CHECK (sizeleft_bytes IS NULL OR sizeleft_bytes >= 0),
+                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_observed_at TIMESTAMPTZ NULL,
+                last_sizeleft_bytes BIGINT NULL,
+                last_meaningful_progress_at TIMESTAMPTZ NULL,
+                no_progress_window_started_at TIMESTAMPTZ NULL,
+                no_progress_window_start_sizeleft BIGINT NULL,
+                no_progress_window_observations INTEGER NOT NULL DEFAULT 0,
+                stall_strike_count INTEGER NOT NULL DEFAULT 0 CHECK (stall_strike_count >= 0),
+                very_slow_window_started_at TIMESTAMPTZ NULL,
+                very_slow_window_start_sizeleft BIGINT NULL,
+                very_slow_window_observations INTEGER NOT NULL DEFAULT 0,
+                very_slow_strike_count INTEGER NOT NULL DEFAULT 0 CHECK (very_slow_strike_count >= 0),
+                classification TEXT NOT NULL DEFAULT 'grace' CHECK (
+                    classification IN (
+                        'exempt', 'grace', 'healthy', 'slow_watch',
+                        'stalled_evidence', 'very_slow_evidence',
+                        'removal_pending', 'ambiguous', 'removed'
+                    )
+                ),
+                reason TEXT NOT NULL DEFAULT '' CHECK (length(reason) <= 1000),
+                removed_at TIMESTAMPTZ NULL,
+                removal_outcome TEXT NULL CHECK (
+                    removal_outcome IS NULL OR removal_outcome IN ('completed', 'rejected', 'ambiguous')
+                ),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (library_id, sonarr_queue_id)
+            );
+            CREATE INDEX idx_slow_download_queue_items_library_classification
+                ON slow_download_queue_items (library_id, classification, updated_at DESC);
+            CREATE INDEX idx_slow_download_queue_items_last_seen
+                ON slow_download_queue_items (last_seen_at);
+
+            -- Append-only per-poll observation history: enough to explain
+            -- every strike/reset decision and survive a restart.
+            CREATE TABLE slow_download_observations (
+                id BIGSERIAL PRIMARY KEY,
+                queue_item_id BIGINT NOT NULL REFERENCES slow_download_queue_items(id) ON DELETE RESTRICT,
+                observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                status TEXT NOT NULL CHECK (length(status) <= 64),
+                size_bytes BIGINT NULL CHECK (size_bytes IS NULL OR size_bytes >= 0),
+                sizeleft_bytes BIGINT NULL CHECK (sizeleft_bytes IS NULL OR sizeleft_bytes >= 0),
+                delta_bytes BIGINT NULL,
+                elapsed_seconds DOUBLE PRECISION NULL CHECK (elapsed_seconds IS NULL OR elapsed_seconds >= 0),
+                classification TEXT NOT NULL CHECK (length(classification) <= 64),
+                reason TEXT NOT NULL DEFAULT '' CHECK (length(reason) <= 1000)
+            );
+            CREATE INDEX idx_slow_download_observations_item_time
+                ON slow_download_observations (queue_item_id, observed_at DESC, id DESC);
+            CREATE OR REPLACE FUNCTION protect_slow_download_append_only() RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'slow-download audit rows are append-only';
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER trg_protect_slow_download_observations
+                BEFORE UPDATE OR DELETE ON slow_download_observations
+                FOR EACH ROW EXECUTE FUNCTION protect_slow_download_append_only();
+
+            -- Append-only audit of every strike/reset/exemption/removal
+            -- decision - sufficient on its own to explain any removal.
+            CREATE TABLE slow_download_actions (
+                id BIGSERIAL PRIMARY KEY,
+                queue_item_id BIGINT NOT NULL REFERENCES slow_download_queue_items(id) ON DELETE RESTRICT,
+                library_id BIGINT NULL REFERENCES arr_libraries(id) ON DELETE SET NULL,
+                sonarr_queue_id BIGINT NOT NULL CHECK (sonarr_queue_id > 0),
+                action TEXT NOT NULL CHECK (
+                    action IN (
+                        'strike', 'reset', 'exempted', 'cleared_disappeared',
+                        'removal_attempt_started', 'removal_completed',
+                        'removal_rejected', 'removal_ambiguous'
+                    )
+                ),
+                reason TEXT NOT NULL DEFAULT '' CHECK (length(reason) <= 1000),
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX idx_slow_download_actions_item_time
+                ON slow_download_actions (queue_item_id, occurred_at DESC, id DESC);
+            CREATE INDEX idx_slow_download_actions_library_time
+                ON slow_download_actions (library_id, occurred_at DESC);
+            CREATE TRIGGER trg_protect_slow_download_actions
+                BEFORE UPDATE OR DELETE ON slow_download_actions
+                FOR EACH ROW EXECUTE FUNCTION protect_slow_download_append_only();
+
+            -- Durable removal attempt-start marker, committed independently
+            -- just before the bounded Sonarr DELETE (same pattern as
+            -- season_pack_attempt_started). Its mere existence for a queue
+            -- item permanently forbids any further automatic retry of that
+            -- exact queue record - see SlowDownloadRepository.claim_removal.
+            CREATE TABLE slow_download_removal_attempts (
+                queue_item_id BIGINT PRIMARY KEY REFERENCES slow_download_queue_items(id) ON DELETE RESTRICT,
+                started_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE TRIGGER trg_protect_slow_download_removal_attempts
+                BEFORE UPDATE OR DELETE ON slow_download_removal_attempts
+                FOR EACH ROW EXECUTE FUNCTION protect_slow_download_append_only();
+        """,
+    ),
 ]
 
 

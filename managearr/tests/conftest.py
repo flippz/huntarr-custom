@@ -17,6 +17,7 @@ from app.persistence.outcome_repository import OutcomeRepository
 from app.persistence.scheduler_repository import SchedulerRepository
 from app.persistence.refresh_repository import RefreshRepository
 from app.persistence.live_repository import LiveRepository
+from app.persistence.slow_download_repository import SlowDownloadRepository
 from app.services.dispatch_planning_service import DispatchPlanningService
 from app.services.dispatch_service import DispatchService
 from app.services.reconciliation_service import ReconciliationService
@@ -25,6 +26,7 @@ from app.services.refresh_service import RefreshService
 from app.services.refresh_settings_service import RefreshSettingsService
 from app.services.live_control_service import LiveControlService
 from app.services.live_dispatch_coordinator import LiveDispatchCoordinator
+from app.services.slow_download_service import SlowDownloadService
 
 # Tests run against a real PostgreSQL instance - no SQLite/mock DB layer.
 # Point MANAGEARR_TEST_DB_* at a disposable database; the suite truncates
@@ -43,7 +45,8 @@ _DATA_TABLES = (
     "scheduler_candidate_results, scheduler_library_results, scheduler_cycle_runs, "
     "scheduler_run_requests, scheduler_mode_audit, "
     "refresh_run_reconciled_batches, refresh_runs, refresh_requests, "
-    "live_dispatch_ledger, live_control_audit, live_challenges, season_pack_attempt_started, season_pack_audit, season_pack_settings"
+    "live_dispatch_ledger, live_control_audit, live_challenges, season_pack_attempt_started, season_pack_audit, season_pack_settings, "
+    "slow_download_removal_attempts, slow_download_actions, slow_download_observations, slow_download_queue_items, slow_download_settings"
 )
 
 
@@ -204,3 +207,13 @@ def live_control_service(live_repo, scheduler_repo, policy_repo):
 @pytest.fixture
 def live_coordinator(live_repo, scheduler_repo, dispatch_service):
     return LiveDispatchCoordinator(live_repo, scheduler_repo, dispatch_service)
+
+
+@pytest.fixture
+def slow_download_repo(database):
+    return SlowDownloadRepository(database)
+
+
+@pytest.fixture
+def slow_download_service(slow_download_repo, library_repo, live_repo, scheduler_repo):
+    return SlowDownloadService(slow_download_repo, library_repo, live_repo, scheduler_repo)

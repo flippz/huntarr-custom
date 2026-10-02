@@ -379,6 +379,12 @@ def test_off_simulate_and_unarmed_live_never_instantiate_write_client(
     monkeypatch.setattr(dispatch_service_module.DispatchService, "dispatch", forbidden)
 
     worker = SchedulerWorker(scheduler_repo, policy_repo, live_repository=live_repo, owner_id="w1")
+    # The slow-download guard's read-only monitoring (via ReadOnlySonarrClient,
+    # which itself wraps SonarrClient) is an intentional, unrelated GET source
+    # covered by its own dedicated tests in test_slow_download_guard.py - out
+    # of scope for this specific live-dispatch *write*-client safety check.
+    monkeypatch.setattr(worker.slow_download_service, "poll_all", lambda: [])
+    monkeypatch.setattr(worker.slow_download_service, "attempt_removals", lambda **_kwargs: [])
 
     # off
     worker.run_once()

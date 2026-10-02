@@ -602,7 +602,7 @@ def test_v6_live_control_bounds_are_enforced(database):
 
 
 def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(database):
-    assert [item.version for item in MIGRATIONS[-5:]] == [9, 10, 11, 12, 13]
+    assert [item.version for item in MIGRATIONS[-6:]] == [9, 10, 11, 12, 13, 14]
     migration = next(item for item in MIGRATIONS if item.version == 8)
     with database.connect() as conn:
         conn.execute(
@@ -628,6 +628,64 @@ def test_season_pack_attempt_markers_are_append_only(database):
             "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
         ).fetchall()}
     assert "season_pack_attempt_started" in tables
+
+
+def test_v14_slow_download_tables_exist_with_safe_defaults(database, library_repo):
+    with database.connect() as conn:
+        tables = {r["table_name"] for r in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+        ).fetchall()}
+    for table in (
+        "slow_download_settings", "slow_download_queue_items", "slow_download_observations",
+        "slow_download_actions", "slow_download_removal_attempts",
+    ):
+        assert table in tables
+
+    library = library_repo.create({"name": "Sonarr", "type": "sonarr", "url": "http://sonarr", "api_key": "k", "enabled": True})
+    with database.connect() as conn:
+        conn.execute(
+            "INSERT INTO slow_download_settings (library_id) VALUES (%s)", (library.id,)
+        )
+        row = conn.execute("SELECT * FROM slow_download_settings WHERE library_id = %s", (library.id,)).fetchone()
+    # Monitoring enabled, automatic removal disabled - the core migration
+    # safety requirement: a fresh deploy/migration never starts deleting.
+    assert row["monitoring_enabled"] is True
+    assert row["auto_removal_enabled"] is False
+    assert row["remove_from_client"] is True and row["blocklist"] is True and row["skip_redownload"] is False
+
+
+def test_v14_observations_actions_and_removal_markers_are_append_only(database, library_repo):
+    library = library_repo.create({"name": "Sonarr", "type": "sonarr", "url": "http://sonarr", "api_key": "k", "enabled": True})
+    with database.connect() as conn:
+        item_id = conn.execute(
+            "INSERT INTO slow_download_queue_items (library_id, sonarr_queue_id) VALUES (%s, 1) RETURNING id",
+            (library.id,),
+        ).fetchone()["id"]
+        conn.execute(
+            "INSERT INTO slow_download_observations (queue_item_id, status, classification) VALUES (%s, 'downloading', 'healthy')",
+            (item_id,),
+        )
+        conn.execute(
+            "INSERT INTO slow_download_actions (queue_item_id, library_id, sonarr_queue_id, action, reason) "
+            "VALUES (%s, %s, 1, 'strike', 'test')",
+            (item_id, library.id),
+        )
+        conn.execute(
+            "INSERT INTO slow_download_removal_attempts (queue_item_id) VALUES (%s)", (item_id,)
+        )
+
+    with pytest.raises(Exception, match="append-only"):
+        with database.connect() as conn:
+            conn.execute("UPDATE slow_download_observations SET status = 'paused' WHERE queue_item_id = %s", (item_id,))
+    with pytest.raises(Exception, match="append-only"):
+        with database.connect() as conn:
+            conn.execute("DELETE FROM slow_download_actions WHERE queue_item_id = %s", (item_id,))
+    with pytest.raises(Exception, match="append-only"):
+        with database.connect() as conn:
+            conn.execute("UPDATE slow_download_removal_attempts SET started_at = now() WHERE queue_item_id = %s", (item_id,))
+    with pytest.raises(Exception, match="append-only"):
+        with database.connect() as conn:
+            conn.execute("DELETE FROM slow_download_removal_attempts WHERE queue_item_id = %s", (item_id,))
 
 
 def test_v6_live_challenge_kind_shape_is_enforced(database):

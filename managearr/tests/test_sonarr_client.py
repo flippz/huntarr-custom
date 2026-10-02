@@ -10,6 +10,8 @@ from app.adapters.sonarr_client import (
     SonarrConnectionError,
     SonarrDataError,
     SonarrNotFoundError,
+    SonarrPostAmbiguousError,
+    SonarrPostRejectedError,
     SonarrResponseError,
 )
 
@@ -46,6 +48,12 @@ class FakeSession:
 
     def post(self, url, headers=None, json=None, timeout=None):
         self.calls.append({"method": "POST", "url": url, "headers": headers, "json": json, "timeout": timeout})
+        if self._exception:
+            raise self._exception
+        return self._response
+
+    def delete(self, url, headers=None, params=None, timeout=None):
+        self.calls.append({"method": "DELETE", "url": url, "headers": headers, "params": params, "timeout": timeout})
         if self._exception:
             raise self._exception
         return self._response
@@ -354,16 +362,77 @@ def test_get_queue_details_is_bounded_and_normalized():
         "records": [{
             "id": 77, "downloadId": "dl-1", "episode": {"id": 101},
             "status": "downloading", "trackedDownloadState": "downloading",
+            "title": "Some.Show.S01E01", "size": 1000, "sizeleft": 400,
+            "timeleft": "00:10:00",
             "statusMessages": [{"messages": ["unbounded detail"]}],
         }],
     }))
     queue = make_client(session).get_queue_details(page=1, page_size=25)
     assert queue["records"] == [{
-        "episode_ids": [101], "status": "downloading",
+        "queue_id": 77, "episode_ids": [101], "status": "downloading",
         "tracked_state": "downloading", "download_id": "dl-1", "added": None,
+        "title": "Some.Show.S01E01", "size": 1000, "sizeleft": 400,
+        "timeleft": "00:10:00", "error_message": None,
+        "status_messages": [{"title": None, "messages": ["unbounded detail"]}],
     }]
     assert session.calls[0]["url"].endswith("/api/v3/queue/details")
     assert session.calls[0]["params"]["pageSize"] == 25
+
+
+def test_get_queue_details_fails_closed_on_missing_queue_id():
+    session = FakeSession(FakeResponse(200, {
+        "totalRecords": 1,
+        "records": [{"downloadId": "dl-1", "episode": {"id": 101}, "status": "downloading"}],
+    }))
+    with pytest.raises(SonarrDataError):
+        make_client(session).get_queue_details()
+
+
+def test_delete_queue_record_sends_exact_endpoint_and_params():
+    session = FakeSession(FakeResponse(200, {}))
+    make_client(session).delete_queue_record(77, remove_from_client=True, blocklist=True, skip_redownload=False)
+    assert session.calls[0]["method"] == "DELETE"
+    assert session.calls[0]["url"].endswith("/api/v3/queue/77")
+    assert session.calls[0]["params"] == {
+        "removeFromClient": "true", "blocklist": "true", "skipRedownload": "false",
+    }
+
+
+def test_delete_queue_record_treats_404_as_already_removed():
+    session = FakeSession(FakeResponse(404, {}))
+    make_client(session).delete_queue_record(77, remove_from_client=True, blocklist=True)
+
+
+def test_delete_queue_record_rejects_on_definite_4xx():
+    session = FakeSession(FakeResponse(400, {"message": "cannot remove"}))
+    with pytest.raises(SonarrPostRejectedError):
+        make_client(session).delete_queue_record(77, remove_from_client=True, blocklist=True)
+
+
+def test_delete_queue_record_is_ambiguous_on_5xx():
+    session = FakeSession(FakeResponse(500, {}))
+    with pytest.raises(SonarrPostAmbiguousError):
+        make_client(session).delete_queue_record(77, remove_from_client=True, blocklist=True)
+
+
+def test_delete_queue_record_is_ambiguous_on_connection_error():
+    class RaisingSession:
+        def delete(self, *args, **kwargs):
+            raise requests.exceptions.ConnectionError("boom")
+
+    with pytest.raises(SonarrPostAmbiguousError):
+        SonarrClient("http://sonarr.local", "key", session=RaisingSession()).delete_queue_record(
+            77, remove_from_client=True, blocklist=True
+        )
+
+
+def test_delete_queue_record_rejects_invalid_queue_id():
+    session = FakeSession(FakeResponse(200, {}))
+    with pytest.raises(ValueError):
+        make_client(session).delete_queue_record(0, remove_from_client=True, blocklist=True)
+    with pytest.raises(ValueError):
+        make_client(session).delete_queue_record(-1, remove_from_client=True, blocklist=True)
+    assert session.calls == []
 
 
 @pytest.mark.parametrize("method", ["history", "queue"])

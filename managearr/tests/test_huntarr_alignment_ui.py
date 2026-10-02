@@ -93,12 +93,12 @@ def test_home_guides_first_time_live_enablement_and_refreshes_status(client):
 
 def test_sonarr_tabs_have_complete_aria_relationships(client):
     html = client.get("/sonarr").get_data(as_text=True)
-    for name in ("instances", "hunting-policy", "season-packs"):
+    for name in ("instances", "hunting-policy", "season-packs", "slow-download"):
         assert f'id="tab-{name}"' in html
         assert f'aria-controls="panel-{name}"' in html
         assert f'id="panel-{name}"' in html
         assert f'aria-labelledby="tab-{name}"' in html
-    assert html.count('role="tabpanel"') == 3
+    assert html.count('role="tabpanel"') == 4
     assert "aria-selected" in html
 
 

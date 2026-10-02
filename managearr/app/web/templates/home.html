@@ -27,6 +27,15 @@
     </div>
   </section>
 
+  <section class="card" id="home-slow-download-card">
+    <h2>Sonarr downloads</h2>
+    <p class="hint-notice">Slow-download guard observes actual byte progress and excludes queued/paused/importing items. Automatic removal defaults to disabled.</p>
+    <div class="table-scroll"><table class="data-table">
+      <thead><tr><th>Title</th><th>Progress</th><th>Downloaded / remaining</th><th>Speed</th><th>Age</th><th>Health</th><th>Strikes</th><th>Reason</th></tr></thead>
+      <tbody id="home-slow-download-rows"><tr><td colspan="8">Loading...</td></tr></tbody>
+    </table></div>
+  </section>
+
   <section class="card">
     <h2>Simulation scheduler</h2>
     <p class="hint-notice">Simulation sends no Sonarr commands and remains read-only.</p>
@@ -120,6 +129,67 @@ async function refreshHomeLive() {
   renderHomeLive(live.live, policy.policy);
 }
 
+const SLOW_DOWNLOAD_HEALTH_LABELS = {
+  exempt: 'Exempt', grace: 'Grace', healthy: 'Healthy', slow_watch: 'Slow watch',
+  stalled_evidence: 'Stalled evidence', very_slow_evidence: 'Very slow evidence',
+  removal_pending: 'Removal pending', ambiguous: 'Removal ambiguous', removed: 'Removed',
+};
+
+function formatBytes(value) {
+  if (value === null || value === undefined) return '-';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let n = value, i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
+  return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
+}
+
+function ageText(isoValue) {
+  if (!isoValue) return '-';
+  const ms = Date.now() - new Date(isoValue).getTime();
+  if (Number.isNaN(ms) || ms < 0) return '-';
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+async function loadSlowDownloadCard() {
+  const tbody = document.getElementById('home-slow-download-rows');
+  try {
+    const data = await api('/api/v1/slow-download/status');
+    const rows = [];
+    data.libraries.forEach(lib => {
+      lib.items.forEach(item => rows.push(item));
+    });
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="8">No active or recently tracked downloads.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = '';
+    rows.forEach(item => {
+      const tr = document.createElement('tr');
+      const progress = item.progress_percent !== null && item.progress_percent !== undefined ? `${item.progress_percent}%` : '-';
+      const downloaded = item.size_bytes !== null && item.sizeleft_bytes !== null
+        ? `${formatBytes(item.size_bytes - item.sizeleft_bytes)} / ${formatBytes(item.sizeleft_bytes)} left`
+        : '-';
+      const speed = item.measured_rate_bytes_per_second !== null && item.measured_rate_bytes_per_second !== undefined
+        ? `${formatBytes(item.measured_rate_bytes_per_second)}/s` : '-';
+      const health = SLOW_DOWNLOAD_HEALTH_LABELS[item.classification] || item.classification;
+      tr.innerHTML = `
+        <td>${escapeHtml(item.title || '(untitled)')}</td>
+        <td>${progress}</td>
+        <td>${downloaded}</td>
+        <td>${speed}</td>
+        <td>${ageText(item.first_seen_at)}</td>
+        <td><span class="state-pill">${escapeHtml(health)}</span></td>
+        <td>${item.strike_count}</td>
+        <td class="muted">${escapeHtml(item.reason || '')}</td>`;
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="8">Could not load Sonarr download status: ${escapeHtml(err.message)}</td></tr>`;
+  }
+}
+
 async function loadHome() {
   const [librariesData, policy, scheduler, live, jobsData, dispatchesData, timeline, refresh] = await Promise.all([
     api('/api/v1/libraries'),
@@ -131,6 +201,7 @@ async function loadHome() {
     api('/api/v1/activity/timeline?limit=8'),
     api('/api/v1/refresh'),
   ]);
+  await loadSlowDownloadCard();
 
   const sonarrLibraries = librariesData.libraries.filter(l => l.type === 'sonarr');
   document.getElementById('home-empty').hidden = sonarrLibraries.length > 0;
@@ -207,5 +278,6 @@ document.getElementById('home-live-run-now').addEventListener('click', async () 
 
 loadHome().catch(err => toast('Failed to load Home: ' + err.message));
 setInterval(() => refreshHomeLive().catch(() => {}), 5000);
+setInterval(() => loadSlowDownloadCard().catch(() => {}), 10000);
 </script>
 {% endblock %}

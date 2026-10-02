@@ -449,3 +449,65 @@ def season_pack_activity():
     limit=max(1,min(request.args.get("limit",50,type=int),100))
     rows=_services()["season_pack_repo"].recent(limit)
     return jsonify({"audits": [_services()["season_pack"].safe_audit(x) for x in rows]})
+
+
+# --- Sonarr-only slow-download guard -------------------------------------
+#
+# GET endpoints are always safe (read-only status/settings). The PUT/PATCH
+# settings endpoint is the only place automatic removal can be turned on,
+# and SlowDownloadService.update_settings refuses to enable it (or loosen
+# thresholds) without an explicit confirm+reason and Live already armed and
+# running. Removal itself only ever happens from app/worker.py.
+
+@api_bp.get("/libraries/<int:library_id>/slow-download/settings")
+def slow_download_settings(library_id: int):
+    settings = _services()["slow_download"].settings(library_id)
+    if settings is None:
+        return jsonify({"errors": ["Sonarr library not found"]}), 404
+    return jsonify({"settings": settings})
+
+
+@api_bp.put("/libraries/<int:library_id>/slow-download/settings")
+@api_bp.patch("/libraries/<int:library_id>/slow-download/settings")
+def update_slow_download_settings(library_id: int):
+    settings, errors = _services()["slow_download"].update_settings(library_id, request.get_json(silent=True))
+    if errors:
+        return jsonify({"errors": errors}), 404 if errors == ["Sonarr library not found"] else 400
+    return jsonify({"settings": settings})
+
+
+@api_bp.get("/libraries/<int:library_id>/slow-download/queue")
+def slow_download_queue(library_id: int):
+    limit = max(1, min(request.args.get("limit", 200, type=int), 500))
+    return jsonify({"items": _services()["slow_download_repo"].list_current(library_id, limit=limit)})
+
+
+@api_bp.get("/slow-download/queue")
+def slow_download_queue_all():
+    limit = max(1, min(request.args.get("limit", 200, type=int), 500))
+    return jsonify({"items": _services()["slow_download_repo"].list_current(limit=limit)})
+
+
+@api_bp.get("/slow-download/status")
+def slow_download_status():
+    """Per-library health and rows for the Home status card."""
+    settings_rows = _services()["slow_download_repo"].all_sonarr_settings()
+    libraries = []
+    for s in settings_rows:
+        library = _services()["library"].get_library(s["library_id"])
+        items = _services()["slow_download_repo"].list_current(s["library_id"], limit=100)
+        libraries.append({
+            "library_id": s["library_id"],
+            "library_name": library.name if library else None,
+            "monitoring_enabled": s["monitoring_enabled"],
+            "auto_removal_enabled": s["auto_removal_enabled"],
+            "items": items,
+        })
+    return jsonify({"libraries": libraries})
+
+
+@api_bp.get("/activity/slow-download")
+def slow_download_activity():
+    limit = max(1, min(request.args.get("limit", 100, type=int), 500))
+    library_id = request.args.get("library_id", type=int)
+    return jsonify({"actions": _services()["slow_download_repo"].recent_actions(library_id, limit=limit)})

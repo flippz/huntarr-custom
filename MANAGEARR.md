@@ -75,7 +75,157 @@ empty/summary state, Activity's detail-row collapsing, Settings' routine-
 first/Advanced-disclosure layout, and the continued absence of Radarr/Lidarr/
 Readarr/Whisparr/Eros anywhere in rendered UI.
 
-## Current milestone: strict manual Sonarr season packs (M11)
+## Current milestone: Sonarr-only slow-download guard
+
+The Slow-download guard is the requested successor to the useful part of
+legacy Swaparr: it monitors the Sonarr queue and, only when explicitly
+enabled, removes downloads for which repeated measured evidence proves no
+effective progress or extremely low sustained throughput. It is **Sonarr-
+only** - there is no Radarr/other-Arr support and none is planned. Legacy
+Swaparr is mentioned here only as migration context; it is not a separate
+module and nothing in this codebase ports its "old item" timer.
+
+**Why not legacy Swaparr's model.** Swaparr-style guards typically flag an
+item purely by age ("queued longer than N hours"), which punishes downloads
+that are simply slow due to indexer/seeder/usenet-server conditions outside
+anyone's control. Managearr's guard instead requires *measured byte
+progress* evidence, accumulated over whole, completed observation windows,
+and treats a single bad sample as noise rather than proof.
+
+**Safety posture.** Monitoring (read-only Sonarr queue polling) is enabled by
+default per Sonarr library. Automatic removal is a separate switch, disabled
+by default, and this never changes on a deploy or schema migration -
+`slow_download_settings.auto_removal_enabled` defaults to `FALSE` and the
+migration never flips an existing row. Enabling automatic removal (or
+loosening any threshold) through the API requires an explicit `confirm: true`
+plus a non-empty `reason`, and is rejected outright unless the global Live
+authorization is already armed and running. Disabling automatic removal is
+always allowed, no confirmation required.
+
+**Classification (`app/domain/slow_download.py`, pure/no I/O, fake-clock
+tested).** Only queue items with an actively-downloading-like status and
+positive remaining bytes are evaluated; `queued`, `delayed`, `paused`,
+`completed`/`importpending`/`importing`, and `warning`/`manualintervention`
+items are exempt and shown as such. A new queue item gets a 30-minute
+initial grace period (configurable) before any evidence counts against it.
+Two independent evidence tracks are kept, each needing 2 full windows
+("strikes", configurable) of evidence before removal is eligible:
+
+* **Stalled**: no decrease of at least 1 MiB (`progress_epsilon_bytes`,
+  configurable) in remaining bytes across a full 30-minute window
+  (`no_progress_window_minutes`) with at least 3 valid observations
+  (`no_progress_min_observations`). A single observation showing a decrease
+  of at least the epsilon immediately proves the download isn't frozen and
+  resets this track - but *only* this track.
+* **Very slow**: rolling throughput below 50 KiB/s
+  (`very_slow_rate_bytes_per_second`) sustained across a full 90-minute
+  window (`very_slow_window_minutes`) with at least 4 observations
+  (`very_slow_min_observations`) *and* at least 512 MiB remaining
+  (`very_slow_min_remaining_bytes` - a nearly-finished download is never
+  flagged for being "slow" on its last few hundred MB). This track
+  deliberately does **not** reset on the stall epsilon check: a very-slow
+  download is, by definition, still decreasing - just too slowly - so
+  treating every per-poll decrease as "meaningful progress" would make this
+  classification unreachable.
+
+A queue record identity reset (Sonarr reports *more* remaining bytes than
+before - the underlying download was replaced) or an untrustworthy poll gap
+(gap at least as long as the stall window) restarts both tracks from a fresh
+baseline and clears both strike counts, rather than counting the jump/gap as
+evidence either way. A completed window that shows real (if small) progress
+above the epsilon clears that track's strikes without a strike being
+recorded. Reaching the configured strikes on *either* track makes the item
+`removal_pending`; health states surfaced in the UI are `exempt`, `grace`,
+`healthy`, `slow_watch` (inside an incomplete window), `stalled_evidence`,
+`very_slow_evidence`, `removal_pending`, `ambiguous` (an attempted removal's
+outcome could not be confirmed), and `removed`. An item disappearing from
+the Sonarr queue is recorded as its own outcome (`cleared_disappeared`) and
+is never read as a successful import, which this layer never observes.
+
+**Durable persistence (schema v14).** `slow_download_settings` holds one row
+per Sonarr library (monitoring/auto-removal toggles, every threshold above,
+`remove_from_client`/`blocklist`/`skip_redownload`, an optimistic-concurrency
+`revision`). `slow_download_queue_items` is keyed by `(library_id,
+sonarr_queue_id)` - the Sonarr queue record's own immutable positive integer
+id, *never* `downloadId` (which Sonarr can reuse/rotate) - and carries every
+field needed to resume classification exactly after a restart.
+`slow_download_observations` and `slow_download_actions` are append-only
+(a `BEFORE UPDATE OR DELETE` trigger raises) and together explain every
+strike/reset/exemption/removal decision ever made. `slow_download_
+removal_attempts` is the durable attempt-start marker, committed through
+`Database.dedicated_transaction()` (a connection outside the shared pool,
+exactly like `season_pack_attempt_started`) independently and immediately
+before the one bounded Sonarr DELETE. If that marker exists for a queue
+item, the guard never automatically attempts removal of that exact record
+again, for *any* outcome (including a merely-rejected one) - any further
+action on it is manual-review only. This is deliberately more conservative
+than strictly required (only an ambiguous outcome must never be retried) but
+removes an entire class of "did we already try this" bugs.
+
+**Sonarr adapter.** `get_queue_details` now also returns each record's own
+`queue_id` (fail-closed if missing/non-positive), bounded `title`, `size`,
+`sizeleft`, `timeleft`, `error_message`, and `status_messages`.
+`delete_queue_record(queue_id, remove_from_client, blocklist,
+skip_redownload=False)` issues exactly one `DELETE /api/v3/queue/{id}` with
+those three parameters and distinguishes three outcomes: a 2xx or 404
+(already gone) returns normally; a definite 4xx raises
+`SonarrPostRejectedError`; anything else (timeout, connection error, 5xx, an
+invalid/unparseable response) raises `SonarrPostAmbiguousError` so the
+caller never treats an unproven DELETE as either success or failure. No
+raised message ever includes the configured base URL or API key.
+
+**Worker integration.** Monitoring only ever uses `ReadOnlySonarrClient`
+(the same structural GET-only guard `RefreshService` uses) and runs in the
+same bounded worker iteration as read-only refresh - i.e. whenever scheduler
+mode is `simulate` or `live`, never while mode is `off` (the existing global
+kill-switch for all automatic Sonarr contact), and independent of whether
+Live dispatch itself is armed, paused, or emergency-stopped. Each library is
+only actually polled once its own `poll_seconds` cadence has elapsed
+(`slow_download_settings.last_polled_at`), so this never turns into a tight
+per-tick loop. At most one gated removal DELETE is attempted per worker
+iteration. A removal is attempted only when `auto_removal_enabled` is true
+for that library **and** the global Live authorization is
+mode=`live`/state=`running`/matching arm generation/not emergency-stopped -
+all re-checked, immediately before the DELETE, under the same row-lock
+pattern `SeasonPackService.confirm` already uses: a `FOR NO KEY UPDATE` lock
+on the queue item plus `FOR SHARE` locks on scheduler settings, Live
+control, the library row, and the slow-download settings row linearize the
+last check with the write, so an operator Pause/Emergency Stop or a settings
+disable that lands mid-check is guaranteed to see a consistent picture (and
+may have to wait behind the one bounded DELETE, which is an accepted
+trade-off, exactly as documented for season packs).
+
+**Settings/Activity/Home UI.** The Sonarr workspace has a new "Slow-download
+guard" tab (monitoring/auto-removal toggles, every threshold, a danger-zone
+confirmation + reason field that only appears when enabling or loosening
+automatic removal, and the current per-library queue with health/strikes/
+reason). Home gets a prominent "Sonarr downloads" status card (title,
+progress %, downloaded/remaining, a best-effort measured speed, age, health,
+strikes, and reason), refreshed every 10 seconds, with an honest empty state
+when nothing is tracked. `GET /api/v1/libraries/<id>/slow-download/settings`,
+`PUT`/`PATCH` (optimistic concurrency via `revision`, strict ranges,
+confirm+reason to enable/loosen), `GET .../slow-download/queue`, `GET
+/api/v1/slow-download/status` (per-library health for Home), and `GET
+/api/v1/activity/slow-download` (the action audit) never return secrets.
+
+**Tests** (`managearr/tests/test_slow_download_domain.py`,
+`test_slow_download_guard.py`, plus additions to `test_sonarr_client.py`,
+`test_migrations.py`, `test_ui_copy.py`, `test_huntarr_alignment_ui.py`)
+cover: every classification scenario above with a fake clock (slow-but-
+progressing protection, progress resets, true stall, sustained very-slow,
+short low-speed periods that don't strike, queued/paused/importing
+exemptions, tiny jitter vs. real cumulative progress, counter reset/replaced
+item, long poll gap, restart-safety as a pure function of persisted state,
+two-strike windowing); the adapter's exact DELETE endpoint/params and its
+timeout/connection/4xx/5xx/malformed-response outcomes; settings API
+confirmation/Live-armed gating and optimistic concurrency; and the same race
+shape as season packs - Pause-vs-DELETE, auto-removal-disabled-vs-DELETE,
+queue-id-mismatch, crash-immediately-after-accepted-DELETE-before-persistence
+(never resent on restart), a `max_size=1` connection pool (proving the
+marker never shares the pooled connection), and concurrent worker cycles
+racing for the same removal_pending item (never a duplicate DELETE).
+
+## Previous milestone: strict manual Sonarr season packs (M11)
 
 M9 keeps the append-only `dispatch_outcome_events` ledger as the single source
 of item outcomes. For each dispatched item, effective evidence is selected by

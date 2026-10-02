@@ -7,6 +7,7 @@
   <button type="button" class="tab-button" id="tab-instances" data-tab="instances" role="tab" aria-controls="panel-instances" aria-selected="false">Instances</button>
   <button type="button" class="tab-button" id="tab-hunting-policy" data-tab="hunting-policy" role="tab" aria-controls="panel-hunting-policy" aria-selected="false">Hunting policy</button>
   <button type="button" class="tab-button" id="tab-season-packs" data-tab="season-packs" role="tab" aria-controls="panel-season-packs" aria-selected="false">Season packs</button>
+  <button type="button" class="tab-button" id="tab-slow-download" data-tab="slow-download" role="tab" aria-controls="panel-slow-download" aria-selected="false">Slow-download guard</button>
 </div>
 
 <!-- ============================== Instances ============================== -->
@@ -124,6 +125,45 @@
     <label id="sp-confirm-wrap" hidden><input id="sp-confirm-check" type="checkbox"> I confirm one exact release grab using the previewed protocol and client.</label>
     <button id="sp-confirm" hidden class="button-danger">Confirm exact grab</button>
     <p class="muted">Emergency Stop and Pause both block confirmation; Live must be running to complete a grab.</p>
+  </section>
+</section>
+
+<!-- =========================== Slow-download guard ========================= -->
+<section class="tab-panel" id="panel-slow-download" data-tab="slow-download" role="tabpanel" aria-labelledby="tab-slow-download" hidden>
+  <p class="hint-notice">Sonarr-only. Observes actual byte progress in the Sonarr queue; excludes queued, paused, delayed, importing, and warning/manual-intervention items. Monitoring is enabled by default and only ever reads the queue. Automatic removal defaults to disabled and, when enabled, requires sustained evidence across whole observation windows (never a single bad sample) plus Live already armed and running.</p>
+  <section class="card">
+    <h2>Monitoring and thresholds</h2>
+    <label>Sonarr instance <select id="sdg-library"></select></label>
+    <label><input id="sdg-monitoring" type="checkbox"> Monitoring enabled</label>
+    <label class="danger-confirm"><input id="sdg-auto-removal" type="checkbox"> Automatic removal enabled (destructive - removes from client and blocklists in Sonarr)</label>
+    <label>Poll cadence (seconds) <input id="sdg-poll" type="number" min="15" max="3600"></label>
+    <label>Initial grace (minutes) <input id="sdg-grace" type="number" min="0" max="1440"></label>
+    <label>No-progress window (minutes) <input id="sdg-window" type="number" min="5" max="1440"></label>
+    <label>No-progress min observations <input id="sdg-window-obs" type="number" min="2" max="100"></label>
+    <label>Progress epsilon (MiB) <input id="sdg-epsilon" type="number" min="0.0625" max="1024" step="0.0625"></label>
+    <label>Very-slow rate floor (KiB/s) <input id="sdg-rate" type="number" min="1" max="102400"></label>
+    <label>Very-slow window (minutes) <input id="sdg-very-slow-window" type="number" min="15" max="2880"></label>
+    <label>Very-slow min remaining (MiB) <input id="sdg-min-remaining" type="number" min="0" max="1048576"></label>
+    <label>Very-slow min observations <input id="sdg-very-slow-obs" type="number" min="2" max="200"></label>
+    <label>Strikes required <input id="sdg-strikes" type="number" min="1" max="10"></label>
+    <label><input id="sdg-remove-from-client" type="checkbox"> Remove from download client</label>
+    <label><input id="sdg-blocklist" type="checkbox"> Blocklist release</label>
+    <label><input id="sdg-skip-redownload" type="checkbox"> Skip redownload</label>
+    <label id="sdg-confirm-wrap" class="danger-confirm" hidden>
+      <input id="sdg-confirm-check" type="checkbox">
+      I understand automatic removal will delete the download from the client and blocklist the release in Sonarr once the sustained evidence thresholds above are met.
+    </label>
+    <label id="sdg-reason-wrap" hidden>Reason <input id="sdg-reason" type="text" maxlength="500" placeholder="Reason for enabling or loosening automatic removal"></label>
+    <div class="form-actions"><button type="button" id="sdg-save">Save settings</button></div>
+    <pre id="sdg-result"></pre>
+  </section>
+  <section class="card">
+    <h2>Current queue</h2>
+    <div class="table-scroll"><table class="data-table">
+      <thead><tr><th>Title</th><th>Status</th><th>Health</th><th>Strikes</th><th>Reason</th></tr></thead>
+      <tbody id="sdg-rows"><tr><td colspan="5">Loading...</td></tr></tbody>
+    </table></div>
+    <div class="form-actions"><button type="button" id="sdg-refresh" class="button-secondary">Refresh</button></div>
   </section>
 </section>
 {% endblock %}
@@ -372,6 +412,100 @@ loadPolicy().catch(err => toast('Failed to load hunting policy: ' + err.message)
   });
   function showSp(value) { $('sp-result').textContent = value instanceof Error ? value.message : value; }
   loadSpLibraries().catch(showSp);
+})();
+
+// --- Slow-download guard -----------------------------------------------------
+(() => {
+  const $ = id => document.getElementById(id);
+  let currentSettings = null;
+  async function sdgApi(url, options = {}) {
+    const response = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
+    const body = await response.json();
+    if (!response.ok) throw new Error((body.errors || ['Request failed']).join('; '));
+    return body;
+  }
+  async function loadSdgLibraries() {
+    const body = await sdgApi('/api/v1/libraries');
+    const libraries = body.libraries.filter(x => x.type === 'sonarr' && x.enabled);
+    $('sdg-library').innerHTML = libraries.map(x => '<option value="' + x.id + '">' + x.name + '</option>').join('');
+    if (libraries.length) await loadSdgSettings();
+  }
+  function MiB(bytes) { return bytes / (1024 * 1024); }
+  async function loadSdgSettings() {
+    const id = $('sdg-library').value;
+    if (!id) return;
+    const body = await sdgApi('/api/v1/libraries/' + id + '/slow-download/settings');
+    currentSettings = body.settings;
+    const s = currentSettings;
+    $('sdg-monitoring').checked = s.monitoring_enabled;
+    $('sdg-auto-removal').checked = s.auto_removal_enabled;
+    $('sdg-poll').value = s.poll_seconds;
+    $('sdg-grace').value = s.initial_grace_minutes;
+    $('sdg-window').value = s.no_progress_window_minutes;
+    $('sdg-window-obs').value = s.no_progress_min_observations;
+    $('sdg-epsilon').value = MiB(s.progress_epsilon_bytes);
+    $('sdg-rate').value = s.very_slow_rate_bytes_per_second / 1024;
+    $('sdg-very-slow-window').value = s.very_slow_window_minutes;
+    $('sdg-min-remaining').value = MiB(s.very_slow_min_remaining_bytes);
+    $('sdg-very-slow-obs').value = s.very_slow_min_observations;
+    $('sdg-strikes').value = s.strikes_required;
+    $('sdg-remove-from-client').checked = s.remove_from_client;
+    $('sdg-blocklist').checked = s.blocklist;
+    $('sdg-skip-redownload').checked = s.skip_redownload;
+    await loadSdgQueue();
+  }
+  async function loadSdgQueue() {
+    const id = $('sdg-library').value;
+    if (!id) return;
+    const body = await sdgApi('/api/v1/libraries/' + id + '/slow-download/queue');
+    const rows = body.items;
+    if (!rows.length) { $('sdg-rows').innerHTML = '<tr><td colspan="5">No tracked downloads.</td></tr>'; return; }
+    $('sdg-rows').innerHTML = rows.map(r => (
+      '<tr><td>' + (r.title || '(untitled)') + '</td><td>' + r.status + '</td><td>' + r.classification
+      + '</td><td>' + r.strike_count + '</td><td class="muted">' + (r.reason || '') + '</td></tr>'
+    )).join('');
+  }
+  $('sdg-library').addEventListener('change', () => loadSdgSettings().catch(showSdg));
+  $('sdg-refresh').addEventListener('click', () => loadSdgQueue().catch(showSdg));
+  function updateSdgConfirmVisibility() {
+    const enablingOrLoosening = $('sdg-auto-removal').checked;
+    $('sdg-confirm-wrap').hidden = !enablingOrLoosening;
+    $('sdg-reason-wrap').hidden = !enablingOrLoosening;
+  }
+  $('sdg-auto-removal').addEventListener('change', updateSdgConfirmVisibility);
+  $('sdg-save').addEventListener('click', async () => {
+    const enablingAutoRemoval = $('sdg-auto-removal').checked && currentSettings && !currentSettings.auto_removal_enabled;
+    if (enablingAutoRemoval && !confirm('Enable automatic removal? This will delete downloads from the client and blocklist releases in Sonarr once sustained evidence thresholds are met.')) return;
+    const payload = {
+      revision: currentSettings ? currentSettings.revision : undefined,
+      monitoring_enabled: $('sdg-monitoring').checked,
+      auto_removal_enabled: $('sdg-auto-removal').checked,
+      poll_seconds: Number($('sdg-poll').value),
+      initial_grace_minutes: Number($('sdg-grace').value),
+      no_progress_window_minutes: Number($('sdg-window').value),
+      no_progress_min_observations: Number($('sdg-window-obs').value),
+      progress_epsilon_bytes: Math.round(Number($('sdg-epsilon').value) * 1024 * 1024),
+      very_slow_rate_bytes_per_second: Math.round(Number($('sdg-rate').value) * 1024),
+      very_slow_window_minutes: Number($('sdg-very-slow-window').value),
+      very_slow_min_remaining_bytes: Math.round(Number($('sdg-min-remaining').value) * 1024 * 1024),
+      very_slow_min_observations: Number($('sdg-very-slow-obs').value),
+      strikes_required: Number($('sdg-strikes').value),
+      remove_from_client: $('sdg-remove-from-client').checked,
+      blocklist: $('sdg-blocklist').checked,
+      skip_redownload: $('sdg-skip-redownload').checked,
+    };
+    if ($('sdg-confirm-wrap').hidden === false) {
+      if (!$('sdg-confirm-check').checked) return showSdg('Tick the explicit confirmation first.');
+      payload.confirm = true;
+      payload.reason = $('sdg-reason').value || 'operator confirmed from Sonarr workspace';
+    }
+    const body = await sdgApi('/api/v1/libraries/' + $('sdg-library').value + '/slow-download/settings', { method: 'PATCH', body: JSON.stringify(payload) });
+    currentSettings = body.settings;
+    showSdg('Settings saved.');
+    await loadSdgSettings();
+  });
+  function showSdg(value) { $('sdg-result').textContent = value instanceof Error ? value.message : value; }
+  loadSdgLibraries().catch(showSdg);
 })();
 </script>
 {% endblock %}
