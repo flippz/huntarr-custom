@@ -688,6 +688,68 @@ def test_v14_observations_actions_and_removal_markers_are_append_only(database, 
             conn.execute("DELETE FROM slow_download_removal_attempts WHERE queue_item_id = %s", (item_id,))
 
 
+def test_v14_library_deletion_succeeds_with_populated_slow_download_audit_and_retains_it(database, library_repo):
+    """The v14 schema originally made slow_download_queue_items RESTRICT
+    its append-only children, which made arr_libraries' cascading delete of
+    those queue items fail with a foreign-key violation the instant any
+    observation/action/removal-attempt had ever been recorded - i.e. on
+    basically every real library delete. Deletion must keep working, and
+    the append-only audit rows must be retained (nulled identity, not
+    deleted) rather than silently dropped."""
+    library = library_repo.create({"name": "Sonarr", "type": "sonarr", "url": "http://sonarr", "api_key": "k", "enabled": True})
+    with database.connect() as conn:
+        item_id = conn.execute(
+            "INSERT INTO slow_download_queue_items (library_id, sonarr_queue_id) VALUES (%s, 1) RETURNING id",
+            (library.id,),
+        ).fetchone()["id"]
+        conn.execute(
+            "INSERT INTO slow_download_observations (queue_item_id, status, classification) VALUES (%s, 'downloading', 'healthy')",
+            (item_id,),
+        )
+        conn.execute(
+            "INSERT INTO slow_download_actions (queue_item_id, library_id, sonarr_queue_id, action, reason) "
+            "VALUES (%s, %s, 1, 'strike', 'test')",
+            (item_id, library.id),
+        )
+        conn.execute("INSERT INTO slow_download_removal_attempts (queue_item_id) VALUES (%s)", (item_id,))
+
+    assert library_repo.delete(library.id) is True
+    assert library_repo.get(library.id) is None
+
+    with database.connect() as conn:
+        # The mutable queue-item row cascades away with its library...
+        assert conn.execute(
+            "SELECT 1 FROM slow_download_queue_items WHERE id = %s", (item_id,)
+        ).fetchone() is None
+        # ...but every append-only audit row survives, with its now-dangling
+        # identity column nulled instead of the row being deleted.
+        observation = conn.execute(
+            "SELECT queue_item_id, status, classification FROM slow_download_observations"
+        ).fetchone()
+        assert observation is not None
+        assert observation["queue_item_id"] is None
+        assert observation["status"] == "downloading"
+        action = conn.execute(
+            "SELECT queue_item_id, library_id, action, reason FROM slow_download_actions"
+        ).fetchone()
+        assert action is not None
+        assert action["queue_item_id"] is None
+        assert action["library_id"] is None
+        assert action["reason"] == "test"
+        marker = conn.execute("SELECT queue_item_id FROM slow_download_removal_attempts").fetchone()
+        assert marker is not None
+        assert marker["queue_item_id"] is None
+
+    # The append-only trigger's cascade carve-out must not have opened the
+    # door to arbitrary mutation: these rows are still fully protected.
+    with pytest.raises(Exception, match="append-only"):
+        with database.connect() as conn:
+            conn.execute("UPDATE slow_download_observations SET status = 'paused'")
+    with pytest.raises(Exception, match="append-only"):
+        with database.connect() as conn:
+            conn.execute("DELETE FROM slow_download_actions")
+
+
 def test_v6_live_challenge_kind_shape_is_enforced(database):
     with pytest.raises(psycopg.errors.CheckViolation):
         with database.connect() as conn:

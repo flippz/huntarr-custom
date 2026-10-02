@@ -347,3 +347,63 @@ def test_two_strikes_required_by_default():
     # Must take at least two full windows to reach removal_eligible, never
     # a single bad sample.
     assert first_pending_index >= 5
+
+
+# --- Grace must not let evidence windows bank during grace -----------------
+
+def test_grace_expiry_starts_a_fresh_window_not_banked_evidence():
+    """A window that would have completed the instant grace ends (because it
+    silently started accumulating from the very first, still-in-grace
+    observation) must not produce a strike at grace expiry. The first
+    post-grace observation must start a brand-new window baseline."""
+    s = settings(initial_grace_minutes=30, no_progress_window_minutes=30, no_progress_min_observations=2, strikes_required=1)
+    state = fresh_state()
+    sizeleft = 5 * GiB
+    observations = [
+        obs(T0, sizeleft=sizeleft),
+        obs(T0 + timedelta(minutes=15), sizeleft=sizeleft),
+        obs(T0 + timedelta(minutes=30), sizeleft=sizeleft),  # grace just expired; fresh baseline starts here
+        obs(T0 + timedelta(minutes=45), sizeleft=sizeleft),
+        obs(T0 + timedelta(minutes=60), sizeleft=sizeleft),  # one full post-grace window later
+    ]
+    results = feed(s, state, observations)
+    assert all(r.state.classification != "removal_pending" for r in results[:-1])
+    assert results[-1].state.classification == "removal_pending"
+    assert results[-1].state.stall_strike_count == 1
+
+
+def test_default_strikes_required_needs_two_full_windows_after_grace():
+    s = settings(initial_grace_minutes=30, no_progress_window_minutes=30, no_progress_min_observations=2)
+    assert s.strikes_required == 2
+    state = fresh_state()
+    sizeleft = 5 * GiB
+    observations = [obs(T0 + timedelta(minutes=m), sizeleft=sizeleft) for m in (0, 15, 30, 45, 60, 75, 90)]
+    results = feed(s, state, observations)
+    first_pending_index = next((i for i, r in enumerate(results) if r.removal_eligible), None)
+    assert first_pending_index is not None
+    # Earliest possible removal is grace (30m) + two full 30m windows = 90m.
+    assert observations[first_pending_index].observed_at == T0 + timedelta(minutes=90)
+
+
+# --- Gap reset must use the shorter of the two active windows --------------
+
+def test_gap_reset_uses_the_shorter_of_the_two_active_windows():
+    """A gap long enough to make the (short) very-slow window untrustworthy,
+    but not the (long) no-progress window, must still reset both tracks -
+    otherwise the very-slow window could silently "complete" across a gap
+    during which the worker was simply not polling."""
+    s = settings(
+        initial_grace_minutes=0, no_progress_window_minutes=120, no_progress_min_observations=2,
+        very_slow_window_minutes=20, very_slow_min_observations=2,
+        very_slow_rate_bytes_per_second=50 * KiB, very_slow_min_remaining_bytes=512 * MiB,
+    )
+    state = fresh_state()
+    sizeleft = 5 * GiB
+    r1 = classify(s, state, obs(T0, sizeleft=sizeleft))
+    # Gap of 25 minutes exceeds the 20-minute very-slow window but not the
+    # 120-minute no-progress window.
+    r2 = classify(s, r1.state, obs(T0 + timedelta(minutes=25), sizeleft=sizeleft))
+    assert r2.state.strike_count == 0
+    assert "gap" in r2.state.reason
+    assert r2.state.no_progress_window_started_at == T0 + timedelta(minutes=25)
+    assert r2.state.very_slow_window_started_at == T0 + timedelta(minutes=25)

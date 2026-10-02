@@ -91,23 +91,44 @@ class SlowDownloadService:
                     errors.append(f"{field} must be an integer between {lo} and {hi}")
         if errors:
             return None, errors
+        wants_monitoring = data.get("monitoring_enabled", current["monitoring_enabled"])
         wants_auto_removal = data.get("auto_removal_enabled", current["auto_removal_enabled"])
+        if wants_monitoring is False and wants_auto_removal:
+            # Disabling monitoring while automatic removal would stay/become
+            # active is unsafe: with no fresh observations, any already-
+            # stale removal_pending item would still be eligible for an
+            # automatic DELETE with nothing watching it. Disabling
+            # monitoring always disables removal with it - a protective
+            # transition, so it never itself requires confirm.
+            data["auto_removal_enabled"] = False
+            wants_auto_removal = False
         enabling_auto_removal = wants_auto_removal and not current["auto_removal_enabled"]
         loosening = any(
             field in data and self._is_loosening(field, current[field], data[field])
             for field in SETTINGS_RANGES
         )
-        if enabling_auto_removal or (wants_auto_removal and loosening):
+        boolean_loosening = any(
+            field in data and data[field] is True and current[field] is False
+            for field in self._BOOLEAN_LOOSENING_WHEN_TRUE
+        )
+        if enabling_auto_removal or (wants_auto_removal and (loosening or boolean_loosening)):
             if not isinstance(payload.get("confirm"), bool) or payload.get("confirm") is not True:
                 return None, ["confirm must be true to enable or loosen automatic removal"]
             reason = payload.get("reason")
             if not isinstance(reason, str) or not reason.strip():
                 return None, ["reason is required to enable or loosen automatic removal"]
         if enabling_auto_removal:
+            # Fast, friendly rejection for the common case - but this is
+            # only a preliminary check. It is not atomic with the write
+            # below, so it must never be the sole gate: see
+            # ``require_live_running`` on ``repo.update_settings``, which
+            # rechecks this inside the same transaction as the commit.
             live_status = self._live_status()
             if not live_status["allowed"]:
                 return None, ["automatic removal cannot be enabled unless Live is armed and running: " + "; ".join(live_status["reasons"])]
-        updated, error = self.repo.update_settings(library_id, data, expected_revision=expected_revision)
+        updated, error = self.repo.update_settings(
+            library_id, data, expected_revision=expected_revision, require_live_running=enabling_auto_removal
+        )
         if error:
             return None, [error]
         return updated, []
@@ -130,6 +151,12 @@ class SlowDownloadService:
         # higher throughput floor classifies more downloads as "too slow".
         "progress_epsilon_bytes", "very_slow_rate_bytes_per_second",
     })
+    # False -> True on any of these makes an already-eligible removal more
+    # destructive (removes the download from the client too, blocklists the
+    # release, or skips the automatic redownload) without changing whether
+    # removal itself fires. True -> False is always protective and never
+    # needs confirmation.
+    _BOOLEAN_LOOSENING_WHEN_TRUE = frozenset({"remove_from_client", "blocklist", "skip_redownload"})
 
     @classmethod
     def _is_loosening(cls, field: str, old_value: int, new_value: int) -> bool:
@@ -141,9 +168,17 @@ class SlowDownloadService:
 
     # --- monitoring -----------------------------------------------------------
 
-    def poll_library(self, library_id: int) -> dict:
+    def poll_library(self, library_id: int, *, heartbeat=None) -> dict:
         """Bounded, read-only poll of one Sonarr library's queue. Never
-        mutates Sonarr. Returns a summary dict for worker logging/tests."""
+        mutates Sonarr. Returns a summary dict for worker logging/tests.
+
+        ``heartbeat``, if given, is called after every fetched page (a
+        bounded poll can issue up to ``QUEUE_MAX_PAGES`` GETs for one
+        library) so the worker's scheduler lease is renewed during a long
+        multi-page read instead of only once per whole iteration. If it
+        returns falsy - the lease was lost - the read stops immediately and
+        is treated exactly like a truncated/bounded read: no disappearance
+        reconciliation runs on an incomplete snapshot."""
         library = self.libraries.get(library_id)
         if not library or library.type != "sonarr" or not library.enabled:
             return {"library_id": library_id, "polled": 0, "error": "library not available"}
@@ -153,6 +188,8 @@ class SlowDownloadService:
         client = self._read_only_client(library)
         present_queue_ids = set()
         polled = 0
+        queue_complete = False
+        lease_lost = False
         try:
             for page in range(1, QUEUE_MAX_PAGES + 1):
                 result = client.get_queue_details(page=page, page_size=QUEUE_PAGE_SIZE)
@@ -161,31 +198,55 @@ class SlowDownloadService:
                     self.repo.record_observation(library_id, record, settings)
                     polled += 1
                 if page * QUEUE_PAGE_SIZE >= result["total_records"]:
+                    queue_complete = True
+                    break
+                if heartbeat is not None and not heartbeat():
+                    lease_lost = True
                     break
         except SonarrError as exc:
             # Fail closed: any telemetry uncertainty from this poll never
             # triggers removal logic below, and existing evidence is left
             # untouched rather than guessed at.
             return {"library_id": library_id, "polled": polled, "error": str(exc)}
+        if lease_lost:
+            return {
+                "library_id": library_id, "polled": polled, "cleared": 0,
+                "error": "scheduler lease lost during bounded queue read; disappearance reconciliation skipped",
+            }
+        # Never infer disappearance from a deliberately bounded/truncated
+        # queue read. Existing evidence remains untouched until a complete
+        # Sonarr queue snapshot proves that a record is gone.
+        if not queue_complete:
+            return {
+                "library_id": library_id, "polled": polled, "cleared": 0,
+                "error": f"Sonarr queue exceeded the bounded {QUEUE_MAX_PAGES * QUEUE_PAGE_SIZE}-record read; disappearance reconciliation skipped",
+            }
         cleared = self.repo.clear_disappeared(library_id, present_queue_ids)
         return {"library_id": library_id, "polled": polled, "cleared": cleared}
 
-    def poll_all(self) -> list[dict]:
+    def poll_all(self, *, heartbeat=None) -> list[dict]:
         """Bounded periodic read of every enabled Sonarr library, gated per
         library by its configured ``poll_seconds`` cadence - callers that
         want to force an immediate poll regardless of cadence should call
         ``poll_library`` directly instead (used by tests and any future
-        manual "poll now" trigger)."""
+        manual "poll now" trigger).
+
+        ``heartbeat`` is forwarded to ``poll_library`` (renewing the lease
+        during each library's multi-page read) and is also checked between
+        libraries; once it reports the lease lost, remaining libraries are
+        skipped for this cycle rather than polled under an unowned lease."""
         results = []
         now = datetime.now(timezone.utc)
         for settings in self.repo.all_sonarr_settings():
+            if heartbeat is not None and not heartbeat():
+                break
             if not settings["monitoring_enabled"]:
                 continue
             last_polled = self.repo.last_polled_at(settings["library_id"])
             if last_polled is not None and (now - last_polled).total_seconds() < settings["poll_seconds"]:
                 continue
             self.repo.record_poll_attempt(settings["library_id"])
-            results.append(self.poll_library(settings["library_id"]))
+            results.append(self.poll_library(settings["library_id"], heartbeat=heartbeat))
         return results
 
     # --- gated automatic removal (worker-only) --------------------------------
@@ -200,10 +261,18 @@ class SlowDownloadService:
             reasons.append("Live authorization is paused or emergency-stopped")
         return {"allowed": not reasons, "reasons": reasons, "generation": control.get("authorization_generation", 0)}
 
-    def attempt_removals(self, *, max_removals: int = 1) -> list[dict]:
+    def attempt_removals(self, *, max_removals: int = 1, heartbeat=None) -> list[dict]:
         """At most ``max_removals`` gated DELETEs per call - the worker calls
         this once per poll iteration. Never raises on an individual item's
-        Sonarr error; each outcome is durably recorded instead."""
+        Sonarr error; each outcome is durably recorded instead.
+
+        ``heartbeat``, if given, is verified immediately before this method
+        does anything else, and again immediately before each individual
+        removal attempt: a worker whose scheduler lease was lost during the
+        (possibly long, multi-page) poll that preceded this call must never
+        go on to issue a DELETE under a lease it no longer holds."""
+        if heartbeat is not None and not heartbeat():
+            return []
         live_status = self._live_status()
         if not live_status["allowed"]:
             return []
@@ -219,6 +288,8 @@ class SlowDownloadService:
             for item in self.repo.list_current(settings["library_id"]):
                 if item["classification"] != "removal_pending":
                     continue
+                if heartbeat is not None and not heartbeat():
+                    return outcomes
                 outcome = self._attempt_removal(library, item, live_status["generation"])
                 if outcome is not None:
                     outcomes.append(outcome)
@@ -227,17 +298,58 @@ class SlowDownloadService:
         return outcomes
 
     def _attempt_removal(self, library, item: dict, expected_generation: int) -> dict | None:
-        settings = self.repo.settings(library.id)
-        with self.repo.authorized_removal(item["id"], expected_generation) as (conn, row, error):
+        with self.repo.authorized_removal(
+            item["id"], expected_generation, expected_url=library.url, expected_api_key=library.api_key
+        ) as (conn, row, error):
             if error:
                 return None
+            # Re-read Sonarr while authorization/settings/library locks are
+            # held. Stored observations alone are never sufficient for a
+            # destructive action: prove the exact queue record still exists,
+            # is actively downloading with bytes remaining, has the same
+            # download identity, and has not made meaningful progress.
+            try:
+                current = self._find_live_queue_record(library, row["sonarr_queue_id"])
+            except SonarrError as exc:
+                self.repo.abort_revalidated_removal(
+                    row, "ambiguous", f"final queue revalidation unavailable: {exc}", conn=conn
+                )
+                return None
+            if current is None:
+                self.repo.abort_revalidated_removal(
+                    row, "removed", "queue record no longer present during final revalidation; outcome unknown", conn=conn
+                )
+                return None
+            if current["status"] != "downloading" or current.get("sizeleft") is None or current["sizeleft"] <= 0:
+                self.repo.abort_revalidated_removal(
+                    row, "exempt", f"queue record is now {current['status']} or has no bytes remaining", conn=conn
+                )
+                return None
+            if row.get("download_id") and current.get("download_id") != row["download_id"]:
+                self.repo.abort_revalidated_removal(
+                    row, "ambiguous", "queue record download identity changed before removal", conn=conn
+                )
+                return None
+            stored_remaining = row.get("sizeleft_bytes")
+            if stored_remaining is None:
+                self.repo.abort_revalidated_removal(
+                    row, "ambiguous", "stored remaining-byte evidence is unavailable", conn=conn
+                )
+                return None
+            decrease = stored_remaining - current["sizeleft"]
+            if decrease >= row["progress_epsilon_bytes"] or decrease < 0:
+                self.repo.abort_revalidated_removal(
+                    row, "healthy", "remaining bytes changed materially before removal; evidence reset", conn=conn
+                )
+                return None
+            self.repo.mark_removal_attempt_started(row, conn=conn)
             client = self._client(library)
             try:
                 client.delete_queue_record(
                     row["sonarr_queue_id"],
-                    remove_from_client=settings["remove_from_client"],
-                    blocklist=settings["blocklist"],
-                    skip_redownload=settings["skip_redownload"],
+                    remove_from_client=row["remove_from_client"],
+                    blocklist=row["blocklist"],
+                    skip_redownload=row["skip_redownload"],
                 )
             except SonarrPostRejectedError as exc:
                 return self.repo.finalize_removal(item["id"], "rejected", str(exc), conn=conn)
@@ -246,3 +358,17 @@ class SlowDownloadService:
             except Exception:
                 return self.repo.finalize_removal(item["id"], "ambiguous", "unexpected error after removal attempt", conn=conn)
             return self.repo.finalize_removal(item["id"], "completed", "removed by slow-download guard", conn=conn)
+
+    def _find_live_queue_record(self, library, queue_id: int) -> dict | None:
+        """Bounded read-only proof for one exact Sonarr queue record. None is
+        returned only after a complete queue enumeration proves absence; an
+        over-bound queue raises and therefore fails closed."""
+        client = self._read_only_client(library)
+        for page in range(1, QUEUE_MAX_PAGES + 1):
+            result = client.get_queue_details(page=page, page_size=QUEUE_PAGE_SIZE)
+            for record in result["records"]:
+                if record["queue_id"] == queue_id:
+                    return record
+            if page * QUEUE_PAGE_SIZE >= result["total_records"]:
+                return None
+        raise SonarrError("Sonarr queue exceeded the bounded final revalidation read")

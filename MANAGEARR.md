@@ -3,8 +3,9 @@
 Managearr is a standalone Flask/PostgreSQL rewrite beside the legacy Huntarr
 application (`main.py`, `src/`). It has its own image, database, port, API, and
 UI. Nothing in this application changes the legacy runtime. Managearr is
-Sonarr-only for now; Radarr, Lidarr, Readarr, Whisparr, and Eros are not part
-of the current UI or roadmap.
+Sonarr-only for now. Radarr support is parked - not built, not in the
+current UI - pending an explicit owner request; Lidarr, Readarr, Whisparr,
+and Eros have been dropped and are not part of the current UI or roadmap.
 
 ## Huntarr-aligned navigation and information architecture
 
@@ -81,7 +82,8 @@ The Slow-download guard is the requested successor to the useful part of
 legacy Swaparr: it monitors the Sonarr queue and, only when explicitly
 enabled, removes downloads for which repeated measured evidence proves no
 effective progress or extremely low sustained throughput. It is **Sonarr-
-only** - there is no Radarr/other-Arr support and none is planned. Legacy
+only** - there is no Radarr/other-Arr support today. Radarr is parked
+pending an explicit owner request; other Arrs have been dropped. Legacy
 Swaparr is mentioned here only as migration context; it is not a separate
 module and nothing in this codebase ports its "old item" timer.
 
@@ -1281,7 +1283,8 @@ M11 delegates the sanctioned release grab to Sonarr and performs no file deletio
 - Sonarr only. The UI only ever creates/edits `type: "sonarr"` instances; the
   `ARR_TYPES` enum still accepts other legacy values through the API for
   backward compatibility, but no page renders them or offers them as a
-  choice, and none of Radarr/Lidarr/Readarr/Whisparr/Eros are on the roadmap.
+  choice. Radarr is parked pending an explicit owner request, not on the
+  current roadmap; Lidarr/Readarr/Whisparr/Eros have been dropped entirely.
 - Automatic dispatch exists only through the M7-M8 persistent, paced Live
   scheduler path (`mode = live` plus authorization state `running`, rechecked
   before every send); fresh deployments still default to `off`. The M2 manual

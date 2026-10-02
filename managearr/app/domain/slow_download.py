@@ -173,17 +173,43 @@ def classify(
 
     in_grace = _minutes(now - state.first_seen_at) < settings.initial_grace_minutes
 
+    if in_grace:
+        # No evidence window may accumulate during the initial grace period:
+        # a window that happened to open before grace expired and complete
+        # exactly as grace ends would otherwise bank a strike for free,
+        # letting removal fire right at grace expiry instead of after grace
+        # plus full evidence windows measured from a clean post-grace
+        # baseline. Freeze both tracks entirely (mirrors the exempt/no-
+        # remaining branch above) so the first post-grace observation always
+        # starts a fresh window.
+        new_state = replace(
+            state,
+            last_observed_at=now,
+            last_sizeleft_bytes=remaining,
+            no_progress_window_started_at=None,
+            no_progress_window_start_sizeleft=None,
+            no_progress_window_observations=0,
+            very_slow_window_started_at=None,
+            very_slow_window_start_sizeleft=None,
+            very_slow_window_observations=0,
+            classification="grace",
+            reason="within initial grace period",
+        )
+        return ClassificationResult(new_state, strike_recorded=False, reset_recorded=False, removal_eligible=False)
+
     last_sizeleft = state.last_sizeleft_bytes
     delta_bytes = None if last_sizeleft is None else last_sizeleft - remaining
 
     # A negative delta (sizeleft increased) means the queue record's
     # underlying download was replaced/restarted; an untrustworthy gap means
-    # elapsed time can't be used as continuous evidence either way. Both
-    # start a brand-new baseline on both tracks, clearing all strikes - the
-    # old evidence no longer describes the current download.
+    # elapsed time can't be used as continuous evidence either way (the gap
+    # is measured against whichever active window is shorter, since either
+    # one completing on an untrustworthy gap would be wrong). Both start a
+    # brand-new baseline on both tracks, clearing all strikes - the old
+    # evidence no longer describes the current download.
     reset_needed = (
         delta_bytes is not None and delta_bytes < 0
-    ) or _gap_too_long(settings.no_progress_window_minutes)
+    ) or _gap_too_long(min(settings.no_progress_window_minutes, settings.very_slow_window_minutes))
 
     if reset_needed:
         new_state = replace(
@@ -198,7 +224,7 @@ def classify(
             very_slow_window_start_sizeleft=remaining,
             very_slow_window_observations=1,
             very_slow_strike_count=0,
-            classification="grace" if in_grace else "healthy",
+            classification="healthy",
             reason=(
                 "remaining bytes increased; starting a new baseline"
                 if delta_bytes is not None and delta_bytes < 0
@@ -240,16 +266,14 @@ def classify(
     very_slow_elapsed_minutes = _minutes(now - very_slow_started)
 
     stalled_window_complete = (
-        not in_grace
-        and not meaningful_progress
+        not meaningful_progress
         and no_progress_elapsed_minutes >= settings.no_progress_window_minutes
         and no_progress_observations >= settings.no_progress_min_observations
     )
     stalled_window_decrease = no_progress_start_sizeleft - remaining if stalled_window_complete else None
 
     very_slow_window_complete = (
-        not in_grace
-        and very_slow_elapsed_minutes >= settings.very_slow_window_minutes
+        very_slow_elapsed_minutes >= settings.very_slow_window_minutes
         and very_slow_observations >= settings.very_slow_min_observations
         and remaining >= settings.very_slow_min_remaining_bytes
     )
@@ -300,9 +324,7 @@ def classify(
         or very_slow_strike_count >= settings.strikes_required
     )
 
-    if in_grace:
-        classification, reason = "grace", "within initial grace period"
-    elif removal_eligible:
+    if removal_eligible:
         classification = "removal_pending"
         parts = []
         if stall_strike_count >= settings.strikes_required:

@@ -147,17 +147,17 @@ class SchedulerWorker:
         if self.repository.current_mode() in ("simulate", "live"):
             self.refresh_service.ensure_freshness()
             self.refresh_service.enqueue_reconcile_if_due()
-            # Slow-download guard monitoring is read-only GET polling, same
-            # kill-switch as refresh above: it runs in simulate or live
-            # (i.e. "regardless of Live hunting/armed state"), never while
-            # mode is off. Automatic removal is attempted at most once per
-            # iteration and is independently gated inside
-            # SlowDownloadService.attempt_removals on auto_removal_enabled
-            # AND a live/running/matching-generation/non-emergency-stopped
-            # Live authorization, re-checked immediately before each
-            # bounded DELETE.
-            self.slow_download_service.poll_all()
-            self.slow_download_service.attempt_removals(max_removals=1)
+            # Queue monitoring remains read-only and independent of whether
+            # Live is armed, paused, or emergency-stopped. Scheduler mode off
+            # retains its stronger no-automatic-network-I/O boundary. Actual
+            # removal is separately gated on live/running/current authorization.
+            # ``self._heartbeat`` is threaded through both calls: a bounded
+            # poll can issue many pages across many libraries, so the lease
+            # is renewed during that read rather than only once per whole
+            # worker iteration, and attempt_removals re-verifies the lease
+            # immediately before issuing any DELETE.
+            self.slow_download_service.poll_all(heartbeat=self._heartbeat)
+            self.slow_download_service.attempt_removals(max_removals=1, heartbeat=self._heartbeat)
         refresh_run = self.refresh_repository.start_next_run(self.owner_id)
         if refresh_run is not None:
             if not self._heartbeat():

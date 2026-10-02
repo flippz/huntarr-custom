@@ -1395,7 +1395,7 @@ MIGRATIONS: list[Migration] = [
             -- underlying client download).
             CREATE TABLE slow_download_queue_items (
                 id BIGSERIAL PRIMARY KEY,
-                library_id BIGINT NOT NULL REFERENCES arr_libraries(id) ON DELETE CASCADE,
+                library_id BIGINT NULL REFERENCES arr_libraries(id) ON DELETE SET NULL,
                 sonarr_queue_id BIGINT NOT NULL CHECK (sonarr_queue_id > 0),
                 download_id TEXT NULL CHECK (download_id IS NULL OR length(download_id) <= 255),
                 title TEXT NOT NULL DEFAULT '' CHECK (length(title) <= 500),
@@ -1437,8 +1437,10 @@ MIGRATIONS: list[Migration] = [
             CREATE INDEX idx_slow_download_queue_items_last_seen
                 ON slow_download_queue_items (last_seen_at);
 
-            -- Append-only per-poll observation history: enough to explain
-            -- every strike/reset decision and survive a restart.
+            -- Append-only per-poll observation history. Queue rows are
+            -- retained after a library is deleted (their nullable library_id
+            -- is cleared), so child evidence can keep a strict RESTRICT FK
+            -- and never needs a trigger exception for identity mutation.
             CREATE TABLE slow_download_observations (
                 id BIGSERIAL PRIMARY KEY,
                 queue_item_id BIGINT NOT NULL REFERENCES slow_download_queue_items(id) ON DELETE RESTRICT,
@@ -1464,10 +1466,12 @@ MIGRATIONS: list[Migration] = [
 
             -- Append-only audit of every strike/reset/exemption/removal
             -- decision - sufficient on its own to explain any removal.
+            -- library_id is an immutable identity snapshot rather than an FK:
+            -- deleting a configured library must not rewrite append-only audit.
             CREATE TABLE slow_download_actions (
                 id BIGSERIAL PRIMARY KEY,
                 queue_item_id BIGINT NOT NULL REFERENCES slow_download_queue_items(id) ON DELETE RESTRICT,
-                library_id BIGINT NULL REFERENCES arr_libraries(id) ON DELETE SET NULL,
+                library_id BIGINT NOT NULL,
                 sonarr_queue_id BIGINT NOT NULL CHECK (sonarr_queue_id > 0),
                 action TEXT NOT NULL CHECK (
                     action IN (
@@ -1491,7 +1495,7 @@ MIGRATIONS: list[Migration] = [
             -- just before the bounded Sonarr DELETE (same pattern as
             -- season_pack_attempt_started). Its mere existence for a queue
             -- item permanently forbids any further automatic retry of that
-            -- exact queue record - see SlowDownloadRepository.claim_removal.
+            -- exact queue record - see SlowDownloadRepository.authorized_removal.
             CREATE TABLE slow_download_removal_attempts (
                 queue_item_id BIGINT PRIMARY KEY REFERENCES slow_download_queue_items(id) ON DELETE RESTRICT,
                 started_at TIMESTAMPTZ NOT NULL DEFAULT now()

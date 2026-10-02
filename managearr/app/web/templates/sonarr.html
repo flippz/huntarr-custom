@@ -460,9 +460,13 @@ loadPolicy().catch(err => toast('Failed to load hunting policy: ' + err.message)
     const body = await sdgApi('/api/v1/libraries/' + id + '/slow-download/queue');
     const rows = body.items;
     if (!rows.length) { $('sdg-rows').innerHTML = '<tr><td colspan="5">No tracked downloads.</td></tr>'; return; }
+    // r.title and r.status are Sonarr-derived (attacker-influenceable via a
+    // crafted release/download name) - every value here must be escaped,
+    // never concatenated raw into innerHTML.
     $('sdg-rows').innerHTML = rows.map(r => (
-      '<tr><td>' + (r.title || '(untitled)') + '</td><td>' + r.status + '</td><td>' + r.classification
-      + '</td><td>' + r.strike_count + '</td><td class="muted">' + (r.reason || '') + '</td></tr>'
+      '<tr><td>' + escapeHtml(r.title || '(untitled)') + '</td><td>' + escapeHtml(r.status || '')
+      + '</td><td>' + escapeHtml(r.classification) + '</td><td>' + escapeHtml(String(r.strike_count))
+      + '</td><td class="muted">' + escapeHtml(r.reason || '') + '</td></tr>'
     )).join('');
   }
   $('sdg-library').addEventListener('change', () => loadSdgSettings().catch(showSdg));

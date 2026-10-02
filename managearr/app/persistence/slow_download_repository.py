@@ -140,9 +140,41 @@ class SlowDownloadRepository:
             return {"library_id": library_id, "revision": 0, **DEFAULT_SETTINGS}
         return {"library_id": library_id, "revision": row["revision"], **{k: row[k] for k in _SETTINGS_COLUMNS}}
 
-    def update_settings(self, library_id: int, data: dict, *, expected_revision: int | None) -> tuple[dict | None, str | None]:
+    def update_settings(
+        self, library_id: int, data: dict, *, expected_revision: int | None, require_live_running: bool = False,
+        _on_locked=None,
+    ) -> tuple[dict | None, str | None]:
+        """Persist a settings change.
+
+        ``require_live_running=True`` (passed only when the caller is
+        enabling or loosening automatic removal) locks and rechecks
+        ``scheduler_settings``/``live_control`` *inside this same
+        transaction*, immediately before the settings row is written -
+        exactly like ``authorized_removal`` rechecks them immediately
+        before a DELETE. Without this, a preliminary, non-transactional
+        "is Live armed?" check could read a stale 'running' state and let
+        an operator's enable commit after a concurrent Pause/E-stop should
+        have blocked it. The lock order (scheduler_settings, then
+        live_control, then this settings row) matches
+        ``authorized_removal`` so the two can never deadlock against each
+        other.
+        """
         current = self.settings(library_id)
         with self.db.connect() as conn:
+            if require_live_running:
+                scheduler = conn.execute("SELECT mode FROM scheduler_settings WHERE id = 1 FOR SHARE").fetchone()
+                live = conn.execute(
+                    "SELECT authorization_state, authorization_generation FROM live_control WHERE id = 1 FOR SHARE"
+                ).fetchone()
+                if scheduler is None or scheduler["mode"] != "live":
+                    return None, "Live mode is not active"
+                if live is None or live["authorization_state"] != "running":
+                    return None, "Live authorization changed before this change could be saved; reload and try again"
+                if _on_locked is not None:
+                    # Test-only hook: lets a concurrency test deterministically
+                    # prove a racing Pause/E-stop blocks on the lock held here
+                    # rather than slipping in between this check and commit.
+                    _on_locked()
             row = conn.execute(
                 "SELECT revision FROM slow_download_settings WHERE library_id = %s FOR UPDATE", (library_id,)
             ).fetchone()
@@ -383,7 +415,9 @@ class SlowDownloadRepository:
     # --- gated removal: mirrors SeasonPackRepository.authorized_write ------
 
     @contextmanager
-    def authorized_removal(self, queue_item_id: int, expected_generation: int):
+    def authorized_removal(
+        self, queue_item_id: int, expected_generation: int, *, expected_url: str, expected_api_key: str
+    ):
         """Linearize the last authorization/settings check with the DELETE.
 
         Row/shared locks held here keep settings, Live authorization, and
@@ -422,23 +456,59 @@ class SlowDownloadRepository:
                 error = "Live mode is not active"
             elif live is None or live["authorization_state"] != "running" or live["authorization_generation"] != expected_generation:
                 error = "Live authorization changed before removal"
-            elif not library or library["type"] != "sonarr" or library["enabled"] is not True:
+            elif (
+                not library or library["type"] != "sonarr" or library["enabled"] is not True
+                or library["url"] != expected_url or library["api_key"] != expected_api_key
+            ):
                 error = "library routing identity changed since evaluation"
             elif not settings_row or not settings_row["auto_removal_enabled"]:
                 error = "automatic removal is disabled for this library"
             elif row["classification"] != "removal_pending":
                 error = "queue item is no longer removal-pending"
             if error is None:
-                with self.db.dedicated_transaction(lock_timeout_seconds=5) as marker_conn:
-                    marker_conn.execute(
-                        "INSERT INTO slow_download_removal_attempts (queue_item_id, started_at) VALUES (%s, now())",
-                        (queue_item_id,),
-                    )
-                self._record_action(
-                    conn, queue_item_id, row["library_id"], row["sonarr_queue_id"],
-                    "removal_attempt_started", "durable attempt marker committed before DELETE",
-                )
+                # Bind the exact locked settings to the caller. Reading
+                # these before taking the settings row lock could apply a
+                # stale removal policy after an operator edit.
+                row["remove_from_client"] = settings_row["remove_from_client"]
+                row["blocklist"] = settings_row["blocklist"]
+                row["skip_redownload"] = settings_row["skip_redownload"]
+                row["progress_epsilon_bytes"] = settings_row["progress_epsilon_bytes"]
             yield conn, row, error
+
+    def mark_removal_attempt_started(self, row: dict, *, conn) -> None:
+        """Commit the permanent no-retry marker after the final live queue
+        GET has revalidated the exact record, and immediately before DELETE."""
+        with self.db.dedicated_transaction(lock_timeout_seconds=5) as marker_conn:
+            marker_conn.execute(
+                "INSERT INTO slow_download_removal_attempts (queue_item_id, started_at) VALUES (%s, now())",
+                (row["id"],),
+            )
+        self._record_action(
+            conn, row["id"], row["library_id"], row["sonarr_queue_id"],
+            "removal_attempt_started", "durable attempt marker committed after live queue revalidation and before DELETE",
+        )
+
+    def abort_revalidated_removal(self, row: dict, classification: str, reason: str, *, conn) -> dict:
+        """Fail closed before an attempt marker/DELETE when the final queue
+        read no longer proves the stored removal evidence is current."""
+        if classification not in ("healthy", "exempt", "removed", "ambiguous"):
+            classification = "ambiguous"
+        updated = conn.execute(
+            """
+            UPDATE slow_download_queue_items SET
+                classification=%s, reason=%s, stall_strike_count=0, very_slow_strike_count=0,
+                no_progress_window_started_at=NULL, no_progress_window_start_sizeleft=NULL,
+                no_progress_window_observations=0, very_slow_window_started_at=NULL,
+                very_slow_window_start_sizeleft=NULL, very_slow_window_observations=0, updated_at=now()
+            WHERE id=%s RETURNING *
+            """,
+            (classification, reason[:1000], row["id"]),
+        ).fetchone()
+        self._record_action(
+            conn, row["id"], row["library_id"], row["sonarr_queue_id"],
+            "reset", "final removal revalidation blocked DELETE: " + reason[:900],
+        )
+        return _queue_item_dict(updated)
 
     def finalize_removal(self, queue_item_id: int, outcome: str, reason: str, *, conn=None) -> dict | None:
         """``outcome`` is one of 'completed', 'rejected', 'ambiguous'."""

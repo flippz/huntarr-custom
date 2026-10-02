@@ -383,7 +383,7 @@ def test_off_simulate_and_unarmed_live_never_instantiate_write_client(
     # which itself wraps SonarrClient) is an intentional, unrelated GET source
     # covered by its own dedicated tests in test_slow_download_guard.py - out
     # of scope for this specific live-dispatch *write*-client safety check.
-    monkeypatch.setattr(worker.slow_download_service, "poll_all", lambda: [])
+    monkeypatch.setattr(worker.slow_download_service, "poll_all", lambda **_kwargs: [])
     monkeypatch.setattr(worker.slow_download_service, "attempt_removals", lambda **_kwargs: [])
 
     # off
