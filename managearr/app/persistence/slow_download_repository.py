@@ -109,7 +109,7 @@ def _queue_item_dict(row) -> dict:
     return {
         "id": row["id"], "library_id": row["library_id"], "sonarr_queue_id": row["sonarr_queue_id"],
         "download_id": row["download_id"], "title": row["title"], "status": row["status"],
-        "tracked_state": row["tracked_state"], "size_bytes": row["size_bytes"],
+        "tracked_state": row["tracked_state"], "tracked_status": row["tracked_status"], "size_bytes": row["size_bytes"],
         "sizeleft_bytes": row["sizeleft_bytes"], "progress_percent": progress_percent,
         "measured_rate_bytes_per_second": _measured_rate(row),
         "first_seen_at": _iso(row["first_seen_at"]), "last_seen_at": _iso(row["last_seen_at"]),
@@ -141,10 +141,20 @@ class SlowDownloadRepository:
         return {"library_id": library_id, "revision": row["revision"], **{k: row[k] for k in _SETTINGS_COLUMNS}}
 
     def update_settings(
-        self, library_id: int, data: dict, *, expected_revision: int | None, require_live_running: bool = False,
+        self, library_id: int, data: dict, *, expected_revision: int, require_live_running: bool = False,
         _on_locked=None,
     ) -> tuple[dict | None, str | None]:
         """Persist a settings change.
+
+        ``expected_revision`` is required and is checked against the row
+        locked immediately below - never against an earlier, unlocked
+        read - so a caller that skipped reloading current settings can
+        never silently bypass the optimistic-concurrency check. The full
+        current settings row is likewise read for the first time only
+        after being locked (``FOR UPDATE``), so ``merged`` below always
+        merges against what is truly current at write time, never a
+        possibly-stale pre-lock snapshot a concurrent writer already
+        moved past.
 
         ``require_live_running=True`` (passed only when the caller is
         enabling or loosening automatic removal) locks and rechecks
@@ -159,7 +169,6 @@ class SlowDownloadRepository:
         ``authorized_removal`` so the two can never deadlock against each
         other.
         """
-        current = self.settings(library_id)
         with self.db.connect() as conn:
             if require_live_running:
                 scheduler = conn.execute("SELECT mode FROM scheduler_settings WHERE id = 1 FOR SHARE").fetchone()
@@ -176,11 +185,15 @@ class SlowDownloadRepository:
                     # rather than slipping in between this check and commit.
                     _on_locked()
             row = conn.execute(
-                "SELECT revision FROM slow_download_settings WHERE library_id = %s FOR UPDATE", (library_id,)
+                "SELECT * FROM slow_download_settings WHERE library_id = %s FOR UPDATE", (library_id,)
             ).fetchone()
             current_revision = row["revision"] if row else 0
-            if expected_revision is not None and expected_revision != current_revision:
+            if expected_revision != current_revision:
                 return None, "settings were changed by someone else; reload and try again"
+            current = {
+                "library_id": library_id, "revision": current_revision,
+                **(({k: row[k] for k in _SETTINGS_COLUMNS}) if row else DEFAULT_SETTINGS),
+            }
             merged = {**current, **data}
             values = [merged[k] for k in _SETTINGS_COLUMNS]
             conn.execute(
@@ -246,15 +259,15 @@ class SlowDownloadRepository:
                 row = conn.execute(
                     """
                     INSERT INTO slow_download_queue_items (
-                        library_id, sonarr_queue_id, download_id, title, status, tracked_state,
+                        library_id, sonarr_queue_id, download_id, title, status, tracked_state, tracked_status,
                         size_bytes, sizeleft_bytes, first_seen_at, last_seen_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING *
                     """,
                     (
                         library_id, record["queue_id"], record.get("download_id"), record.get("title", ""),
-                        record.get("status", ""), record.get("tracked_state"), record.get("size"),
-                        record.get("sizeleft"), observed_at, observed_at,
+                        record.get("status", ""), record.get("tracked_state"), record.get("tracked_status"),
+                        record.get("size"), record.get("sizeleft"), observed_at, observed_at,
                     ),
                 ).fetchone()
 
@@ -262,6 +275,7 @@ class SlowDownloadRepository:
             observation = Observation(
                 observed_at=observed_at, status=record.get("status", ""),
                 size_bytes=record.get("size"), sizeleft_bytes=record.get("sizeleft"),
+                tracked_state=record.get("tracked_state"), tracked_status=record.get("tracked_status"),
             )
             last_sizeleft_before = state.last_sizeleft_bytes
             result = classify(domain_settings, state, observation)
@@ -270,7 +284,7 @@ class SlowDownloadRepository:
             updated = conn.execute(
                 """
                 UPDATE slow_download_queue_items SET
-                    download_id = %s, title = %s, status = %s, tracked_state = %s,
+                    download_id = %s, title = %s, status = %s, tracked_state = %s, tracked_status = %s,
                     size_bytes = %s, sizeleft_bytes = %s, last_seen_at = %s,
                     last_observed_at = %s, last_sizeleft_bytes = %s, last_meaningful_progress_at = %s,
                     no_progress_window_started_at = %s, no_progress_window_start_sizeleft = %s,
@@ -283,7 +297,8 @@ class SlowDownloadRepository:
                 """,
                 (
                     record.get("download_id"), record.get("title", ""), record.get("status", ""),
-                    record.get("tracked_state"), record.get("size"), record.get("sizeleft"), observed_at,
+                    record.get("tracked_state"), record.get("tracked_status"), record.get("size"),
+                    record.get("sizeleft"), observed_at,
                     new_state.last_observed_at, new_state.last_sizeleft_bytes, new_state.last_meaningful_progress_at,
                     new_state.no_progress_window_started_at, new_state.no_progress_window_start_sizeleft,
                     new_state.no_progress_window_observations, new_state.stall_strike_count,

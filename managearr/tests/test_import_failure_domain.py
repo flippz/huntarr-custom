@@ -173,6 +173,64 @@ def test_normalize_sample_indeterminate_not_collapsed_to_sample():
     assert result.matched_reasons == {"SampleIndeterminate"}
 
 
+def test_normalize_sample_indeterminate_sentence_not_collapsed_to_sample():
+    # Same overlap-suppression rule as the literal-token case above, but
+    # for the humanized sentence form: "Sample" is a word-bounded substring
+    # of "Sample indeterminate", yet only the longer, more specific match
+    # must survive.
+    result = normalize_messages(["Sample indeterminate - unable to verify"])
+    assert result.matched_reasons == {"SampleIndeterminate"}
+    assert "Sample" not in result.matched_reasons
+
+
+def test_normalize_generic_word_error_requires_exact_whole_message_match():
+    # "error" is an ordinary, highly generic English word - matching it as
+    # a mere word-bounded substring would misclassify unrelated text (e.g.
+    # a download client's own "filesystem error" message, which is not
+    # Sonarr's "Error" import-rejection reason at all). Only the complete
+    # trimmed message being exactly "error" is safe signal.
+    result = normalize_messages(["filesystem error"])
+    assert "Error" not in result.matched_reasons
+    assert result.matched_reasons == frozenset()
+    assert result.unmatched_messages == ("filesystem error",)
+
+
+def test_normalize_sampler_is_not_collapsed_to_sample():
+    # "sampler" is a different word entirely - "Sample" must never match
+    # as a substring glued to other letters.
+    result = normalize_messages(["sampler"])
+    assert "Sample" not in result.matched_reasons
+    assert result.matched_reasons == frozenset()
+    assert result.unmatched_messages == ("sampler",)
+
+
+def test_normalize_single_message_returns_every_distinct_matched_category():
+    # Two genuinely separate, non-overlapping reason mentions in one
+    # message must both be reported - "return all matched categories",
+    # not just the first/longest one found.
+    result = normalize_messages(["Sample Unpacking"])
+    assert result.matched_reasons == {"Sample", "Unpacking"}
+    assert result.unmatched_messages == ()
+
+
+def test_evaluate_combined_single_message_reasons_require_every_category_selected():
+    normalization = normalize_messages(["Sample Unpacking"])
+    only_one_selected = ImportFailurePolicy(auto_removal_enabled=True, removal_reasons=frozenset({"Sample"}))
+    decision = evaluate(only_one_selected, normalization)
+    assert decision.action == "leave"
+    assert "Unpacking" in decision.reason
+    both_selected = ImportFailurePolicy(auto_removal_enabled=True, removal_reasons=frozenset({"Sample", "Unpacking"}))
+    decision = evaluate(both_selected, normalization)
+    assert decision.action == "remove_eligible"
+
+
+def test_all_reason_keys_catalog_is_exactly_35():
+    # 34 current upstream Sonarr v4 ImportRejectionReason enum values
+    # (including "Unknown") plus the one synthetic queue-only key.
+    assert len(ALL_REASON_KEYS) == 35
+    assert len(set(ALL_REASON_KEYS)) == 35
+
+
 # --- should_observe ---------------------------------------------------------
 
 @pytest.mark.parametrize("status,tracked_state,tracked_status,expected", [

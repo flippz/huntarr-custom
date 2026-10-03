@@ -12,6 +12,7 @@ from app.domain.slow_download import (
     QueueItemState,
     SlowDownloadSettings,
     classify,
+    is_exempt_tracked,
 )
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -28,8 +29,11 @@ def fresh_state(first_seen_at=T0):
     return QueueItemState(first_seen_at=first_seen_at)
 
 
-def obs(t, status="downloading", size=10 * GiB, sizeleft=None):
-    return Observation(observed_at=t, status=status, size_bytes=size, sizeleft_bytes=sizeleft)
+def obs(t, status="downloading", size=10 * GiB, sizeleft=None, tracked_state=None, tracked_status=None):
+    return Observation(
+        observed_at=t, status=status, size_bytes=size, sizeleft_bytes=sizeleft,
+        tracked_state=tracked_state, tracked_status=tracked_status,
+    )
 
 
 def feed(settings_, state, observations):
@@ -66,6 +70,67 @@ def test_zero_remaining_bytes_is_exempt():
     state = fresh_state()
     result = classify(s, state, obs(T0, status="downloading", sizeleft=0))
     assert result.state.classification == "exempt"
+
+
+# --- Hard exemption: trackedDownloadState/trackedDownloadStatus is the
+# import-failure reason policy's exclusive territory, regardless of the
+# plain Sonarr queue ``status`` -----------------------------------------
+
+@pytest.mark.parametrize("tracked_state,tracked_status", [
+    ("importblocked", None), ("ImportBlocked", None),  # case-insensitive
+    (None, "warning"), (None, "Warning"),
+    (None, "error"), (None, "Error"),
+])
+def test_hard_exempt_tracked_state_or_status_overrides_active_downloading_status(tracked_state, tracked_status):
+    assert is_exempt_tracked(tracked_state, tracked_status) is True
+    s = settings()
+    state = fresh_state()
+    # "downloading" with bytes remaining would otherwise be fully active -
+    # the hard exemption must still win.
+    result = classify(s, state, obs(T0, status="downloading", sizeleft=5 * GiB, tracked_state=tracked_state, tracked_status=tracked_status))
+    assert result.state.classification == "exempt"
+    assert "hard-exempt" in result.state.reason
+
+
+def test_hard_exempt_tracked_state_never_accumulates_evidence_across_many_observations():
+    s = settings(initial_grace_minutes=0, no_progress_window_minutes=30, no_progress_min_observations=2)
+    state = fresh_state()
+    observations = [
+        obs(T0 + timedelta(minutes=i * 10), status="downloading", sizeleft=5 * GiB, tracked_state="importblocked")
+        for i in range(10)
+    ]
+    results = feed(s, state, observations)
+    assert all(r.state.classification == "exempt" for r in results)
+    assert all(r.state.strike_count == 0 for r in results)
+    assert all(not r.strike_recorded for r in results)
+
+
+def test_not_exempt_when_tracked_state_and_status_are_both_absent_or_benign():
+    assert is_exempt_tracked(None, None) is False
+    assert is_exempt_tracked("downloading", "ok") is False
+
+
+def test_tracked_hard_exempt_freezes_existing_evidence_like_other_exemptions():
+    s = settings(
+        initial_grace_minutes=0, no_progress_window_minutes=30, no_progress_min_observations=3,
+        strikes_required=5,
+    )
+    state = fresh_state()
+    sizeleft = 5 * GiB
+    # Accumulate one stall strike while actively downloading with no
+    # tracked exemption (window opens at minute 10, completes at minute 40
+    # with no meaningful decrease).
+    observations = [obs(T0 + timedelta(minutes=10 * i), sizeleft=sizeleft) for i in range(1, 5)]
+    results = feed(s, state, observations)
+    state = results[-1].state
+    assert state.stall_strike_count == 1
+    # ...then Sonarr reports it import-blocked: existing strikes are
+    # preserved (not wiped), but the window is frozen, exactly like any
+    # other exempt transition.
+    r_exempt = classify(s, state, obs(T0 + timedelta(minutes=50), sizeleft=sizeleft, tracked_state="importblocked"))
+    assert r_exempt.state.classification == "exempt"
+    assert r_exempt.state.stall_strike_count == 1
+    assert r_exempt.state.no_progress_window_started_at is None
 
 
 def test_queue_paused_then_resumes_does_not_count_pause_duration():

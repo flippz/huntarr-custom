@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from ..domain.import_failure import (
+    Decision,
     ImportFailurePolicy,
     NormalizationResult,
     evaluate,
@@ -93,11 +94,25 @@ class ImportFailureRepository:
 
     def update_settings(
         self, library_id: int, data: dict, *, removal_reasons: list[str] | None,
-        expected_revision: int | None, require_live_running: bool = False,
+        expected_revision: int, require_live_running: bool = False,
         confirm: bool = False, reason: str = "", _on_locked=None,
     ) -> tuple[dict | None, str | None]:
         """Persist a settings change, atomically with any reason-selection
         change, bumping ``revision`` and appending one audit row.
+
+        ``expected_revision`` is required (callers must always supply the
+        revision they last read) and is checked against the row locked
+        immediately below - never against an earlier, unlocked read - so a
+        caller that skipped reloading current settings can never silently
+        bypass the optimistic-concurrency check.
+
+        The full current settings row *and* the full current reason
+        selection are both read for the first time only after being locked
+        here (``FOR UPDATE``) - never from an earlier, unlocked snapshot -
+        so ``merged`` below always merges the incoming change against
+        what is truly current at write time, not a possibly-stale
+        pre-lock read that a concurrent writer could have already moved
+        past.
 
         ``require_live_running=True`` (passed only when the caller is
         enabling or loosening automatic removal, or newly selecting any
@@ -109,7 +124,6 @@ class ImportFailureRepository:
         settings row) matches those so the two can never deadlock against
         each other.
         """
-        current = self.settings(library_id)
         with self.db.connect() as conn:
             if require_live_running:
                 scheduler = conn.execute("SELECT mode FROM scheduler_settings WHERE id = 1 FOR SHARE").fetchone()
@@ -123,11 +137,20 @@ class ImportFailureRepository:
                 if _on_locked is not None:
                     _on_locked()
             row = conn.execute(
-                "SELECT revision FROM import_failure_policies WHERE library_id = %s FOR UPDATE", (library_id,)
+                "SELECT * FROM import_failure_policies WHERE library_id = %s FOR UPDATE", (library_id,)
             ).fetchone()
+            reason_rows = conn.execute(
+                "SELECT reason_key FROM import_failure_policy_reasons WHERE library_id = %s ORDER BY reason_key FOR UPDATE",
+                (library_id,),
+            ).fetchall()
             current_revision = row["revision"] if row else 0
-            if expected_revision is not None and expected_revision != current_revision:
+            if expected_revision != current_revision:
                 return None, "settings were changed by someone else; reload and try again"
+            current = {
+                "library_id": library_id, "revision": current_revision,
+                "removal_reasons": [r["reason_key"] for r in reason_rows],
+                **(({k: row[k] for k in _SETTINGS_COLUMNS}) if row else DEFAULT_SETTINGS),
+            }
             merged = {**current, **data}
             values = [merged[k] for k in _SETTINGS_COLUMNS]
             conn.execute(
@@ -211,6 +234,13 @@ class ImportFailureRepository:
             ).fetchall()
             policy = _policy_to_domain(settings, frozenset(r["reason_key"] for r in reason_rows))
             decision = evaluate(policy, normalization)
+            if decision.action == "remove_eligible" and not record.get("download_id"):
+                # A stable, nonempty downloadId is required for removal -
+                # without one there is nothing to re-prove identity against
+                # at the final pre-DELETE revalidation (see
+                # ImportFailureService._attempt_removal), so this item must
+                # never become remove_eligible in the first place.
+                decision = Decision("leave", "queue record has no stable download identity; never auto-removed")
 
             row = conn.execute(
                 """

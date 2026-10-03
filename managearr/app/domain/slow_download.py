@@ -44,6 +44,18 @@ EXEMPT_STATUSES = frozenset({
 })
 ACTIVE_STATUSES = frozenset({"downloading"})
 
+# Hard-exempt regardless of ``status`` - Sonarr has already classified this
+# download as import-blocked or carrying a warning/error, which is the
+# import-failure reason policy's exclusive territory (see
+# app/domain/import_failure.py). A queue record can legitimately still
+# report status "downloading" while trackedDownloadState is "importBlocked"
+# or trackedDownloadStatus is "warning"/"error" - this guard must never
+# accumulate stall/slow-speed evidence against it, or revalidate it as
+# removal-eligible, while that is true, since it is not a measured-
+# progress problem this guard is meant to police.
+EXEMPT_TRACKED_STATES = frozenset({"importblocked"})
+EXEMPT_TRACKED_STATUSES = frozenset({"warning", "error"})
+
 CLASSIFICATIONS = frozenset({
     "exempt", "grace", "healthy", "slow_watch",
     "stalled_evidence", "very_slow_evidence", "removal_pending",
@@ -76,6 +88,8 @@ class Observation:
     status: str  # already lower-cased Sonarr queue status
     size_bytes: int | None
     sizeleft_bytes: int | None
+    tracked_state: str | None = None  # already lower-cased trackedDownloadState
+    tracked_status: str | None = None  # already lower-cased trackedDownloadStatus
 
 
 @dataclass(frozen=True)
@@ -124,6 +138,10 @@ def is_active_status(status: str) -> bool:
     return (status or "").lower() in ACTIVE_STATUSES
 
 
+def is_exempt_tracked(tracked_state: str | None, tracked_status: str | None) -> bool:
+    return (tracked_state or "").lower() in EXEMPT_TRACKED_STATES or (tracked_status or "").lower() in EXEMPT_TRACKED_STATUSES
+
+
 def _minutes(delta: timedelta) -> float:
     return delta.total_seconds() / 60.0
 
@@ -150,13 +168,21 @@ def classify(
 
     status = (observation.status or "").lower()
     remaining = observation.sizeleft_bytes
-    exempt = is_exempt_status(status) or not is_active_status(status)
+    tracked_exempt = is_exempt_tracked(observation.tracked_state, observation.tracked_status)
+    exempt = is_exempt_status(status) or not is_active_status(status) or tracked_exempt
     no_remaining = remaining is None or remaining <= 0
     if exempt or no_remaining:
         # Freeze both windows while exempt/unknown so paused/queued time is
         # never read back as "no progress for N minutes" once the item
         # resumes. Strikes are preserved: pausing is not itself evidence of
         # anything, good or bad.
+        if tracked_exempt:
+            reason = (
+                f"trackedDownloadState '{observation.tracked_state}'/trackedDownloadStatus "
+                f"'{observation.tracked_status}' is hard-exempt from slow-download evaluation"
+            )
+        else:
+            reason = f"status '{status}' is exempt from slow-download evaluation"
         new_state = replace(
             state,
             last_observed_at=now,
@@ -167,7 +193,7 @@ def classify(
             very_slow_window_start_sizeleft=None,
             very_slow_window_observations=0,
             classification="exempt",
-            reason=f"status '{status}' is exempt from slow-download evaluation",
+            reason=reason,
         )
         return ClassificationResult(new_state, strike_recorded=False, reset_recorded=False, removal_eligible=False)
 

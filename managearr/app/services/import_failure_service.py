@@ -103,7 +103,14 @@ class ImportFailureService:
         if not isinstance(payload, dict):
             return None, ["request body must be an object"]
         current = self.repo.settings(library_id)
-        expected_revision = payload.get("revision", current["revision"])
+        if "revision" not in payload:
+            # Optimistic concurrency is only meaningful if every caller is
+            # forced to prove they have actually seen current settings -
+            # an omitted revision must never silently fall back to
+            # whatever this preliminary read happens to return, or the
+            # check becomes a no-op for any caller that skips it.
+            return None, ["revision is required"]
+        expected_revision = payload["revision"]
         if not isinstance(expected_revision, int) or isinstance(expected_revision, bool):
             return None, ["revision must be an integer"]
         data = {k: v for k, v in payload.items() if k not in ("revision", "removal_reasons", "confirm", "reason")}
@@ -184,35 +191,29 @@ class ImportFailureService:
 
     def poll_library(self, library_id: int, *, heartbeat=None) -> dict:
         """Bounded, read-only poll of one Sonarr library's queue. Never
-        mutates Sonarr. Returns a summary dict for worker logging/tests."""
+        mutates Sonarr. Returns a summary dict for worker logging/tests.
+
+        Every page is first collected into memory (bounded to at most
+        ``QUEUE_MAX_PAGES * QUEUE_PAGE_SIZE`` records) *before* any record
+        is classified: an incomplete snapshot - the queue exceeded the
+        bound, Sonarr errored mid-read, or the lease was lost - must
+        suppress classification entirely, not just disappearance
+        reconciliation, since a partial read isn't a safe basis for
+        scoring individual records either."""
         library = self.libraries.get(library_id)
         if not library or library.type != "sonarr" or not library.enabled:
-            return {"library_id": library_id, "polled": 0, "error": "library not available"}
+            return {"library_id": library_id, "observed": 0, "error": "library not available"}
         settings = self.repo.settings(library_id)
         if not settings["monitoring_enabled"]:
-            return {"library_id": library_id, "polled": 0, "skipped": "monitoring disabled"}
+            return {"library_id": library_id, "observed": 0, "skipped": "monitoring disabled"}
         client = self._read_only_client(library)
-        present_queue_ids = set()
-        observed = 0
+        fetched_records = []
         queue_complete = False
         lease_lost = False
         try:
             for page in range(1, QUEUE_MAX_PAGES + 1):
                 result = client.get_queue_details(page=page, page_size=QUEUE_PAGE_SIZE)
-                for record in result["records"]:
-                    present_queue_ids.add(record["queue_id"])
-                    watched = should_observe(
-                        status=record.get("status"), tracked_state=record.get("tracked_state"),
-                        tracked_status=record.get("tracked_status"),
-                    )
-                    if watched:
-                        messages = _extract_messages(record)
-                        normalization = normalize_messages(messages)
-                        if normalization.has_any_evidence:
-                            self.repo.record_observation(library_id, record, normalization, settings)
-                            observed += 1
-                    else:
-                        self.repo.resolve_no_longer_watched(library_id, record)
+                fetched_records.extend(result["records"])
                 if page * QUEUE_PAGE_SIZE >= result["total_records"]:
                     queue_complete = True
                     break
@@ -220,17 +221,33 @@ class ImportFailureService:
                     lease_lost = True
                     break
         except SonarrError as exc:
-            return {"library_id": library_id, "observed": observed, "error": str(exc)}
+            return {"library_id": library_id, "observed": 0, "error": str(exc)}
         if lease_lost:
             return {
-                "library_id": library_id, "observed": observed, "cleared": 0,
+                "library_id": library_id, "observed": 0, "cleared": 0,
                 "error": "scheduler lease lost during bounded queue read; disappearance reconciliation skipped",
             }
         if not queue_complete:
             return {
-                "library_id": library_id, "observed": observed, "cleared": 0,
-                "error": f"Sonarr queue exceeded the bounded {QUEUE_MAX_PAGES * QUEUE_PAGE_SIZE}-record read; disappearance reconciliation skipped",
+                "library_id": library_id, "observed": 0, "cleared": 0,
+                "error": f"Sonarr queue exceeded the bounded {QUEUE_MAX_PAGES * QUEUE_PAGE_SIZE}-record read; classification skipped",
             }
+        present_queue_ids = set()
+        observed = 0
+        for record in fetched_records:
+            present_queue_ids.add(record["queue_id"])
+            watched = should_observe(
+                status=record.get("status"), tracked_state=record.get("tracked_state"),
+                tracked_status=record.get("tracked_status"),
+            )
+            if watched:
+                messages = _extract_messages(record)
+                normalization = normalize_messages(messages)
+                if normalization.has_any_evidence:
+                    self.repo.record_observation(library_id, record, normalization, settings)
+                    observed += 1
+            else:
+                self.repo.resolve_no_longer_watched(library_id, record)
         cleared = self.repo.clear_disappeared(library_id, present_queue_ids)
         return {"library_id": library_id, "observed": observed, "cleared": cleared}
 
@@ -286,14 +303,14 @@ class ImportFailureService:
                     continue
                 if heartbeat is not None and not heartbeat():
                     return outcomes
-                outcome = self._attempt_removal(library, item, live_status["generation"])
+                outcome = self._attempt_removal(library, item, live_status["generation"], heartbeat=heartbeat)
                 if outcome is not None:
                     outcomes.append(outcome)
                 if len(outcomes) >= max_removals:
                     break
         return outcomes
 
-    def _attempt_removal(self, library, item: dict, expected_generation: int) -> dict | None:
+    def _attempt_removal(self, library, item: dict, expected_generation: int, *, heartbeat=None) -> dict | None:
         with self.repo.authorized_removal(
             item["id"], expected_generation, expected_url=library.url, expected_api_key=library.api_key
         ) as (conn, row, error):
@@ -318,9 +335,17 @@ class ImportFailureService:
                     row, "removed", "queue record no longer present during final revalidation; outcome unknown", conn=conn
                 )
                 return None
-            if row.get("download_id") and current.get("download_id") != row["download_id"]:
+            # Unconditional identity check: a missing download id - on
+            # either side - is never treated as "nothing to compare", only
+            # an exact, nonempty match on both sides is proof of stable
+            # identity. An item that was ever observed without a
+            # downloadId has no stable identity to prove and must stay
+            # ambiguous/untouched rather than being removed on faith.
+            if not row.get("download_id") or not current.get("download_id") or current.get("download_id") != row["download_id"]:
                 self.repo.abort_revalidated_removal(
-                    row, "ambiguous", "queue record download identity changed before removal", conn=conn
+                    row, "ambiguous",
+                    "queue record has no stable download identity, or its download identity changed before removal",
+                    conn=conn,
                 )
                 return None
             watched = should_observe(
@@ -343,6 +368,15 @@ class ImportFailureService:
                 self.repo.abort_revalidated_removal(
                     row, "leave", "a matched reason is no longer selected for automatic removal", conn=conn
                 )
+                return None
+            # The final live queue read above can issue up to
+            # QUEUE_MAX_PAGES network round trips; re-verify this worker
+            # still owns its scheduler lease at the destructive boundary -
+            # immediately before the durable marker and the DELETE - rather
+            # than trusting the single heartbeat check that preceded the
+            # (possibly long) revalidation read. A lost lease fails closed:
+            # no marker, no DELETE.
+            if heartbeat is not None and not heartbeat():
                 return None
             self.repo.mark_removal_attempt_started(row, conn=conn)
             client = self._client(library)

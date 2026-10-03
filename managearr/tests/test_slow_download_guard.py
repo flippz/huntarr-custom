@@ -42,11 +42,14 @@ class FakeQueueClient:
             raise type(self).delete_error("test outcome")
 
 
-def queue_record(queue_id=1, status="downloading", size=10 * GiB, sizeleft=5 * GiB, title="Show.S01E01", download_id="dl-1"):
+def queue_record(
+    queue_id=1, status="downloading", size=10 * GiB, sizeleft=5 * GiB, title="Show.S01E01", download_id="dl-1",
+    tracked_state="downloading", tracked_status=None,
+):
     return {
-        "queue_id": queue_id, "episode_ids": [], "status": status, "tracked_state": "downloading",
-        "download_id": download_id, "added": None, "title": title, "size": size, "sizeleft": sizeleft,
-        "timeleft": None, "error_message": None, "status_messages": [],
+        "queue_id": queue_id, "episode_ids": [], "status": status, "tracked_state": tracked_state,
+        "tracked_status": tracked_status, "download_id": download_id, "added": None, "title": title,
+        "size": size, "sizeleft": sizeleft, "timeleft": None, "error_message": None, "status_messages": [],
     }
 
 
@@ -76,7 +79,9 @@ def test_settings_default_monitoring_on_auto_removal_off(client, library_repo):
 
 def test_enabling_auto_removal_requires_confirm_and_reason(client, library_repo):
     library = make_sonarr_library(library_repo)
-    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={"auto_removal_enabled": True})
+    response = client.put(
+        f"/api/v1/libraries/{library.id}/slow-download/settings", json={"auto_removal_enabled": True, "revision": 0}
+    )
     assert response.status_code == 400
     assert "confirm" in str(response.get_json()["errors"]).lower()
 
@@ -85,7 +90,7 @@ def test_enabling_auto_removal_requires_live_armed(client, library_repo):
     library = make_sonarr_library(library_repo)
     response = client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "testing"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "testing", "revision": 0},
     )
     assert response.status_code == 400
     assert "armed and running" in str(response.get_json()["errors"])
@@ -98,7 +103,7 @@ def test_enabling_auto_removal_succeeds_once_live_armed(client, app, database, l
     app.extensions["managearr"]["live_repo"].set_authorization_state("running", actor="test", reason="guard test")
     response = client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "testing"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "testing", "revision": 0},
     )
     assert response.status_code == 200
     assert response.get_json()["settings"]["auto_removal_enabled"] is True
@@ -109,8 +114,13 @@ def test_disabling_auto_removal_never_requires_confirmation(client, app, databas
     with database.connect() as conn:
         conn.execute("UPDATE scheduler_settings SET mode='live', updated_at=now() WHERE id=1")
     app.extensions["managearr"]["live_repo"].set_authorization_state("running", actor="test", reason="guard test")
-    client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={"auto_removal_enabled": True, "confirm": True, "reason": "x"})
-    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={"auto_removal_enabled": False})
+    client.put(
+        f"/api/v1/libraries/{library.id}/slow-download/settings",
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "x", "revision": 0},
+    )
+    response = client.put(
+        f"/api/v1/libraries/{library.id}/slow-download/settings", json={"auto_removal_enabled": False, "revision": 1}
+    )
     assert response.status_code == 200 and response.get_json()["settings"]["auto_removal_enabled"] is False
 
 
@@ -118,7 +128,9 @@ def test_loosening_thresholds_requires_confirm_only_when_auto_removal_enabled(cl
     library = make_sonarr_library(library_repo)
     # Monitoring-only (auto_removal disabled): any threshold change is safe
     # to make freely since nothing destructive can happen yet.
-    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={"strikes_required": 1})
+    response = client.put(
+        f"/api/v1/libraries/{library.id}/slow-download/settings", json={"strikes_required": 1, "revision": 0}
+    )
     assert response.status_code == 200
 
 
@@ -134,14 +146,14 @@ def test_loosening_while_auto_removal_enabled_requires_confirm_and_reason(client
     _arm_live_for_settings(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "initial enable"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "initial enable", "revision": 0},
     )
-    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={field: new})
+    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={field: new, "revision": 1})
     assert response.status_code == 400
     assert "confirm" in str(response.get_json()["errors"]).lower()
     confirmed = client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={field: new, "confirm": True, "reason": f"loosening {field}"},
+        json={field: new, "confirm": True, "reason": f"loosening {field}", "revision": 1},
     )
     assert confirmed.status_code == 200
 
@@ -155,9 +167,9 @@ def test_tightening_while_auto_removal_enabled_never_requires_confirm(client, ap
     _arm_live_for_settings(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "initial enable"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "initial enable", "revision": 0},
     )
-    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={field: new})
+    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={field: new, "revision": 1})
     assert response.status_code == 200
 
 
@@ -169,14 +181,14 @@ def test_boolean_destructive_loosening_while_auto_removal_enabled_requires_confi
     _arm_live_for_settings(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, field: False, "confirm": True, "reason": "initial enable"},
+        json={"auto_removal_enabled": True, field: False, "confirm": True, "reason": "initial enable", "revision": 0},
     )
-    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={field: True})
+    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={field: True, "revision": 1})
     assert response.status_code == 400
     assert "confirm" in str(response.get_json()["errors"]).lower()
     confirmed = client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={field: True, "confirm": True, "reason": f"loosening {field}"},
+        json={field: True, "confirm": True, "reason": f"loosening {field}", "revision": 1},
     )
     assert confirmed.status_code == 200
     assert confirmed.get_json()["settings"][field] is True
@@ -190,9 +202,9 @@ def test_boolean_protective_tightening_while_auto_removal_enabled_never_requires
     _arm_live_for_settings(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, field: True, "confirm": True, "reason": "initial enable"},
+        json={"auto_removal_enabled": True, field: True, "confirm": True, "reason": "initial enable", "revision": 0},
     )
-    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={field: False})
+    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={field: False, "revision": 1})
     assert response.status_code == 200
     assert response.get_json()["settings"][field] is False
 
@@ -202,14 +214,16 @@ def test_disabling_monitoring_while_auto_removal_enabled_safely_disables_removal
     _arm_live_for_settings(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "initial enable"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "initial enable", "revision": 0},
     )
     # Disabling monitoring is itself protective (it stops evidence from ever
     # reaching removal_pending) but leaving auto_removal_enabled=True active
     # with no monitoring would let an already-stale removal_pending item
     # still be auto-deleted with nothing watching it - so it must never
     # require confirm, and must force auto_removal_enabled off too.
-    response = client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={"monitoring_enabled": False})
+    response = client.put(
+        f"/api/v1/libraries/{library.id}/slow-download/settings", json={"monitoring_enabled": False, "revision": 1}
+    )
     assert response.status_code == 200
     settings = response.get_json()["settings"]
     assert settings["monitoring_enabled"] is False
@@ -223,7 +237,7 @@ def test_enabling_both_monitoring_off_and_auto_removal_in_one_request_is_rejecte
     _arm_live_for_settings(app, database)
     response = client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"monitoring_enabled": False, "auto_removal_enabled": True, "confirm": True, "reason": "x"},
+        json={"monitoring_enabled": False, "auto_removal_enabled": True, "confirm": True, "reason": "x", "revision": 0},
     )
     assert response.status_code == 200
     settings = response.get_json()["settings"]
@@ -252,7 +266,7 @@ def test_atomic_recheck_rejects_enable_even_if_preliminary_check_is_stale(client
     service = app.extensions["managearr"]["slow_download"]
     monkeypatch.setattr(service, "_live_status", lambda: {"allowed": True, "reasons": [], "generation": 0})
     updated, errors = service.update_settings(
-        library.id, {"auto_removal_enabled": True, "confirm": True, "reason": "test"}
+        library.id, {"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0}
     )
     assert updated is None
     assert any("Live" in e for e in errors)
@@ -291,7 +305,7 @@ def test_pause_blocks_on_the_enable_transaction_lock_rather_than_racing_in(
     def enable():
         response = client.put(
             f"/api/v1/libraries/{library.id}/slow-download/settings",
-            json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+            json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
         )
         outcome["status"] = response.status_code
         outcome["body"] = response.get_json()
@@ -348,7 +362,7 @@ def test_estop_blocks_on_the_enable_transaction_lock_rather_than_racing_in(
     def enable():
         response = client.put(
             f"/api/v1/libraries/{library.id}/slow-download/settings",
-            json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+            json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
         )
         outcome["status"] = response.status_code
         outcome["body"] = response.get_json()
@@ -387,7 +401,7 @@ def test_resume_after_a_correctly_rejected_enable_does_not_silently_activate_it(
     app.extensions["managearr"]["live_repo"].set_authorization_state("paused", actor="test", reason="paused")
     response = client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     assert response.status_code == 400
     app.extensions["managearr"]["live_repo"].set_authorization_state("running", actor="test", reason="resume")
@@ -398,7 +412,7 @@ def test_resume_after_a_correctly_rejected_enable_does_not_silently_activate_it(
 def test_settings_optimistic_concurrency_rejects_stale_revision(client, library_repo):
     library = make_sonarr_library(library_repo)
     current = client.get(f"/api/v1/libraries/{library.id}/slow-download/settings").get_json()["settings"]
-    client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={"strikes_required": 3})
+    client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={"strikes_required": 3, "revision": 0})
     stale = client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
         json={"strikes_required": 4, "revision": current["revision"]},
@@ -425,6 +439,29 @@ def test_poll_library_tracks_active_item_and_exempts_paused(client, app, library
     assert items[2]["classification"] == "exempt"
 
 
+@pytest.mark.parametrize("tracked_state,tracked_status", [("importblocked", None), (None, "warning"), (None, "error")])
+def test_poll_library_hard_exempts_import_blocked_or_warning_error_tracked_queue_items(
+    client, app, library_repo, slow_download_repo, monkeypatch, tracked_state, tracked_status
+):
+    """A queue record can report status "downloading" while Sonarr has
+    already flagged it trackedDownloadState=importBlocked or
+    trackedDownloadStatus=warning/error - exactly the import-failure
+    reason policy's territory (see test_import_failure_guard.py). This
+    guard must never accumulate stall/slow-speed evidence against it."""
+    library = make_sonarr_library(library_repo)
+    service = app.extensions["managearr"]["slow_download"]
+    monkeypatch.setattr(service, "client_factory", FakeQueueClient)
+    monkeypatch.setattr(service, "read_only_client_factory", FakeQueueClient)
+    reset_fake()
+    FakeQueueClient.records = [
+        queue_record(queue_id=1, status="downloading", tracked_state=tracked_state, tracked_status=tracked_status)
+    ]
+    service.poll_library(library.id)
+    item = slow_download_repo.list_current(library.id)[0]
+    assert item["classification"] == "exempt"
+    assert item["stall_strike_count"] == 0
+
+
 def test_poll_library_clears_disappeared_item_without_treating_as_import(client, app, library_repo, slow_download_repo, monkeypatch):
     library = make_sonarr_library(library_repo)
     service = app.extensions["managearr"]["slow_download"]
@@ -444,7 +481,9 @@ def test_poll_library_clears_disappeared_item_without_treating_as_import(client,
 
 def test_monitoring_disabled_does_not_poll(client, app, library_repo, slow_download_repo, monkeypatch):
     library = make_sonarr_library(library_repo)
-    client.put(f"/api/v1/libraries/{library.id}/slow-download/settings", json={"monitoring_enabled": False})
+    client.put(
+        f"/api/v1/libraries/{library.id}/slow-download/settings", json={"monitoring_enabled": False, "revision": 0}
+    )
     service = app.extensions["managearr"]["slow_download"]
     monkeypatch.setattr(service, "client_factory", FakeQueueClient)
     monkeypatch.setattr(service, "read_only_client_factory", FakeQueueClient)
@@ -519,7 +558,7 @@ def test_removal_blocked_when_not_live(client, app, library_repo, database, slow
     library = make_sonarr_library(library_repo)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": False},
+        json={"auto_removal_enabled": False, "revision": 0},
     )
     with database.connect() as conn:
         conn.execute(
@@ -542,7 +581,7 @@ def test_removal_completes_when_live_and_auto_removal_enabled(client, app, datab
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id, queue_id=42)
     service = app.extensions["managearr"]["slow_download"]
@@ -563,7 +602,7 @@ def test_at_most_one_removal_per_call(client, app, database, library_repo, slow_
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     _force_removal_pending(database, library.id, queue_id=1)
     _force_removal_pending(database, library.id, queue_id=2)
@@ -582,7 +621,7 @@ def test_typed_delete_outcomes_persist_safely(client, app, database, library_rep
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id)
     service = app.extensions["managearr"]["slow_download"]
@@ -600,7 +639,7 @@ def test_ambiguous_outcome_is_never_automatically_retried(client, app, database,
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id)
     service = app.extensions["managearr"]["slow_download"]
@@ -621,7 +660,7 @@ def test_queue_id_mismatch_cannot_delete_wrong_record(client, app, database, lib
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id, queue_id=99)
     service = app.extensions["managearr"]["slow_download"]
@@ -649,7 +688,7 @@ def test_pause_waits_for_attempt_boundary_then_delete_proceeds(client, app, data
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     _force_removal_pending(database, library.id)
     service = app.extensions["managearr"]["slow_download"]
@@ -690,7 +729,7 @@ def test_crash_after_accepted_delete_is_durably_ambiguous_and_never_resent(clien
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id)
 
@@ -734,7 +773,7 @@ def test_dedicated_marker_connection_works_with_pool_max_size_one(client, app, d
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id)
     single = Database(
@@ -764,7 +803,7 @@ def test_concurrent_worker_cycles_never_double_delete(client, app, database, lib
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     _force_removal_pending(database, library.id)
     reset_fake()
@@ -816,7 +855,7 @@ def test_delete_uses_settings_bound_under_authorization_lock(client, app, databa
     _arm_live(app, database)
     enabled = client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     ).get_json()["settings"]
     changed = client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
@@ -857,7 +896,7 @@ def test_revalidation_aborts_when_queue_record_disappeared(client, app, database
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id, queue_id=201)
     service = app.extensions["managearr"]["slow_download"]
@@ -881,7 +920,7 @@ def test_revalidation_aborts_when_status_no_longer_actively_downloading(
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id, queue_id=202)
     service = app.extensions["managearr"]["slow_download"]
@@ -896,12 +935,42 @@ def test_revalidation_aborts_when_status_no_longer_actively_downloading(
     assert item["classification"] == "exempt"
 
 
+@pytest.mark.parametrize("tracked_state,tracked_status", [("importblocked", None), (None, "warning"), (None, "error")])
+def test_revalidation_aborts_when_live_record_is_hard_exempt_tracked(
+    client, app, database, library_repo, slow_download_repo, monkeypatch, tracked_state, tracked_status
+):
+    """Even when status/sizeleft/download_id all still match stored
+    evidence exactly, a live record Sonarr has since flagged
+    trackedDownloadState=importBlocked or trackedDownloadStatus=warning/
+    error must never be deleted by this guard - that is the import-failure
+    reason policy's exclusive territory."""
+    library = make_sonarr_library(library_repo)
+    _arm_live(app, database)
+    client.put(
+        f"/api/v1/libraries/{library.id}/slow-download/settings",
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
+    )
+    item_id = _force_removal_pending(database, library.id, queue_id=209)
+    service = app.extensions["managearr"]["slow_download"]
+    monkeypatch.setattr(service, "client_factory", FakeQueueClient)
+    monkeypatch.setattr(service, "read_only_client_factory", FakeQueueClient)
+    reset_fake()
+    FakeQueueClient.records = [
+        queue_record(queue_id=209, tracked_state=tracked_state, tracked_status=tracked_status)
+    ]
+    outcomes = service.attempt_removals(max_removals=1)
+    assert outcomes == []
+    _assert_no_marker_and_no_delete(database, item_id)
+    item = slow_download_repo.get(item_id)
+    assert item["classification"] == "exempt"
+
+
 def test_revalidation_aborts_when_download_identity_changed(client, app, database, library_repo, slow_download_repo, monkeypatch):
     library = make_sonarr_library(library_repo)
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id, queue_id=203)
     service = app.extensions["managearr"]["slow_download"]
@@ -926,7 +995,7 @@ def test_revalidation_aborts_when_progress_changed_materially(
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id, queue_id=204)  # stored sizeleft_bytes = 5 GiB
     service = app.extensions["managearr"]["slow_download"]
@@ -947,7 +1016,7 @@ def test_revalidation_fails_closed_on_sonarr_error(client, app, database, librar
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id, queue_id=205)
 
@@ -979,7 +1048,7 @@ def test_revalidation_passes_when_live_queue_matches_stored_evidence_exactly(
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     item_id = _force_removal_pending(database, library.id, queue_id=206)
     service = app.extensions["managearr"]["slow_download"]
@@ -1043,7 +1112,15 @@ def test_poll_library_stops_and_fails_closed_when_lease_lost_mid_poll(
     result = service.poll_library(library.id, heartbeat=lambda: False)
     assert "lease" in result["error"]
     assert result["cleared"] == 0
-    assert result["polled"] == 100  # only the first page was read before the lease check failed
+    # An incomplete snapshot suppresses *all* classification, not just
+    # disappearance reconciliation - the first page's records are never
+    # folded into durable tracking state even though they were fetched,
+    # since the overall read never proved complete.
+    assert result["polled"] == 0
+    # No newly-fetched record (queue ids 1..250) was folded into durable
+    # tracking state - only the pre-existing, unrelated item (9999)
+    # inserted above the poll under test remains.
+    assert {item["sonarr_queue_id"] for item in slow_download_repo.list_current(library.id, limit=500)} == {9999}
     # Disappearance reconciliation never ran on the incomplete read.
     assert slow_download_repo.get(existing["id"])["classification"] != "removed"
 
@@ -1053,7 +1130,7 @@ def test_attempt_removals_never_deletes_when_lease_already_lost(client, app, dat
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     _force_removal_pending(database, library.id, queue_id=88)
     service = app.extensions["managearr"]["slow_download"]
@@ -1071,7 +1148,7 @@ def test_attempt_removals_stops_deleting_once_lease_is_lost_mid_iteration(
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/slow-download/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
     )
     _force_removal_pending(database, library.id, queue_id=1)
     _force_removal_pending(database, library.id, queue_id=2)
@@ -1083,10 +1160,13 @@ def test_attempt_removals_stops_deleting_once_lease_is_lost_mid_iteration(
 
     def heartbeat():
         calls["n"] += 1
-        # True for the top-of-call check and the pre-DELETE check on the
-        # first item; False on the pre-DELETE check for the second item -
-        # the lease is lost between the two removal attempts.
-        return calls["n"] <= 2
+        # True for the top-of-call check, the pre-attempt check on the
+        # first item, and that first item's own destructive-boundary
+        # recheck (immediately before its marker/DELETE); False on the
+        # pre-attempt check for the second item - the lease is lost
+        # between the two removal attempts, so the second item is never
+        # even revalidated.
+        return calls["n"] <= 3
 
     outcomes = service.attempt_removals(max_removals=2, heartbeat=heartbeat)
     assert len(outcomes) == 1

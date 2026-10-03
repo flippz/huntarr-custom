@@ -21,6 +21,7 @@ from ..adapters.sonarr_client import (
     SonarrPostAmbiguousError,
     SonarrPostRejectedError,
 )
+from ..domain.slow_download import is_exempt_tracked
 
 QUEUE_MAX_PAGES = 10
 QUEUE_PAGE_SIZE = 100
@@ -76,7 +77,14 @@ class SlowDownloadService:
         if not isinstance(payload, dict):
             return None, ["request body must be an object"]
         current = self.repo.settings(library_id)
-        expected_revision = payload.get("revision", current["revision"])
+        if "revision" not in payload:
+            # Optimistic concurrency is only meaningful if every caller is
+            # forced to prove they have actually seen current settings -
+            # an omitted revision must never silently fall back to
+            # whatever this preliminary read happens to return, or the
+            # check becomes a no-op for any caller that skips it.
+            return None, ["revision is required"]
+        expected_revision = payload["revision"]
         if not isinstance(expected_revision, int) or isinstance(expected_revision, bool):
             return None, ["revision must be an integer"]
         data = {k: v for k, v in payload.items() if k != "revision"}
@@ -178,7 +186,16 @@ class SlowDownloadService:
         multi-page read instead of only once per whole iteration. If it
         returns falsy - the lease was lost - the read stops immediately and
         is treated exactly like a truncated/bounded read: no disappearance
-        reconciliation runs on an incomplete snapshot."""
+        reconciliation runs on an incomplete snapshot.
+
+        Every page is first collected into memory (bounded to at most
+        ``QUEUE_MAX_PAGES * QUEUE_PAGE_SIZE`` records) *before* any
+        record is classified: an incomplete snapshot - the queue exceeded
+        the bound, Sonarr errored mid-read, or the lease was lost - must
+        suppress classification entirely, not just disappearance
+        reconciliation, since a partial read not only can't prove
+        disappearance, it also isn't a safe basis for scoring individual
+        records either."""
         library = self.libraries.get(library_id)
         if not library or library.type != "sonarr" or not library.enabled:
             return {"library_id": library_id, "polled": 0, "error": "library not available"}
@@ -186,17 +203,13 @@ class SlowDownloadService:
         if not settings["monitoring_enabled"]:
             return {"library_id": library_id, "polled": 0, "skipped": "monitoring disabled"}
         client = self._read_only_client(library)
-        present_queue_ids = set()
-        polled = 0
+        fetched_records = []
         queue_complete = False
         lease_lost = False
         try:
             for page in range(1, QUEUE_MAX_PAGES + 1):
                 result = client.get_queue_details(page=page, page_size=QUEUE_PAGE_SIZE)
-                for record in result["records"]:
-                    present_queue_ids.add(record["queue_id"])
-                    self.repo.record_observation(library_id, record, settings)
-                    polled += 1
+                fetched_records.extend(result["records"])
                 if page * QUEUE_PAGE_SIZE >= result["total_records"]:
                     queue_complete = True
                     break
@@ -207,20 +220,26 @@ class SlowDownloadService:
             # Fail closed: any telemetry uncertainty from this poll never
             # triggers removal logic below, and existing evidence is left
             # untouched rather than guessed at.
-            return {"library_id": library_id, "polled": polled, "error": str(exc)}
+            return {"library_id": library_id, "polled": 0, "error": str(exc)}
         if lease_lost:
             return {
-                "library_id": library_id, "polled": polled, "cleared": 0,
+                "library_id": library_id, "polled": 0, "cleared": 0,
                 "error": "scheduler lease lost during bounded queue read; disappearance reconciliation skipped",
             }
-        # Never infer disappearance from a deliberately bounded/truncated
-        # queue read. Existing evidence remains untouched until a complete
-        # Sonarr queue snapshot proves that a record is gone.
         if not queue_complete:
             return {
-                "library_id": library_id, "polled": polled, "cleared": 0,
-                "error": f"Sonarr queue exceeded the bounded {QUEUE_MAX_PAGES * QUEUE_PAGE_SIZE}-record read; disappearance reconciliation skipped",
+                "library_id": library_id, "polled": 0, "cleared": 0,
+                "error": f"Sonarr queue exceeded the bounded {QUEUE_MAX_PAGES * QUEUE_PAGE_SIZE}-record read; classification skipped",
             }
+        present_queue_ids = set()
+        polled = 0
+        for record in fetched_records:
+            present_queue_ids.add(record["queue_id"])
+            self.repo.record_observation(library_id, record, settings)
+            polled += 1
+        # queue_complete is guaranteed True here (checked above, before any
+        # classification ran) - disappearance reconciliation always runs
+        # against a complete snapshot, never a bounded/truncated one.
         cleared = self.repo.clear_disappeared(library_id, present_queue_ids)
         return {"library_id": library_id, "polled": polled, "cleared": cleared}
 
@@ -290,14 +309,14 @@ class SlowDownloadService:
                     continue
                 if heartbeat is not None and not heartbeat():
                     return outcomes
-                outcome = self._attempt_removal(library, item, live_status["generation"])
+                outcome = self._attempt_removal(library, item, live_status["generation"], heartbeat=heartbeat)
                 if outcome is not None:
                     outcomes.append(outcome)
                 if len(outcomes) >= max_removals:
                     break
         return outcomes
 
-    def _attempt_removal(self, library, item: dict, expected_generation: int) -> dict | None:
+    def _attempt_removal(self, library, item: dict, expected_generation: int, *, heartbeat=None) -> dict | None:
         with self.repo.authorized_removal(
             item["id"], expected_generation, expected_url=library.url, expected_api_key=library.api_key
         ) as (conn, row, error):
@@ -325,6 +344,14 @@ class SlowDownloadService:
                     row, "exempt", f"queue record is now {current['status']} or has no bytes remaining", conn=conn
                 )
                 return None
+            if is_exempt_tracked(current.get("tracked_state"), current.get("tracked_status")):
+                self.repo.abort_revalidated_removal(
+                    row, "exempt",
+                    f"trackedDownloadState '{current.get('tracked_state')}'/trackedDownloadStatus "
+                    f"'{current.get('tracked_status')}' is hard-exempt from removal",
+                    conn=conn,
+                )
+                return None
             if row.get("download_id") and current.get("download_id") != row["download_id"]:
                 self.repo.abort_revalidated_removal(
                     row, "ambiguous", "queue record download identity changed before removal", conn=conn
@@ -341,6 +368,16 @@ class SlowDownloadService:
                 self.repo.abort_revalidated_removal(
                     row, "healthy", "remaining bytes changed materially before removal; evidence reset", conn=conn
                 )
+                return None
+            # The final live queue read above can issue up to
+            # QUEUE_MAX_PAGES network round trips; re-verify this worker
+            # still owns its scheduler lease at the destructive boundary -
+            # immediately before the durable marker and the DELETE - rather
+            # than trusting the single heartbeat check that preceded the
+            # (possibly long) revalidation read. A lost lease fails closed:
+            # no marker, no DELETE, and the item is left exactly as found
+            # for whichever worker now holds the lease to reconsider.
+            if heartbeat is not None and not heartbeat():
                 return None
             self.repo.mark_removal_attempt_started(row, conn=conn)
             client = self._client(library)

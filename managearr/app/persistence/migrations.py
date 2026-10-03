@@ -1681,6 +1681,22 @@ MIGRATIONS: list[Migration] = [
                 FOR EACH ROW EXECUTE FUNCTION protect_import_failure_append_only();
         """,
     ),
+    Migration(
+        version=16,
+        name="slow_download_tracked_status_hard_exempt",
+        sql="""
+            -- The slow-download guard originally only recorded
+            -- trackedDownloadState, never trackedDownloadStatus, so it had
+            -- no way to hard-exempt a queue record Sonarr has already
+            -- flagged with a warning/error tracked status - exactly the
+            -- import-failure reason policy's territory. Add the missing
+            -- column (nullable, same bound/shape as import_failure_
+            -- queue_items.tracked_status) so observation and the final
+            -- live pre-DELETE revalidation can both check it.
+            ALTER TABLE slow_download_queue_items
+                ADD COLUMN tracked_status TEXT NULL CHECK (tracked_status IS NULL OR length(tracked_status) <= 64);
+        """,
+    ),
 ]
 
 

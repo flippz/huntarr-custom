@@ -108,30 +108,51 @@ assert sum(len(keys) for _, keys in REASON_GROUPS) == len(REMOVAL_SELECTABLE_REA
 
 
 def _humanize(token: str) -> str:
-    """"NotQualityUpgrade" -> "not quality upgrade". Used only as a
-    best-effort substring pattern for matching Sonarr's human-readable
-    queue status messages; the literal PascalCase token is also matched
-    directly so a message or title that already carries the raw reason
-    name (as some callers/tests do) is recognized without relying on
-    phrasing at all."""
+    """"NotQualityUpgrade" -> "not quality upgrade". Used as a best-effort
+    word-bounded pattern for matching Sonarr's human-readable queue status
+    messages; the literal PascalCase token is also matched directly so a
+    message or title that already carries the raw reason name (as some
+    callers/tests do) is recognized without relying on phrasing at all."""
     return re.sub(r"(?<!^)(?=[A-Z])", " ", token).lower()
 
 
-# Longest-token-first so e.g. "EpisodeAlreadyImported" is preferred over a
-# coincidental shorter overlap before a generic fallback is considered.
-_PATTERNS: tuple[tuple[str, str], ...] = tuple(
-    sorted(
-        ((key, _humanize(key)) for key in IMPORT_REJECTION_REASONS if key != _UNKNOWN_REASON_KEY),
-        key=lambda pair: len(pair[1]),
-        reverse=True,
-    )
+# "Error" (humanized: the single word "error") is excluded from the
+# word-boundary pattern set below. Every *other* reason's token/phrase is
+# distinctive enough that a whole-word match anywhere in a message is safe
+# signal, but "error" alone is an ordinary, highly generic English word -
+# matching it anywhere would misclassify unrelated text (a download
+# client's own "filesystem error" message is not Sonarr's "Error" import-
+# rejection reason). "Unknown" has the same problem and is handled the same
+# way. Both are only ever matched against the *complete* (trimmed,
+# case-insensitive) message - see ``_EXACT_MATCH_KEYS`` below - never as a
+# substring of a longer sentence.
+_EXACT_ONLY_REASON_KEYS: frozenset[str] = frozenset({"Error"})
+_EXACT_MATCH_KEYS: dict[str, str] = {"error": "Error", _UNKNOWN_REASON_KEY.lower(): _UNKNOWN_REASON_KEY}
+
+
+def _boundary_pattern(phrase: str) -> re.Pattern[str]:
+    # (?<!\w)...(?!\w) rather than \b on both ends: \b alone still fires
+    # between two different "word" boundaries fine for our ASCII catalog,
+    # but spelling it as a non-word lookaround either side is unambiguous
+    # about intent - the phrase must stand on its own, not be glued to
+    # other letters/digits on either side (so "Sample" never matches
+    # inside "sampler", and "SampleIndeterminate" never lets its own
+    # "Sample" prefix also register separately - see the overlap
+    # suppression in ``_match_keys``).
+    return re.compile(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", re.IGNORECASE)
+
+
+# Every (key, compiled pattern) considered for word-boundary matching - both
+# the literal PascalCase token and the humanized phrasing, for every
+# canonical key except the exact-only generic words above. A key
+# contributes one pattern per distinct phrase (token vs. humanized); either
+# one matching counts as that key matching.
+_BOUNDARY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (key, _boundary_pattern(phrase))
+    for key in IMPORT_REJECTION_REASONS
+    if key != _UNKNOWN_REASON_KEY and key not in _EXACT_ONLY_REASON_KEYS
+    for phrase in {key, _humanize(key)}
 )
-
-
-@dataclass(frozen=True)
-class NormalizedMessage:
-    raw: str
-    reason_key: str | None  # None means unmatched - always "leave"
 
 
 @dataclass(frozen=True)
@@ -144,37 +165,59 @@ class NormalizationResult:
         return bool(self.matched_reasons) or bool(self.unmatched_messages)
 
 
-def _normalize_one(raw: str) -> NormalizedMessage:
-    trimmed = raw.strip()
+def _match_keys(trimmed: str) -> frozenset[str]:
+    """Every reason key safely recognizable in one trimmed message.
+
+    Exact allowlisted phrase/pattern boundaries only: a word-bounded
+    token/phrase match for every ordinary reason, or a complete-message
+    match for the two generic single-word keys. When two matches overlap
+    (e.g. "Sample" inside "SampleIndeterminate"), only the longest/most
+    specific span wins - the shorter one is suppressed, never both.
+    Matches at genuinely different, non-overlapping spans are all kept,
+    so a message naming more than one reason returns every one of them.
+    Zero matches - including any residual text no pattern explains - is
+    reported as unmatched (see ``normalize_messages``), never guessed."""
     if trimmed == SERIES_MATCHED_BY_ID_MESSAGE:
-        return NormalizedMessage(raw=raw, reason_key=SERIES_MATCHED_BY_ID_REASON_KEY)
-    lowered = trimmed.lower()
-    for key, humanized in _PATTERNS:
-        if key.lower() in lowered or humanized in lowered:
-            return NormalizedMessage(raw=raw, reason_key=key)
-    if _UNKNOWN_REASON_KEY.lower() in lowered:
-        return NormalizedMessage(raw=raw, reason_key=_UNKNOWN_REASON_KEY)
-    return NormalizedMessage(raw=raw, reason_key=None)
+        return frozenset({SERIES_MATCHED_BY_ID_REASON_KEY})
+    spans: list[tuple[int, int, str]] = [
+        (m.start(), m.end(), key) for key, pattern in _BOUNDARY_PATTERNS for m in pattern.finditer(trimmed)
+    ]
+    exact_key = _EXACT_MATCH_KEYS.get(trimmed.lower())
+    if exact_key is not None:
+        spans.append((0, len(trimmed), exact_key))
+    if not spans:
+        return frozenset()
+    spans.sort(key=lambda s: (-(s[1] - s[0]), s[0]))
+    selected_spans: list[tuple[int, int]] = []
+    keys: set[str] = set()
+    for start, end, key in spans:
+        if any(start < s_end and end > s_start for s_start, s_end in selected_spans):
+            continue
+        selected_spans.append((start, end))
+        keys.add(key)
+    return frozenset(keys)
 
 
 def normalize_messages(messages: list[str]) -> NormalizationResult:
     """Classify a bounded list of raw Sonarr queue status message strings.
 
-    Pure/no I/O. Each message is matched independently; the result is the
-    union of every matched canonical/synthetic reason key, plus every
-    message that could not be matched at all (always "leave" - see
-    ``evaluate`` below, which never guesses an unmatched message into any
-    removal-eligible bucket)."""
+    Pure/no I/O. Each message is matched independently against the
+    allowlisted catalog patterns (see ``_match_keys``); the result is the
+    union of every matched canonical/synthetic reason key across every
+    message, plus every message that could not be safely matched at all
+    (always "leave" - see ``evaluate`` below, which never guesses an
+    unmatched message into any removal-eligible bucket, so removal
+    requires every message to map safely, not just some of them)."""
     matched: set[str] = set()
     unmatched: list[str] = []
     for raw in messages:
         if not isinstance(raw, str) or not raw.strip():
             continue
-        normalized = _normalize_one(raw)
-        if normalized.reason_key is None:
-            unmatched.append(raw)
+        keys = _match_keys(raw.strip())
+        if keys:
+            matched.update(keys)
         else:
-            matched.add(normalized.reason_key)
+            unmatched.append(raw)
     return NormalizationResult(matched_reasons=frozenset(matched), unmatched_messages=tuple(unmatched))
 
 

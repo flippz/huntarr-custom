@@ -602,7 +602,7 @@ def test_v6_live_control_bounds_are_enforced(database):
 
 
 def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(database):
-    assert [item.version for item in MIGRATIONS[-7:]] == [9, 10, 11, 12, 13, 14, 15]
+    assert [item.version for item in MIGRATIONS[-7:]] == [10, 11, 12, 13, 14, 15, 16]
     migration = next(item for item in MIGRATIONS if item.version == 8)
     with database.connect() as conn:
         conn.execute(

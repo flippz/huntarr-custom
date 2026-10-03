@@ -419,7 +419,7 @@ loadPolicy().catch(err => toast('Failed to load hunting policy: ' + err.message)
   async function loadSpLibraries() {
     const body = await spApi('/api/v1/libraries');
     libraries = body.libraries.filter(x => x.type === 'sonarr' && x.enabled);
-    $('sp-library').innerHTML = libraries.map(x => '<option value="' + x.id + '">' + x.name + '</option>').join('');
+    setSelectOptions($('sp-library'), libraries, x => x.name, x => x.id);
     if (libraries.length) await loadSpSettings();
   }
   async function loadSpSettings() {
@@ -428,7 +428,9 @@ loadPolicy().catch(err => toast('Failed to load hunting policy: ' + err.message)
     const s = settingsBody.settings;
     $('sp-enabled').checked = s.enabled; $('sp-cutoff').checked = s.allow_cutoff_override;
     $('sp-protocol').value = s.protocol || 'usenet'; $('sp-cap').value = s.hourly_grab_cap; $('sp-cooldown').value = s.cooldown_minutes; $('sp-pacing').value = s.pacing_seconds;
-    $('sp-client').innerHTML = clientsBody.clients.filter(x => x.enabled).map(x => '<option data-protocol="' + x.protocol + '" value="' + x.id + '">' + x.name + ' (' + x.protocol + ')</option>').join('');
+    const enabledClients = clientsBody.clients.filter(x => x.enabled);
+    setSelectOptions($('sp-client'), enabledClients, x => `${x.name} (${x.protocol})`, x => x.id);
+    enabledClients.forEach((x, i) => { $('sp-client').options[i].dataset.protocol = x.protocol; });
     if (s.download_client_id) $('sp-client').value = String(s.download_client_id);
   }
   $('sp-library').addEventListener('change', () => loadSpSettings().catch(showSp));
@@ -465,7 +467,7 @@ loadPolicy().catch(err => toast('Failed to load hunting policy: ' + err.message)
   async function loadSdgLibraries() {
     const body = await sdgApi('/api/v1/libraries');
     const libraries = body.libraries.filter(x => x.type === 'sonarr' && x.enabled);
-    $('sdg-library').innerHTML = libraries.map(x => '<option value="' + x.id + '">' + x.name + '</option>').join('');
+    setSelectOptions($('sdg-library'), libraries, x => x.name, x => x.id);
     if (libraries.length) await loadSdgSettings();
   }
   function MiB(bytes) { return bytes / (1024 * 1024); }
@@ -538,8 +540,10 @@ loadPolicy().catch(err => toast('Failed to load hunting policy: ' + err.message)
     };
     if ($('sdg-confirm-wrap').hidden === false) {
       if (!$('sdg-confirm-check').checked) return showSdg('Tick the explicit confirmation first.');
+      const reasonText = $('sdg-reason').value.trim();
+      if (!reasonText) return showSdg('Enter a reason for this change first.');
       payload.confirm = true;
-      payload.reason = $('sdg-reason').value || 'operator confirmed from Sonarr workspace';
+      payload.reason = reasonText;
     }
     const body = await sdgApi('/api/v1/libraries/' + $('sdg-library').value + '/slow-download/settings', { method: 'PATCH', body: JSON.stringify(payload) });
     currentSettings = body.settings;
@@ -594,7 +598,7 @@ loadPolicy().catch(err => toast('Failed to load hunting policy: ' + err.message)
   async function loadIfpLibraries() {
     const body = await ifpApi('/api/v1/libraries');
     const libraries = body.libraries.filter(x => x.type === 'sonarr' && x.enabled);
-    $('ifp-library').innerHTML = libraries.map(x => '<option value="' + x.id + '">' + x.name + '</option>').join('');
+    setSelectOptions($('ifp-library'), libraries, x => x.name, x => x.id);
     if (libraries.length) await loadIfpSettings();
   }
   async function loadIfpSettings() {
@@ -668,8 +672,10 @@ loadPolicy().catch(err => toast('Failed to load hunting policy: ' + err.message)
     };
     if (needsConfirm) {
       if (!$('ifp-confirm-check').checked) return showIfp('Tick the explicit confirmation first.');
+      const reasonText = $('ifp-reason').value.trim();
+      if (!reasonText) return showIfp('Enter a reason for this change first.');
       payload.confirm = true;
-      payload.reason = $('ifp-reason').value || 'operator confirmed from Sonarr workspace';
+      payload.reason = reasonText;
     }
     const body = await ifpApi('/api/v1/libraries/' + $('ifp-library').value + '/import-failure/settings', { method: 'PATCH', body: JSON.stringify(payload) });
     currentSettings = body.settings;

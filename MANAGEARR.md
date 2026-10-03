@@ -130,13 +130,22 @@ asserted at import time to exactly match the selectable set, so the
 grouping can never silently drift out of sync with the catalog.
 
 Raw Sonarr queue status messages/error text are normalized against this
-catalog with a single uniform, best-effort rule - a literal PascalCase
-token match or a humanized ("NotQualityUpgrade" -> "not quality upgrade")
-substring match, longest/most-specific pattern first - rather than a
-hand-tuned phrase table per reason. A message that matches nothing is
-never guessed into a bucket: it is recorded as its own "unmatched" message,
-surfaced to the operator (Slow-download guard tab, "Observed unmatched
-messages"), and is always left. Removal eligibility
+catalog with a single uniform, allowlisted rule - a word-bounded literal
+PascalCase token match or a word-bounded humanized ("NotQualityUpgrade" ->
+"not quality upgrade") phrase match, for every reason except the two
+generic single-word keys `Error`/`Unknown`, which only ever match a
+*complete* trimmed message, never a substring of a longer sentence - rather
+than a hand-tuned phrase table per reason or unrestricted substring
+matching (see "Review hardening pass" below for why: unrestricted
+substring matching previously let a download client's own "filesystem
+error" message or the word "sampler" misclassify as `Error`/`Sample`). A
+single message can resolve to more than one matched reason when it
+genuinely names more than one at non-overlapping spans; overlapping spans
+(e.g. `Sample` inside `SampleIndeterminate`) resolve to only the longest/
+most specific one. A message that matches nothing is never guessed into a
+bucket: it is recorded as its own "unmatched" message, surfaced to the
+operator (Slow-download guard tab, "Observed unmatched messages"), and is
+always left. Removal eligibility
 (`app.domain.import_failure.evaluate`) requires automatic removal enabled
 for the library, zero unmatched messages on the item, `Unknown` absent
 from its matched reasons, and every matched reason a member of the
@@ -229,6 +238,110 @@ download guard - Pause-vs-DELETE, crash-immediately-after-accepted-DELETE-
 before-persistence (never resent), a `max_size=1` connection pool, racing
 worker cycles, and every final-revalidation-abort case (disappeared,
 identity changed, no longer watched, reasons drifted, Sonarr unreachable).
+
+**Review hardening pass.** A follow-up review of this milestone and the
+slow-download guard it reuses found and closed several additional gaps:
+
+- Reason matching (`app/domain/import_failure.py`) moved from unrestricted
+  first-substring matching to exact, word-bounded phrase/token matching
+  for every reason except the two generic single-word keys
+  `Error`/`Unknown`, which only ever match a *complete* trimmed message -
+  never a substring of a longer sentence (a download client's own
+  "filesystem error" is not Sonarr's `Error` reason, and "sampler" is not
+  `Sample`). A single message can now resolve to more than one matched
+  key when it genuinely names more than one reason at non-overlapping
+  spans; overlapping spans (e.g. `Sample` inside `SampleIndeterminate`)
+  still resolve to only the longest/most specific one. `evaluate()`'s
+  existing "every matched reason must be selected, and any unmatched
+  message forces leave" rule is unchanged and now covers multi-reason
+  single messages too.
+- The slow-download guard now also hard-exempts a queue record whose
+  `trackedDownloadState` is `importBlocked` or `trackedDownloadStatus` is
+  `warning`/`error` - the import-failure reason policy's territory -
+  during observation (`app/domain/slow_download.py::classify`) *and* at
+  the final live pre-DELETE revalidation
+  (`SlowDownloadService._attempt_removal`), freezing both evidence
+  windows exactly like any other exempt status. Schema v16 adds the
+  `tracked_status` column `slow_download_queue_items` was missing (only
+  `tracked_state` was ever persisted).
+- Both guards' `_attempt_removal` now re-verify the worker's scheduler
+  lease (`heartbeat()`) immediately before the durable attempt marker and
+  the DELETE - not only before the (possibly multi-page) final queue
+  revalidation that precedes it - so a lease lost during that revalidation
+  read can never be followed by a destructive write under a lease this
+  worker no longer holds.
+- Import-failure removal now requires a nonempty `download_id` on *both*
+  the stored evidence and the freshly re-read live record, compared
+  unconditionally (never skipped just because one side happens to be
+  empty) - an item observed without a download identity can never become
+  `remove_eligible` in the first place (`ImportFailureRepository
+  .record_observation`), and if one somehow reaches final revalidation
+  missing it anyway, that revalidation aborts to `ambiguous` rather than
+  proceeding.
+- Settings mutations for both guards now require the caller to supply
+  `revision` explicitly (a missing field is rejected, never silently
+  defaulted to whatever the service's own preliminary read returned), and
+  the repository locks (`FOR UPDATE`) the complete current settings row
+  *and* the complete current reason selection before comparing revisions
+  or merging the incoming change - never against an earlier, unlocked
+  snapshot a concurrent writer could already have moved past. Because the
+  revision check now runs against that same lock, any such concurrent
+  write is caught by "settings were changed by someone else; reload and
+  try again" before the merge ever happens.
+- Four library/download-client `<select>` dropdowns (Season packs, the
+  slow-download guard, and the import-failure policy tabs) built their
+  `<option>` list by string-concatenating the operator-entered name
+  straight into `innerHTML`, unescaped - a stored-XSS path distinct from
+  (and missed by) the existing `escapeHtml`-disciplined queue/activity
+  tables. They now build options via `setSelectOptions()`
+  (`app/web/static/app.js`), which uses the DOM `Option` constructor and
+  `textContent` exclusively - never HTML-parsed, so arbitrary markup in a
+  library or download-client name can never execute.
+- The slow-download guard and import-failure policy tabs no longer
+  fabricate a default audit reason (`'operator confirmed from Sonarr
+  workspace'`) when an operator leaves the reason field blank before
+  confirming a destructive change; the client now blocks the save and
+  asks for a real reason. The server-side nonblank-reason check
+  (`update_settings`) was already enforcing this independently and still
+  is - the client-side fix only removes a UI path that could previously
+  mask the operator never having typed anything.
+- Queue enumeration completeness (`poll_library`, both guards) now gates
+  *all* classification, not only disappearance reconciliation: every page
+  is collected first, and if the bounded read (`QUEUE_MAX_PAGES *
+  QUEUE_PAGE_SIZE` records) turns out incomplete - the bound was
+  exceeded, Sonarr errored mid-read, or the scheduler lease was lost -
+  nothing fetched this cycle is folded into durable tracking state at
+  all. Final pre-DELETE revalidation (`_find_live_queue_record`) already
+  failed closed (raises) on the same bound and is unchanged.
+- Catalog size reconfirmed: exactly 34 current upstream Sonarr v4
+  `ImportRejectionReason` enum values (including `Unknown`) plus the one
+  synthetic `SeriesMatchedByIdOnly` queue-only key = 35 total
+  (`ALL_REASON_KEYS`); 34 of those (everything except `Unknown`) are
+  removal-selectable. This was already accurate in code/docs/tests and is
+  now additionally pinned by an explicit `len(ALL_REASON_KEYS) == 35`
+  test.
+
+**Perimeter risk knowingly kept.** `ImportFailureService.update_settings`
+(and the slow-download guard's equivalent) still decides whether a given
+change *requires* `confirm`/`reason` (newly selecting a reason, enabling or
+loosening removal) from a preliminary, non-transactional read taken before
+the authoritative, lock-protected write - the same documented shape the
+Live-armed preflight check has always used here. A request racing a
+concurrent policy change in the few microseconds between that preliminary
+read and the locked write could in principle be judged against a
+just-stale view of *which* reasons are newly added. In practice this is
+now narrow: the mandatory, lock-checked `revision` match means any
+concurrent settings write that already committed is caught by the
+optimistic-concurrency check before the merge ever happens, so the
+remaining window is only a same-request, same-caller race against another
+write that commits in between this request's preliminary read and its own
+locked write - not a window where a stale read of someone else's prior
+write can slip through unnoticed. Closing it completely would mean
+re-deriving the full loosening/confirm rule set a second time inside the
+locked transaction (duplicating `SETTINGS_RANGES`-style threshold logic
+for the slow-download guard); left open deliberately rather than doubling
+that surface, consistent with how the Live-armed check already accepts
+this same shape of risk.
 
 ## Previous milestone: Sonarr-only slow-download guard
 

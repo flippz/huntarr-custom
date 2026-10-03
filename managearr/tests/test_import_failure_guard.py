@@ -95,7 +95,9 @@ def test_reasons_api_endpoint_returns_groups_and_special_message(client):
 
 def test_enabling_auto_removal_requires_confirm_and_reason(client, library_repo):
     library = make_sonarr_library(library_repo)
-    response = client.put(f"/api/v1/libraries/{library.id}/import-failure/settings", json={"auto_removal_enabled": True})
+    response = client.put(
+        f"/api/v1/libraries/{library.id}/import-failure/settings", json={"auto_removal_enabled": True, "revision": 0}
+    )
     assert response.status_code == 400
     assert "confirm" in str(response.get_json()["errors"]).lower()
 
@@ -104,7 +106,7 @@ def test_enabling_auto_removal_requires_live_armed(client, library_repo):
     library = make_sonarr_library(library_repo)
     response = client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "testing"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "testing", "revision": 0},
     )
     assert response.status_code == 400
     assert "armed and running" in str(response.get_json()["errors"])
@@ -115,7 +117,7 @@ def test_enabling_auto_removal_succeeds_once_live_armed(client, app, database, l
     _arm_live(app, database)
     response = client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"auto_removal_enabled": True, "confirm": True, "reason": "testing"},
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "testing", "revision": 0},
     )
     assert response.status_code == 200
     assert response.get_json()["settings"]["auto_removal_enabled"] is True
@@ -124,8 +126,13 @@ def test_enabling_auto_removal_succeeds_once_live_armed(client, app, database, l
 def test_disabling_auto_removal_never_requires_confirmation(client, app, database, library_repo):
     library = make_sonarr_library(library_repo)
     _arm_live(app, database)
-    client.put(f"/api/v1/libraries/{library.id}/import-failure/settings", json={"auto_removal_enabled": True, "confirm": True, "reason": "x"})
-    response = client.put(f"/api/v1/libraries/{library.id}/import-failure/settings", json={"auto_removal_enabled": False})
+    client.put(
+        f"/api/v1/libraries/{library.id}/import-failure/settings",
+        json={"auto_removal_enabled": True, "confirm": True, "reason": "x", "revision": 0},
+    )
+    response = client.put(
+        f"/api/v1/libraries/{library.id}/import-failure/settings", json={"auto_removal_enabled": False, "revision": 1}
+    )
     assert response.status_code == 200 and response.get_json()["settings"]["auto_removal_enabled"] is False
 
 
@@ -136,13 +143,14 @@ def test_selecting_a_reason_always_requires_confirm_even_with_auto_removal_off(c
     # pre-armed for a later, unconfirmed enable.
     library = make_sonarr_library(library_repo)
     response = client.put(
-        f"/api/v1/libraries/{library.id}/import-failure/settings", json={"removal_reasons": ["Sample", "Unpacking"]}
+        f"/api/v1/libraries/{library.id}/import-failure/settings",
+        json={"removal_reasons": ["Sample", "Unpacking"], "revision": 0},
     )
     assert response.status_code == 400
     assert "confirm" in str(response.get_json()["errors"]).lower()
     confirmed = client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"removal_reasons": ["Sample", "Unpacking"], "confirm": True, "reason": "preselect"},
+        json={"removal_reasons": ["Sample", "Unpacking"], "confirm": True, "reason": "preselect", "revision": 0},
     )
     assert confirmed.status_code == 200
     assert sorted(confirmed.get_json()["settings"]["removal_reasons"]) == ["Sample", "Unpacking"]
@@ -153,16 +161,17 @@ def test_newly_selecting_a_removal_reason_while_enabled_requires_confirm_and_rea
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"auto_removal_enabled": True, "removal_reasons": ["Sample"], "confirm": True, "reason": "initial"},
+        json={"auto_removal_enabled": True, "removal_reasons": ["Sample"], "confirm": True, "reason": "initial", "revision": 0},
     )
     response = client.put(
-        f"/api/v1/libraries/{library.id}/import-failure/settings", json={"removal_reasons": ["Sample", "Unpacking"]}
+        f"/api/v1/libraries/{library.id}/import-failure/settings",
+        json={"removal_reasons": ["Sample", "Unpacking"], "revision": 1},
     )
     assert response.status_code == 400
     assert "confirm" in str(response.get_json()["errors"]).lower()
     confirmed = client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"removal_reasons": ["Sample", "Unpacking"], "confirm": True, "reason": "expand"},
+        json={"removal_reasons": ["Sample", "Unpacking"], "confirm": True, "reason": "expand", "revision": 1},
     )
     assert confirmed.status_code == 200
     assert sorted(confirmed.get_json()["settings"]["removal_reasons"]) == ["Sample", "Unpacking"]
@@ -173,9 +182,14 @@ def test_unselecting_a_removal_reason_while_enabled_never_requires_confirm(clien
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"auto_removal_enabled": True, "removal_reasons": ["Sample", "Unpacking"], "confirm": True, "reason": "initial"},
+        json={
+            "auto_removal_enabled": True, "removal_reasons": ["Sample", "Unpacking"], "confirm": True,
+            "reason": "initial", "revision": 0,
+        },
     )
-    response = client.put(f"/api/v1/libraries/{library.id}/import-failure/settings", json={"removal_reasons": ["Sample"]})
+    response = client.put(
+        f"/api/v1/libraries/{library.id}/import-failure/settings", json={"removal_reasons": ["Sample"], "revision": 1}
+    )
     assert response.status_code == 200
     assert response.get_json()["settings"]["removal_reasons"] == ["Sample"]
 
@@ -183,7 +197,8 @@ def test_unselecting_a_removal_reason_while_enabled_never_requires_confirm(clien
 def test_unrecognized_reason_key_is_rejected(client, library_repo):
     library = make_sonarr_library(library_repo)
     response = client.put(
-        f"/api/v1/libraries/{library.id}/import-failure/settings", json={"removal_reasons": ["TotallyMadeUpReason"]}
+        f"/api/v1/libraries/{library.id}/import-failure/settings",
+        json={"removal_reasons": ["TotallyMadeUpReason"], "revision": 0},
     )
     assert response.status_code == 400
     assert "unrecognized" in str(response.get_json()["errors"]).lower()
@@ -191,7 +206,9 @@ def test_unrecognized_reason_key_is_rejected(client, library_repo):
 
 def test_unknown_reason_key_can_never_be_selected_even_though_it_is_in_the_canonical_catalog(client, library_repo):
     library = make_sonarr_library(library_repo)
-    response = client.put(f"/api/v1/libraries/{library.id}/import-failure/settings", json={"removal_reasons": ["Unknown"]})
+    response = client.put(
+        f"/api/v1/libraries/{library.id}/import-failure/settings", json={"removal_reasons": ["Unknown"], "revision": 0}
+    )
     assert response.status_code == 400
 
 
@@ -201,12 +218,15 @@ def test_boolean_destructive_loosening_while_auto_removal_enabled_requires_confi
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"auto_removal_enabled": True, field: False, "confirm": True, "reason": "initial enable"},
+        json={"auto_removal_enabled": True, field: False, "confirm": True, "reason": "initial enable", "revision": 0},
     )
-    response = client.put(f"/api/v1/libraries/{library.id}/import-failure/settings", json={field: True})
+    response = client.put(
+        f"/api/v1/libraries/{library.id}/import-failure/settings", json={field: True, "revision": 1}
+    )
     assert response.status_code == 400
     confirmed = client.put(
-        f"/api/v1/libraries/{library.id}/import-failure/settings", json={field: True, "confirm": True, "reason": "loosen"}
+        f"/api/v1/libraries/{library.id}/import-failure/settings",
+        json={field: True, "confirm": True, "reason": "loosen", "revision": 1},
     )
     assert confirmed.status_code == 200
     assert confirmed.get_json()["settings"][field] is True
@@ -217,9 +237,11 @@ def test_disabling_monitoring_while_auto_removal_enabled_safely_disables_removal
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"auto_removal_enabled": True, "removal_reasons": ["Sample"], "confirm": True, "reason": "initial"},
+        json={"auto_removal_enabled": True, "removal_reasons": ["Sample"], "confirm": True, "reason": "initial", "revision": 0},
     )
-    response = client.put(f"/api/v1/libraries/{library.id}/import-failure/settings", json={"monitoring_enabled": False})
+    response = client.put(
+        f"/api/v1/libraries/{library.id}/import-failure/settings", json={"monitoring_enabled": False, "revision": 1}
+    )
     assert response.status_code == 200
     settings = response.get_json()["settings"]
     assert settings["monitoring_enabled"] is False
@@ -229,7 +251,7 @@ def test_disabling_monitoring_while_auto_removal_enabled_safely_disables_removal
 def test_settings_optimistic_concurrency_rejects_stale_revision(client, library_repo):
     library = make_sonarr_library(library_repo)
     current = client.get(f"/api/v1/libraries/{library.id}/import-failure/settings").get_json()["settings"]
-    client.put(f"/api/v1/libraries/{library.id}/import-failure/settings", json={"poll_seconds": 90})
+    client.put(f"/api/v1/libraries/{library.id}/import-failure/settings", json={"poll_seconds": 90, "revision": 0})
     stale = client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
         json={"revision": current["revision"], "poll_seconds": 120},
@@ -244,7 +266,9 @@ def test_atomic_recheck_rejects_enable_even_if_preliminary_check_is_stale(client
     app.extensions["managearr"]["live_repo"].set_authorization_state("paused", actor="test", reason="already paused")
     service = app.extensions["managearr"]["import_failure"]
     monkeypatch.setattr(service, "_live_status", lambda: {"allowed": True, "reasons": [], "generation": 0})
-    updated, errors = service.update_settings(library.id, {"auto_removal_enabled": True, "confirm": True, "reason": "test"})
+    updated, errors = service.update_settings(
+        library.id, {"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0}
+    )
     assert updated is None
     assert any("Live" in e for e in errors)
     assert service.repo.settings(library.id)["auto_removal_enabled"] is False
@@ -274,7 +298,7 @@ def test_pause_blocks_on_the_enable_transaction_lock_rather_than_racing_in(clien
     def enable():
         response = client.put(
             f"/api/v1/libraries/{library.id}/import-failure/settings",
-            json={"auto_removal_enabled": True, "confirm": True, "reason": "test"},
+            json={"auto_removal_enabled": True, "confirm": True, "reason": "test", "revision": 0},
         )
         outcome["status"] = response.status_code
         outcome["body"] = response.get_json()
@@ -397,7 +421,9 @@ def test_poll_library_clears_disappeared_item_without_treating_as_removal(client
 
 def test_monitoring_disabled_does_not_poll(client, app, library_repo, import_failure_repo, monkeypatch):
     library = make_sonarr_library(library_repo)
-    client.put(f"/api/v1/libraries/{library.id}/import-failure/settings", json={"monitoring_enabled": False})
+    client.put(
+        f"/api/v1/libraries/{library.id}/import-failure/settings", json={"monitoring_enabled": False, "revision": 0}
+    )
     service = app.extensions["managearr"]["import_failure"]
     monkeypatch.setattr(service, "read_only_client_factory", FakeQueueClient)
     reset_fake()
@@ -446,7 +472,10 @@ def _enable_with_reasons(client, database, app, library_id, reasons):
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library_id}/import-failure/settings",
-        json={"auto_removal_enabled": True, "removal_reasons": list(reasons), "confirm": True, "reason": "test"},
+        json={
+            "auto_removal_enabled": True, "removal_reasons": list(reasons), "confirm": True, "reason": "test",
+            "revision": 0,
+        },
     )
 
 
@@ -805,7 +834,7 @@ def test_delete_uses_settings_bound_under_authorization_lock(client, app, databa
     _arm_live(app, database)
     enabled = client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"auto_removal_enabled": True, "removal_reasons": ["Sample"], "confirm": True, "reason": "test"},
+        json={"auto_removal_enabled": True, "removal_reasons": ["Sample"], "confirm": True, "reason": "test", "revision": 0},
     ).get_json()["settings"]
     changed = client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
@@ -857,7 +886,12 @@ def test_poll_library_stops_and_fails_closed_when_lease_lost_mid_poll(app, libra
     result = service.poll_library(library.id, heartbeat=lambda: False)
     assert "lease" in result["error"]
     assert result["cleared"] == 0
-    assert result["observed"] == 100
+    # An incomplete snapshot suppresses *all* classification, not just
+    # disappearance reconciliation - the first page's records are never
+    # folded into durable tracking state even though they were fetched,
+    # since the overall read never proved complete.
+    assert result["observed"] == 0
+    assert import_failure_repo.list_current(library.id, limit=500) == []
 
 
 def test_attempt_removals_never_deletes_when_lease_already_lost(client, app, database, library_repo, monkeypatch):
@@ -879,11 +913,14 @@ def test_policy_audit_records_added_and_removed_reasons(client, app, database, l
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"auto_removal_enabled": True, "removal_reasons": ["Sample"], "confirm": True, "reason": "enable"},
+        json={
+            "auto_removal_enabled": True, "removal_reasons": ["Sample"], "confirm": True, "reason": "enable",
+            "revision": 0,
+        },
     )
     client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"removal_reasons": ["Sample", "Unpacking"], "confirm": True, "reason": "expand"},
+        json={"removal_reasons": ["Sample", "Unpacking"], "confirm": True, "reason": "expand", "revision": 1},
     )
     audit = client.get(f"/api/v1/activity/import-failure/policy?library_id={library.id}").get_json()["audit"]
     assert len(audit) == 2
@@ -899,7 +936,10 @@ def test_policy_audit_is_append_only(client, app, database, library_repo):
     _arm_live(app, database)
     client.put(
         f"/api/v1/libraries/{library.id}/import-failure/settings",
-        json={"auto_removal_enabled": True, "removal_reasons": ["Sample"], "confirm": True, "reason": "enable"},
+        json={
+            "auto_removal_enabled": True, "removal_reasons": ["Sample"], "confirm": True, "reason": "enable",
+            "revision": 0,
+        },
     )
     import psycopg
     with pytest.raises(psycopg.errors.RaiseException):

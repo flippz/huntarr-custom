@@ -79,6 +79,18 @@ function escapeHtml(value) {
   return div.innerHTML;
 }
 
+function setSelectOptions(select, items, labelOf, valueOf) {
+  // Builds <option> elements via the DOM Option constructor/textContent,
+  // never innerHTML string concatenation - operator-entered text (a
+  // library name, a download client name) can contain arbitrary markup,
+  // and the Option constructor's label argument is always plain text,
+  // never parsed as HTML, so this is safe regardless of content.
+  select.textContent = '';
+  for (const item of items) {
+    select.appendChild(new Option(String(labelOf(item)), String(valueOf(item))));
+  }
+}
+
 function formatLocalTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value || '-';
