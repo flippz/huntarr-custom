@@ -833,3 +833,29 @@ def test_activity_live_attempts_api_and_ui(client):
     assert "Missing, upgrade, and season-pack attempts with their outcome" in html
     assert "Batch-level evidence" not in html
     assert "loadTimeline" in html
+
+
+@pytest.mark.parametrize("transition", ["pause", "emergency_stop", "enable_live", "mode_away"])
+def test_live_kill_switches_disable_both_removal_policies_and_bump_revisions(
+    transition, app, database, library_repo
+):
+    library = library_repo.create({"name": "Sonarr", "type": "sonarr", "url": "http://sonarr", "api_key": "secret", "enabled": True})
+    repo = app.extensions["managearr"]["live_repo"]
+    with database.connect() as conn:
+        conn.execute("UPDATE scheduler_settings SET mode='live' WHERE id=1")
+        conn.execute("UPDATE live_control SET authorization_state='running' WHERE id=1")
+        conn.execute("INSERT INTO slow_download_settings(library_id, auto_removal_enabled, revision) VALUES (%s, TRUE, 10)", (library.id,))
+        conn.execute("INSERT INTO import_failure_policies(library_id, auto_removal_enabled, revision) VALUES (%s, TRUE, 20)", (library.id,))
+    if transition == "pause":
+        repo.set_authorization_state("paused", actor="test", reason="pause")
+    elif transition == "emergency_stop":
+        repo.emergency_stop(actor="test", reason="stop")
+    elif transition == "enable_live":
+        repo.enable_live_mode(actor="test", reason="reset")
+    else:
+        repo.disarm_for_mode_change(new_mode="simulate", actor="test")
+    with database.connect() as conn:
+        slow = conn.execute("SELECT auto_removal_enabled, revision FROM slow_download_settings WHERE library_id=%s", (library.id,)).fetchone()
+        imports = conn.execute("SELECT auto_removal_enabled, revision FROM import_failure_policies WHERE library_id=%s", (library.id,)).fetchone()
+    assert slow["auto_removal_enabled"] is False and slow["revision"] == 11
+    assert imports["auto_removal_enabled"] is False and imports["revision"] == 21

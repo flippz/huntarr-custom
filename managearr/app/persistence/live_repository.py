@@ -148,6 +148,7 @@ class LiveRepository:
                 authorization_reason='Live enabled; explicit resume required',
                 state_changed_at=now(), updated_at=now() WHERE id=1""")
             conn.execute("UPDATE slow_download_settings SET auto_removal_enabled=FALSE, revision=revision+1, updated_at=now() WHERE auto_removal_enabled=TRUE")
+            conn.execute("UPDATE import_failure_policies SET auto_removal_enabled=FALSE, revision=revision+1, updated_at=now() WHERE auto_removal_enabled=TRUE")
         return {"mode": row["mode"]}
 
     def disarm_for_mode_change(self, *, new_mode: str, actor: str) -> None:
@@ -169,6 +170,7 @@ class LiveRepository:
                 """
             ).fetchone()
             conn.execute("UPDATE slow_download_settings SET auto_removal_enabled=FALSE, revision=revision+1, updated_at=now() WHERE auto_removal_enabled=TRUE")
+            conn.execute("UPDATE import_failure_policies SET auto_removal_enabled=FALSE, revision=revision+1, updated_at=now() WHERE auto_removal_enabled=TRUE")
             if updated is not None:
                 conn.execute(
                     """
@@ -217,6 +219,7 @@ class LiveRepository:
                 (reason[:500], actor[:255], row["arm_generation"]),
             )
             conn.execute("UPDATE slow_download_settings SET auto_removal_enabled=FALSE, revision=revision+1, updated_at=now() WHERE auto_removal_enabled=TRUE")
+            conn.execute("UPDATE import_failure_policies SET auto_removal_enabled=FALSE, revision=revision+1, updated_at=now() WHERE auto_removal_enabled=TRUE")
             cancelled = conn.execute(
                 """
                 UPDATE scheduler_cycle_runs
@@ -289,6 +292,7 @@ class LiveRepository:
                 # confirmation after the next Resume; Resume alone never
                 # silently revives deletion.
                 conn.execute("UPDATE slow_download_settings SET auto_removal_enabled=FALSE, revision=revision+1, updated_at=now() WHERE auto_removal_enabled=TRUE")
+                conn.execute("UPDATE import_failure_policies SET auto_removal_enabled=FALSE, revision=revision+1, updated_at=now() WHERE auto_removal_enabled=TRUE")
                 conn.execute("""UPDATE scheduler_cycle_runs SET state='skipped',
                     started_at=COALESCE(started_at,now()),finished_at=now(),
                     worker_owner=COALESCE(worker_owner,'pause'),

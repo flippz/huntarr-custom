@@ -136,6 +136,10 @@ class ImportFailureRepository:
                     return None, "Live authorization changed before this change could be saved; reload and try again"
                 if _on_locked is not None:
                     _on_locked()
+            conn.execute(
+                "INSERT INTO import_failure_policies (library_id, revision) VALUES (%s, 0) ON CONFLICT (library_id) DO NOTHING",
+                (library_id,),
+            )
             row = conn.execute(
                 "SELECT * FROM import_failure_policies WHERE library_id = %s FOR UPDATE", (library_id,)
             ).fetchone()
@@ -176,18 +180,28 @@ class ImportFailureRepository:
                         "INSERT INTO import_failure_policy_reasons (library_id, reason_key) VALUES (%s, %s)",
                         (library_id, key),
                     )
-            if added or removed or merged["auto_removal_enabled"] != current["auto_removal_enabled"]:
+            destructive_changed = any(
+                merged[field] != current[field]
+                for field in ("remove_from_client", "blocklist", "skip_redownload")
+            )
+            if added or removed or merged["auto_removal_enabled"] != current["auto_removal_enabled"] or destructive_changed:
                 conn.execute(
                     """
                     INSERT INTO import_failure_policy_audit (
                         library_id, revision_before, revision_after,
                         auto_removal_enabled_before, auto_removal_enabled_after,
+                        remove_from_client_before, remove_from_client_after,
+                        blocklist_before, blocklist_after,
+                        skip_redownload_before, skip_redownload_after,
                         added_reasons, removed_reasons, confirm, reason
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         library_id, current_revision, new_revision,
                         current["auto_removal_enabled"], merged["auto_removal_enabled"],
+                        current["remove_from_client"], merged["remove_from_client"],
+                        current["blocklist"], merged["blocklist"],
+                        current["skip_redownload"], merged["skip_redownload"],
                         sorted(added), sorted(removed), confirm, reason[:500],
                     ),
                 )
@@ -433,6 +447,12 @@ class ImportFailureRepository:
                 "revision_before": r["revision_before"], "revision_after": r["revision_after"],
                 "auto_removal_enabled_before": r["auto_removal_enabled_before"],
                 "auto_removal_enabled_after": r["auto_removal_enabled_after"],
+                "remove_from_client_before": r["remove_from_client_before"],
+                "remove_from_client_after": r["remove_from_client_after"],
+                "blocklist_before": r["blocklist_before"],
+                "blocklist_after": r["blocklist_after"],
+                "skip_redownload_before": r["skip_redownload_before"],
+                "skip_redownload_after": r["skip_redownload_after"],
                 "added_reasons": list(r["added_reasons"] or []), "removed_reasons": list(r["removed_reasons"] or []),
                 "confirm": r["confirm"], "reason": r["reason"], "occurred_at": _iso(r["occurred_at"]),
             }

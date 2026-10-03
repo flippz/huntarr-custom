@@ -1697,6 +1697,23 @@ MIGRATIONS: list[Migration] = [
                 ADD COLUMN tracked_status TEXT NULL CHECK (tracked_status IS NULL OR length(tracked_status) <= 64);
         """,
     ),
+    Migration(
+        version=17,
+        name="policy_first_write_lock_and_destructive_option_audit",
+        sql="""
+            ALTER TABLE slow_download_settings DROP CONSTRAINT slow_download_settings_revision_check;
+            ALTER TABLE slow_download_settings ADD CHECK (revision >= 0);
+            ALTER TABLE import_failure_policies DROP CONSTRAINT import_failure_policies_revision_check;
+            ALTER TABLE import_failure_policies ADD CHECK (revision >= 0);
+            ALTER TABLE import_failure_policy_audit
+                ADD COLUMN remove_from_client_before BOOLEAN,
+                ADD COLUMN remove_from_client_after BOOLEAN,
+                ADD COLUMN blocklist_before BOOLEAN,
+                ADD COLUMN blocklist_after BOOLEAN,
+                ADD COLUMN skip_redownload_before BOOLEAN,
+                ADD COLUMN skip_redownload_after BOOLEAN;
+        """,
+    ),
 ]
 
 

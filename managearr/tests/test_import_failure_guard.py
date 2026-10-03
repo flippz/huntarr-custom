@@ -963,3 +963,60 @@ def test_actions_audit_is_append_only(client, app, database, library_repo):
     with pytest.raises(psycopg.errors.RaiseException):
         with database.connect() as conn:
             conn.execute("UPDATE import_failure_actions SET reason = 'tampered'")
+
+
+def test_first_import_policy_write_serializes_revision_zero(database, library_repo):
+    library = make_sonarr_library(library_repo)
+    repo = ImportFailureRepository(database)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def writer(poll_seconds):
+        barrier.wait()
+        results.append(repo.update_settings(
+            library.id, {"poll_seconds": poll_seconds}, removal_reasons=None, expected_revision=0
+        ))
+
+    threads = [threading.Thread(target=writer, args=(30,)), threading.Thread(target=writer, args=(45,))]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join(timeout=5)
+    assert sum(error is None for _, error in results) == 1
+    assert sum(error is not None and "changed by someone else" in error for _, error in results) == 1
+    assert repo.settings(library.id)["revision"] == 1
+
+
+def test_first_slow_download_settings_write_serializes_revision_zero(database, library_repo):
+    from app.persistence.slow_download_repository import SlowDownloadRepository
+    library = make_sonarr_library(library_repo)
+    repo = SlowDownloadRepository(database)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def writer(poll_seconds):
+        barrier.wait()
+        results.append(repo.update_settings(library.id, {"poll_seconds": poll_seconds}, expected_revision=0))
+
+    threads = [threading.Thread(target=writer, args=(30,)), threading.Thread(target=writer, args=(45,))]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join(timeout=5)
+    assert sum(error is None for _, error in results) == 1
+    assert sum(error is not None and "changed by someone else" in error for _, error in results) == 1
+    assert repo.settings(library.id)["revision"] == 1
+
+
+def test_policy_audit_records_every_destructive_option_before_after(client, library_repo):
+    library = make_sonarr_library(library_repo)
+    response = client.put(
+        f"/api/v1/libraries/{library.id}/import-failure/settings",
+        json={
+            "revision": 0, "remove_from_client": False, "blocklist": False,
+            "skip_redownload": True, "reason": "safer client behavior",
+        },
+    )
+    assert response.status_code == 200
+    audit = client.get(f"/api/v1/activity/import-failure/policy?library_id={library.id}").get_json()["audit"]
+    row = audit[0]
+    assert row["remove_from_client_before"] is True and row["remove_from_client_after"] is False
+    assert row["blocklist_before"] is True and row["blocklist_after"] is False
+    assert row["skip_redownload_before"] is False and row["skip_redownload_after"] is True
+    assert row["reason"] == "safer client behavior"

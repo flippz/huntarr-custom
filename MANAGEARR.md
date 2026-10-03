@@ -129,21 +129,15 @@ episode shape, Media content, Capacity & upgrade gates, Errors) and is
 asserted at import time to exactly match the selectable set, so the
 grouping can never silently drift out of sync with the catalog.
 
-Raw Sonarr queue status messages/error text are normalized against this
-catalog with a single uniform, allowlisted rule - a word-bounded literal
-PascalCase token match or a word-bounded humanized ("NotQualityUpgrade" ->
-"not quality upgrade") phrase match, for every reason except the two
-generic single-word keys `Error`/`Unknown`, which only ever match a
-*complete* trimmed message, never a substring of a longer sentence - rather
-than a hand-tuned phrase table per reason or unrestricted substring
-matching (see "Review hardening pass" below for why: unrestricted
-substring matching previously let a download client's own "filesystem
-error" message or the word "sampler" misclassify as `Error`/`Sample`). A
-single message can resolve to more than one matched reason when it
-genuinely names more than one at non-overlapping spans; overlapping spans
-(e.g. `Sample` inside `SampleIndeterminate`) resolve to only the longest/
-most specific one. A message that matches nothing is never guessed into a
-bucket: it is recorded as its own "unmatched" message, surfaced to the
+Raw Sonarr queue status messages/error text are normalized against a
+strict full-message allowlist: the complete trimmed message must equal a
+canonical PascalCase token, its humanized form, or one of the explicitly
+supported Sonarr phrases. Multiple reasons in one field are accepted only
+as semicolon-, pipe-, or newline-separated complete allowlisted segments.
+Any residual text invalidates the entire field, so `Sample
+xyz-unrecognized-tail`, a download client's `filesystem error`, and
+`sampler` are all unmatched rather than partial matches. A message that
+does not conform completely is never guessed into a bucket: it is recorded as its own "unmatched" message, surfaced to the
 operator (Slow-download guard tab, "Observed unmatched messages"), and is
 always left. Removal eligibility
 (`app.domain.import_failure.evaluate`) requires automatic removal enabled
@@ -161,9 +155,12 @@ row per library (monitoring/auto-removal toggles, poll cadence, remove-
 from-client/blocklist/skip-redownload, an optimistic-concurrency
 `revision`). `import_failure_policy_audit` is an append-only revision/
 audit trail distinct from the per-item action log: every settings write
-that adds/removes a reason or changes `auto_removal_enabled` appends one
-row recording the before/after revision, the added/removed reason keys,
-whether `confirm` was set, and the operator's `reason` text.
+that adds/removes a reason, changes `auto_removal_enabled`, or changes
+`remove_from_client`/`blocklist`/`skip_redownload` appends one row
+recording the before/after revision and destructive-option values, the
+added/removed reason keys, whether `confirm` was set, and the operator's
+supplied `reason` text. Schema v17 also makes the first revision-0 write
+linearizable by inserting and locking a revision-0 row before validation.
 `import_failure_queue_items` is keyed by `(library_id, sonarr_queue_id)` -
 the Sonarr queue record's own immutable id, never `downloadId`, same
 rationale as the slow-download guard - and carries the currently matched

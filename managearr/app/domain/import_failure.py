@@ -116,43 +116,23 @@ def _humanize(token: str) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", " ", token).lower()
 
 
-# "Error" (humanized: the single word "error") is excluded from the
-# word-boundary pattern set below. Every *other* reason's token/phrase is
-# distinctive enough that a whole-word match anywhere in a message is safe
-# signal, but "error" alone is an ordinary, highly generic English word -
-# matching it anywhere would misclassify unrelated text (a download
-# client's own "filesystem error" message is not Sonarr's "Error" import-
-# rejection reason). "Unknown" has the same problem and is handled the same
-# way. Both are only ever matched against the *complete* (trimmed,
-# case-insensitive) message - see ``_EXACT_MATCH_KEYS`` below - never as a
-# substring of a longer sentence.
-_EXACT_ONLY_REASON_KEYS: frozenset[str] = frozenset({"Error"})
-_EXACT_MATCH_KEYS: dict[str, str] = {"error": "Error", _UNKNOWN_REASON_KEY.lower(): _UNKNOWN_REASON_KEY}
+# Complete-message allowlist. These are deliberately values, not search
+# fragments: no recognized prefix or embedded token can authorize removal.
+_EXACT_MESSAGE_KEYS: dict[str, str] = {
+    **{key.casefold(): key for key in IMPORT_REJECTION_REASONS},
+    **{_humanize(key).casefold(): key for key in IMPORT_REJECTION_REASONS},
+    "this appears to be a sample file": "Sample",
+    "sample indeterminate - unable to verify": "SampleIndeterminate",
+    "unable to parse the episode information": "UnableToParse",
+    "minimum free space not available on disk": "MinimumFreeSpace",
+    "not quality upgrade for this release": "NotQualityUpgrade",
+    "file locked - unable to import": "FileLocked",
+    SERIES_MATCHED_BY_ID_MESSAGE.casefold(): SERIES_MATCHED_BY_ID_REASON_KEY,
+}
 
-
-def _boundary_pattern(phrase: str) -> re.Pattern[str]:
-    # (?<!\w)...(?!\w) rather than \b on both ends: \b alone still fires
-    # between two different "word" boundaries fine for our ASCII catalog,
-    # but spelling it as a non-word lookaround either side is unambiguous
-    # about intent - the phrase must stand on its own, not be glued to
-    # other letters/digits on either side (so "Sample" never matches
-    # inside "sampler", and "SampleIndeterminate" never lets its own
-    # "Sample" prefix also register separately - see the overlap
-    # suppression in ``_match_keys``).
-    return re.compile(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", re.IGNORECASE)
-
-
-# Every (key, compiled pattern) considered for word-boundary matching - both
-# the literal PascalCase token and the humanized phrasing, for every
-# canonical key except the exact-only generic words above. A key
-# contributes one pattern per distinct phrase (token vs. humanized); either
-# one matching counts as that key matching.
-_BOUNDARY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
-    (key, _boundary_pattern(phrase))
-    for key in IMPORT_REJECTION_REASONS
-    if key != _UNKNOWN_REASON_KEY and key not in _EXACT_ONLY_REASON_KEYS
-    for phrase in {key, _humanize(key)}
-)
+# Only explicitly supported separators may combine complete messages. Commas
+# are excluded because the synthetic queue-only message itself contains one.
+_SUPPORTED_MESSAGE_DELIMITER = re.compile(r"\s*(?:;|\||\r?\n)\s*")
 
 
 @dataclass(frozen=True)
@@ -168,32 +148,20 @@ class NormalizationResult:
 def _match_keys(trimmed: str) -> frozenset[str]:
     """Every reason key safely recognizable in one trimmed message.
 
-    Exact allowlisted phrase/pattern boundaries only: a word-bounded
-    token/phrase match for every ordinary reason, or a complete-message
-    match for the two generic single-word keys. When two matches overlap
-    (e.g. "Sample" inside "SampleIndeterminate"), only the longest/most
-    specific span wins - the shorter one is suppressed, never both.
-    Matches at genuinely different, non-overlapping spans are all kept,
-    so a message naming more than one reason returns every one of them.
-    Zero matches - including any residual text no pattern explains - is
-    reported as unmatched (see ``normalize_messages``), never guessed."""
-    if trimmed == SERIES_MATCHED_BY_ID_MESSAGE:
-        return frozenset({SERIES_MATCHED_BY_ID_REASON_KEY})
-    spans: list[tuple[int, int, str]] = [
-        (m.start(), m.end(), key) for key, pattern in _BOUNDARY_PATTERNS for m in pattern.finditer(trimmed)
-    ]
-    exact_key = _EXACT_MATCH_KEYS.get(trimmed.lower())
-    if exact_key is not None:
-        spans.append((0, len(trimmed), exact_key))
-    if not spans:
+    The complete message must be allowlisted, or be an explicitly
+    delimiter-separated sequence whose every complete segment is allowlisted.
+    Any residual text invalidates the whole message. Multiple valid segments
+    return every distinct key so policy evaluation still requires all of them
+    to be selected."""
+    segments = _SUPPORTED_MESSAGE_DELIMITER.split(trimmed)
+    if not segments or any(not segment.strip() for segment in segments):
         return frozenset()
-    spans.sort(key=lambda s: (-(s[1] - s[0]), s[0]))
-    selected_spans: list[tuple[int, int]] = []
     keys: set[str] = set()
-    for start, end, key in spans:
-        if any(start < s_end and end > s_start for s_start, s_end in selected_spans):
-            continue
-        selected_spans.append((start, end))
+    for segment in segments:
+        key = _EXACT_MESSAGE_KEYS.get(segment.strip().casefold())
+        if key is None:
+            # Residual/unrecognized text invalidates the complete message.
+            return frozenset()
         keys.add(key)
     return frozenset(keys)
 

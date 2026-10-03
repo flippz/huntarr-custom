@@ -184,6 +184,10 @@ class SlowDownloadRepository:
                     # prove a racing Pause/E-stop blocks on the lock held here
                     # rather than slipping in between this check and commit.
                     _on_locked()
+            conn.execute(
+                "INSERT INTO slow_download_settings (library_id, revision) VALUES (%s, 0) ON CONFLICT (library_id) DO NOTHING",
+                (library_id,),
+            )
             row = conn.execute(
                 "SELECT * FROM slow_download_settings WHERE library_id = %s FOR UPDATE", (library_id,)
             ).fetchone()

@@ -208,13 +208,19 @@ def test_normalize_single_message_returns_every_distinct_matched_category():
     # Two genuinely separate, non-overlapping reason mentions in one
     # message must both be reported - "return all matched categories",
     # not just the first/longest one found.
-    result = normalize_messages(["Sample Unpacking"])
+    result = normalize_messages(["Sample; Unpacking"])
     assert result.matched_reasons == {"Sample", "Unpacking"}
     assert result.unmatched_messages == ()
 
 
+def test_normalize_rejects_recognized_prefix_with_residual_unknown_text():
+    result = normalize_messages(["Sample xyz-unrecognized-tail"])
+    assert result.matched_reasons == frozenset()
+    assert result.unmatched_messages == ("Sample xyz-unrecognized-tail",)
+
+
 def test_evaluate_combined_single_message_reasons_require_every_category_selected():
-    normalization = normalize_messages(["Sample Unpacking"])
+    normalization = normalize_messages(["Sample; Unpacking"])
     only_one_selected = ImportFailurePolicy(auto_removal_enabled=True, removal_reasons=frozenset({"Sample"}))
     decision = evaluate(only_one_selected, normalization)
     assert decision.action == "leave"

@@ -602,7 +602,7 @@ def test_v6_live_control_bounds_are_enforced(database):
 
 
 def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(database):
-    assert [item.version for item in MIGRATIONS[-7:]] == [10, 11, 12, 13, 14, 15, 16]
+    assert [item.version for item in MIGRATIONS[-8:]] == [10, 11, 12, 13, 14, 15, 16, 17]
     migration = next(item for item in MIGRATIONS if item.version == 8)
     with database.connect() as conn:
         conn.execute(
@@ -1007,3 +1007,16 @@ def test_m11_real_postgresql_upgrade_preserves_populated_append_only_audit(datab
         finally:
             conn.execute("SET search_path TO public")
             conn.execute(psycopg.sql.SQL("DROP SCHEMA {} CASCADE").format(quoted))
+
+
+def test_v17_adds_policy_concurrency_and_destructive_audit_columns(database):
+    with database.connect() as conn:
+        columns = {row["column_name"] for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='import_failure_policy_audit'"
+        ).fetchall()}
+        for field in ("remove_from_client", "blocklist", "skip_redownload"):
+            assert f"{field}_before" in columns
+            assert f"{field}_after" in columns
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM schema_migrations WHERE version=17"
+        ).fetchone()["n"] == 1
