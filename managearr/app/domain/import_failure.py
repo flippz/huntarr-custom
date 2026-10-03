@@ -57,6 +57,7 @@ SERIES_MATCHED_BY_ID_MESSAGE = (
     "series by ID. Automatic import is not possible."
 )
 SERIES_MATCHED_BY_ID_REASON_KEY = "SeriesMatchedByIdOnly"
+SERIES_MATCHED_BY_ID_FAQ_MESSAGE = SERIES_MATCHED_BY_ID_MESSAGE + " See the FAQ for details."
 
 # Every key this module can ever assign to an observed message - the
 # canonical catalog plus the one synthetic queue-only key above.
@@ -128,6 +129,7 @@ _EXACT_MESSAGE_KEYS: dict[str, str] = {
     "not quality upgrade for this release": "NotQualityUpgrade",
     "file locked - unable to import": "FileLocked",
     SERIES_MATCHED_BY_ID_MESSAGE.casefold(): SERIES_MATCHED_BY_ID_REASON_KEY,
+    SERIES_MATCHED_BY_ID_FAQ_MESSAGE.casefold(): SERIES_MATCHED_BY_ID_REASON_KEY,
 }
 
 # Only explicitly supported separators may combine complete messages. Commas

@@ -8,6 +8,7 @@ from app.domain.import_failure import (
     REASON_GROUPS,
     REMOVAL_SELECTABLE_REASON_KEYS,
     SERIES_MATCHED_BY_ID_MESSAGE,
+    SERIES_MATCHED_BY_ID_FAQ_MESSAGE,
     SERIES_MATCHED_BY_ID_REASON_KEY,
     Decision,
     ImportFailurePolicy,
@@ -115,9 +116,10 @@ def test_normalize_recognizes_literal_token_and_humanized_phrasing(message, expe
 
 
 def test_normalize_exact_series_matched_by_id_message():
-    result = normalize_messages([SERIES_MATCHED_BY_ID_MESSAGE])
-    assert result.matched_reasons == {SERIES_MATCHED_BY_ID_REASON_KEY}
-    assert result.unmatched_messages == ()
+    for message in (SERIES_MATCHED_BY_ID_MESSAGE, SERIES_MATCHED_BY_ID_FAQ_MESSAGE):
+        result = normalize_messages([message])
+        assert result.matched_reasons == {SERIES_MATCHED_BY_ID_REASON_KEY}
+        assert result.unmatched_messages == ()
 
 
 def test_normalize_series_matched_by_id_message_requires_exact_match_not_fuzzy():
