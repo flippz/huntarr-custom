@@ -2,6 +2,7 @@
 from flask import Blueprint, current_app, jsonify, request
 
 from ..adapters.redaction import redact_libraries, redact_library
+from ..domain.import_failure import REASON_GROUPS, SERIES_MATCHED_BY_ID_MESSAGE
 from ..services.sonarr_scan_service import VALIDATION_ERRORS
 from ..services.dispatch_planning_service import JOB_NOT_FOUND_ERROR
 from ..services.reconciliation_service import BATCH_NOT_FOUND
@@ -511,3 +512,67 @@ def slow_download_activity():
     limit = max(1, min(request.args.get("limit", 100, type=int), 500))
     library_id = request.args.get("library_id", type=int)
     return jsonify({"actions": _services()["slow_download_repo"].recent_actions(library_id, limit=limit)})
+
+
+# --- Sonarr-only import-failure reason policy ----------------------------
+#
+# GET endpoints are always safe (read-only status/settings). The PUT/PATCH
+# settings endpoint is the only place automatic removal (or any new
+# removal reason) can be turned on, and ImportFailureService.update_settings
+# refuses to do so without an explicit confirm+reason and Live already
+# armed and running. Removal itself only ever happens from app/worker.py,
+# reusing the exact same bounded Sonarr queue DELETE the slow-download
+# guard already uses - no new Sonarr write exists here.
+
+@api_bp.get("/libraries/<int:library_id>/import-failure/settings")
+def import_failure_settings(library_id: int):
+    settings = _services()["import_failure"].settings(library_id)
+    if settings is None:
+        return jsonify({"errors": ["Sonarr library not found"]}), 404
+    return jsonify({"settings": settings})
+
+
+@api_bp.put("/libraries/<int:library_id>/import-failure/settings")
+@api_bp.patch("/libraries/<int:library_id>/import-failure/settings")
+def update_import_failure_settings(library_id: int):
+    settings, errors = _services()["import_failure"].update_settings(library_id, request.get_json(silent=True))
+    if errors:
+        return jsonify({"errors": errors}), 404 if errors == ["Sonarr library not found"] else 400
+    return jsonify({"settings": settings})
+
+
+@api_bp.get("/import-failure/reasons")
+def import_failure_reasons():
+    """Static, read-only reason catalog/grouping for the UI - never
+    includes anything Sonarr- or library-specific."""
+    return jsonify({
+        "groups": [{"name": name, "reasons": list(keys)} for name, keys in REASON_GROUPS],
+        "always_leave": ["Unknown"],
+        "series_matched_by_id_message": SERIES_MATCHED_BY_ID_MESSAGE,
+    })
+
+
+@api_bp.get("/libraries/<int:library_id>/import-failure/queue")
+def import_failure_queue(library_id: int):
+    limit = max(1, min(request.args.get("limit", 200, type=int), 500))
+    return jsonify({"items": _services()["import_failure_repo"].list_current(library_id, limit=limit)})
+
+
+@api_bp.get("/import-failure/queue")
+def import_failure_queue_all():
+    limit = max(1, min(request.args.get("limit", 200, type=int), 500))
+    return jsonify({"items": _services()["import_failure_repo"].list_current(limit=limit)})
+
+
+@api_bp.get("/activity/import-failure")
+def import_failure_activity():
+    limit = max(1, min(request.args.get("limit", 100, type=int), 500))
+    library_id = request.args.get("library_id", type=int)
+    return jsonify({"actions": _services()["import_failure_repo"].recent_actions(library_id, limit=limit)})
+
+
+@api_bp.get("/activity/import-failure/policy")
+def import_failure_policy_activity():
+    limit = max(1, min(request.args.get("limit", 100, type=int), 500))
+    library_id = request.args.get("library_id", type=int)
+    return jsonify({"audit": _services()["import_failure_repo"].recent_policy_audit(library_id, limit=limit)})

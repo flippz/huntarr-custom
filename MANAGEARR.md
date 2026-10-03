@@ -76,7 +76,161 @@ empty/summary state, Activity's detail-row collapsing, Settings' routine-
 first/Advanced-disclosure layout, and the continued absence of Radarr/Lidarr/
 Readarr/Whisparr/Eros anywhere in rendered UI.
 
-## Current milestone: Sonarr-only slow-download guard
+## Current milestone: Sonarr-only import-failure reason policy
+
+The import-failure reason policy lets an operator decide, per Sonarr
+library and per rejection reason, whether a stuck completed/import-blocked/
+warning queue record should eventually be automatically removed from the
+queue or always left for manual review. Scope is deliberately narrow:
+**reason-aware observation and reason-gated removal only** - there is no
+force-import and no new Sonarr write. The only mutation this feature can
+ever cause is the exact same bounded `DELETE /api/v3/queue/{id}` the
+slow-download guard already uses; this milestone adds no other way to
+reach Sonarr, and the slow-download guard's own classification/evidence
+path (above) is completely untouched by it.
+
+**Safety posture.** Every reason defaults to "leave" - nothing is
+removal-eligible until an operator explicitly selects it - and global
+automatic removal is a separate switch, disabled by default, exactly like
+`slow_download_settings.auto_removal_enabled`. `Unknown` and any observed
+message that cannot be matched to a known reason are **never** eligible
+for automatic removal, no matter what is selected, because Managearr
+cannot say with confidence what Sonarr actually rejected. An item with
+*any* unmatched or non-selected reason is left, even if its other observed
+reasons are selected - removal requires every reason seen on an item to be
+one the operator explicitly chose. Newly selecting any removal category,
+enabling automatic removal, or turning on any of remove-from-client/
+blocklist/skip-redownload all require an explicit `confirm: true` plus a
+non-empty `reason`, and enabling/expanding removal is rejected outright
+unless the global Live authorization is already armed and running -
+identical gating to the slow-download guard's settings API.
+
+**Canonical reason catalog (`app/domain/import_failure.py`, pure/no I/O).**
+The 34 Sonarr v4 `ImportRejectionReason` values (`Unknown`, `FileLocked`,
+`UnknownSeries`, `DangerousFile`, `ExecutableFile`, `ArchiveFile`,
+`SeriesFolder`, `InvalidFilePath`, `UnsupportedExtension`, `PartialSeason`,
+`SeasonExtra`, `InvalidSeasonOrEpisode`, `UnableToParse`, `Error`,
+`DecisionError`, `NoEpisodes`, `MissingAbsoluteEpisodeNumber`,
+`EpisodeAlreadyImported`, `TitleMissing`, `TitleTba`, `MinimumFreeSpace`,
+`FullSeason`, `NoAudio`, `EpisodeUnexpected`, `EpisodeNotFoundInRelease`,
+`Sample`, `SampleIndeterminate`, `Unpacking`, `ExistingFileHasMoreEpisodes`,
+`SplitEpisode`, `UnverifiedSceneMapping`, `NotQualityUpgrade`,
+`NotRevisionUpgrade`, `NotCustomFormatUpgrade`), plus one synthetic key,
+`SeriesMatchedByIdOnly`, for a documented queue-only message that is not
+itself part of that enum: *"Found matching series via grab history, but
+release was matched to series by ID. Automatic import is not possible."*
+That exact sentence is matched verbatim (trimmed, not fuzzy) since it is a
+single fixed message, not a family of related phrasings. `Unknown` is
+excluded from `REMOVAL_SELECTABLE_REASON_KEYS` - the 33 remaining
+canonical reasons plus `SeriesMatchedByIdOnly` (34 total) are every
+checkbox an operator can ever see. `REASON_GROUPS` partitions those 34
+into six UI-facing groups (Parsing & identification, File safety, Season/
+episode shape, Media content, Capacity & upgrade gates, Errors) and is
+asserted at import time to exactly match the selectable set, so the
+grouping can never silently drift out of sync with the catalog.
+
+Raw Sonarr queue status messages/error text are normalized against this
+catalog with a single uniform, best-effort rule - a literal PascalCase
+token match or a humanized ("NotQualityUpgrade" -> "not quality upgrade")
+substring match, longest/most-specific pattern first - rather than a
+hand-tuned phrase table per reason. A message that matches nothing is
+never guessed into a bucket: it is recorded as its own "unmatched" message,
+surfaced to the operator (Slow-download guard tab, "Observed unmatched
+messages"), and is always left. Removal eligibility
+(`app.domain.import_failure.evaluate`) requires automatic removal enabled
+for the library, zero unmatched messages on the item, `Unknown` absent
+from its matched reasons, and every matched reason a member of the
+library's selected `removal_reasons` - a single bad reason blocks the
+whole item.
+
+**Durable persistence (schema v15).** `import_failure_reason_catalog` is a
+fixed lookup table seeded with exactly the 34 selectable keys (not
+`Unknown`); `import_failure_policy_reasons` FK-references it, so an
+invalid or `Unknown` key can never be persisted as removal-eligible
+independent of any application bug. `import_failure_policies` holds one
+row per library (monitoring/auto-removal toggles, poll cadence, remove-
+from-client/blocklist/skip-redownload, an optimistic-concurrency
+`revision`). `import_failure_policy_audit` is an append-only revision/
+audit trail distinct from the per-item action log: every settings write
+that adds/removes a reason or changes `auto_removal_enabled` appends one
+row recording the before/after revision, the added/removed reason keys,
+whether `confirm` was set, and the operator's `reason` text.
+`import_failure_queue_items` is keyed by `(library_id, sonarr_queue_id)` -
+the Sonarr queue record's own immutable id, never `downloadId`, same
+rationale as the slow-download guard - and carries the currently matched
+reasons, unmatched messages, and decision. `import_failure_actions` and
+`import_failure_removal_attempts` are append-only (the same `BEFORE UPDATE
+OR DELETE`-raises trigger pattern, under its own `protect_import_failure_
+append_only` function) and mirror `slow_download_actions`/`slow_download_
+removal_attempts` exactly, including the durable attempt-start marker
+committed through `Database.dedicated_transaction()` independently and
+immediately before the one bounded Sonarr DELETE, and the same "never
+automatically retried, for any outcome" rule once that marker exists.
+`import_failure_queue_items.library_id` is nullable `ON DELETE SET NULL`
+and `import_failure_actions.library_id` is a plain snapshot column, not an
+FK - the nullable/snapshot shape the slow-download guard's own schema
+only reached after its P1 fix - applied here from the start.
+
+**Sonarr adapter.** `get_queue_details` additionally returns each record's
+bounded, lower-cased `trackedDownloadStatus` (`tracked_status`: `ok`/
+`warning`/`error`/...), alongside the pre-existing bounded `title`/
+`status_messages`/`error_message` this feature reads reasons from. No new
+Sonarr write exists; removal reuses `delete_queue_record` unchanged.
+
+**Worker integration.** Monitoring watches queue records whose `status` is
+`completed`, whose `trackedDownloadState` is `importBlocked`, or whose
+`trackedDownloadStatus` is `warning`/`error` - every other status (queued/
+downloading/paused/importing-without-warning) is exempt, which is the
+slow-download guard's exclusive territory. It runs in the same bounded
+worker iteration, immediately after the slow-download guard's own poll/
+removal calls, under the same scheduler-mode/kill-switch rules. A removal
+is attempted only when `auto_removal_enabled` is true for that library
+**and** the global Live authorization is mode=`live`/state=`running`/
+matching arm generation/not emergency-stopped, re-checked immediately
+before the DELETE under the same row-lock pattern (`FOR NO KEY UPDATE` on
+the queue item, `FOR SHARE` on scheduler settings/Live control/the library
+row/the policy settings row/the selected-reasons rows) `SlowDownloadRepository
+.authorized_removal`/`SeasonPackService.confirm` already use, under its own
+advisory-lock namespace (`ImportFailureRepository.LOCK_CLASS = 91_827`,
+distinct from both). Immediately before the marker/DELETE, the exact live
+Sonarr queue record is re-read and must still prove: the same queue record
+exists, the same download identity, still in a watched state, the *exact
+same* set of matched reasons (no fresh/dropped reason), and every one of
+those reasons still selected under the freshly re-locked policy. Any drift
+aborts safely (no marker, no DELETE) into `resolved`/`healthy`-equivalent/
+`ambiguous` as appropriate - never silently treated as a success.
+
+**Settings/Activity UI.** The existing Sonarr workspace "Slow-download
+guard" tab gains an "Import-failure reason policy" card (monitoring/auto-
+removal toggles, poll cadence, remove-from-client/blocklist/skip-
+redownload, a danger-zone confirmation + reason field, and the grouped
+reason checkboxes rendered from `GET /api/v1/import-failure/reasons`), a
+"Tracked import-failure items" table (title/status/matched reasons/
+decision/reason), and an "Observed unmatched messages" list - all Sonarr-
+derived text passes through the same `escapeHtml` helper the slow-download
+guard's own queue table uses. `GET`/`PUT`/`PATCH /api/v1/libraries/<id>/
+import-failure/settings`, `GET .../import-failure/queue`, `GET /api/v1/
+import-failure/queue`, `GET /api/v1/import-failure/reasons`, `GET
+/api/v1/activity/import-failure`, and `GET /api/v1/activity/import-failure/
+policy` never return secrets.
+
+**Tests** (`managearr/tests/test_import_failure_domain.py`,
+`test_import_failure_guard.py`, plus additions to `test_sonarr_client.py`,
+`test_migrations.py`, `test_live_dispatch.py`, and `tests/js/
+test_import_failure_escaping.js`) cover: catalog/grouping integrity
+(no gaps/overlaps, `Unknown` never selectable), message normalization
+(literal token, humanized phrasing, the exact special message, unmatched/
+multi-reason union, longest-token precedence), the reason-gated decision
+(every-reason-selected-required, `Unknown`/unmatched force "leave"),
+settings confirm/reason/Live-armed gating for every loosening transition,
+optimistic concurrency, the policy audit trail, monitoring (observed/
+resolved/cleared-disappeared), and the same race shape as the slow-
+download guard - Pause-vs-DELETE, crash-immediately-after-accepted-DELETE-
+before-persistence (never resent), a `max_size=1` connection pool, racing
+worker cycles, and every final-revalidation-abort case (disappeared,
+identity changed, no longer watched, reasons drifted, Sonarr unreachable).
+
+## Previous milestone: Sonarr-only slow-download guard
 
 The Slow-download guard is the requested successor to the useful part of
 legacy Swaparr: it monitors the Sonarr queue and, only when explicitly

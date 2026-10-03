@@ -39,6 +39,8 @@ from .services.refresh_service import RefreshService
 from .services.scheduler_service import SchedulerService
 from .services.slow_download_service import SlowDownloadService
 from .persistence.slow_download_repository import SlowDownloadRepository
+from .services.import_failure_service import ImportFailureService
+from .persistence.import_failure_repository import ImportFailureRepository
 
 LOG = logging.getLogger("managearr.worker")
 
@@ -53,6 +55,7 @@ class SchedulerWorker:
         live_repository: LiveRepository | None = None,
         live_coordinator: LiveDispatchCoordinator | None = None,
         slow_download_service: SlowDownloadService | None = None,
+        import_failure_service: ImportFailureService | None = None,
         *,
         owner_id: str | None = None,
         lease_seconds: int = 30,
@@ -95,6 +98,15 @@ class SchedulerWorker:
         # immediately before each DELETE - see SlowDownloadService.
         self.slow_download_service = slow_download_service or SlowDownloadService(
             SlowDownloadRepository(repository.db), LibraryRepository(repository.db),
+            self.live_repository, repository, timeout=sonarr_timeout,
+        )
+        # Same monitoring-only-by-construction shape as slow_download_service
+        # above: poll_library never calls anything but GET. Gated removal
+        # (attempt_removals) requires auto_removal_enabled AND a live,
+        # running, matching-generation, non-emergency-stopped Live
+        # authorization, re-checked immediately before each DELETE.
+        self.import_failure_service = import_failure_service or ImportFailureService(
+            ImportFailureRepository(repository.db), LibraryRepository(repository.db),
             self.live_repository, repository, timeout=sonarr_timeout,
         )
         self.owner_id = owner_id or f"worker-{uuid.uuid4()}"
@@ -158,6 +170,8 @@ class SchedulerWorker:
             # immediately before issuing any DELETE.
             self.slow_download_service.poll_all(heartbeat=self._heartbeat)
             self.slow_download_service.attempt_removals(max_removals=1, heartbeat=self._heartbeat)
+            self.import_failure_service.poll_all(heartbeat=self._heartbeat)
+            self.import_failure_service.attempt_removals(max_removals=1, heartbeat=self._heartbeat)
         refresh_run = self.refresh_repository.start_next_run(self.owner_id)
         if refresh_run is not None:
             if not self._heartbeat():

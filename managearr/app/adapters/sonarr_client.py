@@ -313,6 +313,7 @@ class SonarrClient:
             episode_ids = [self._positive_int(value, "queue episode id") for value in raw_episode_ids]
             status = self._bounded_text(record.get("status"), "queue status", required=True, limit=64)
             tracked_state = self._bounded_text(record.get("trackedDownloadState"), "queue tracked state", limit=64)
+            tracked_status = self._bounded_text(record.get("trackedDownloadStatus"), "queue tracked status", limit=64)
             added = self._timestamp_text(record.get("added"), "queue added date")
             download_id = record.get("downloadId")
             if download_id is not None:
@@ -356,6 +357,7 @@ class SonarrClient:
                     "episode_ids": episode_ids,
                     "status": status.lower(),
                     "tracked_state": tracked_state.lower() if tracked_state else None,
+                    "tracked_status": tracked_status.lower() if tracked_status else None,
                     "download_id": download_id,
                     "added": added,
                     "title": title,

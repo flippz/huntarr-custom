@@ -362,6 +362,7 @@ def test_get_queue_details_is_bounded_and_normalized():
         "records": [{
             "id": 77, "downloadId": "dl-1", "episode": {"id": 101},
             "status": "downloading", "trackedDownloadState": "downloading",
+            "trackedDownloadStatus": "Warning",
             "title": "Some.Show.S01E01", "size": 1000, "sizeleft": 400,
             "timeleft": "00:10:00",
             "statusMessages": [{"messages": ["unbounded detail"]}],
@@ -370,7 +371,8 @@ def test_get_queue_details_is_bounded_and_normalized():
     queue = make_client(session).get_queue_details(page=1, page_size=25)
     assert queue["records"] == [{
         "queue_id": 77, "episode_ids": [101], "status": "downloading",
-        "tracked_state": "downloading", "download_id": "dl-1", "added": None,
+        "tracked_state": "downloading", "tracked_status": "warning",
+        "download_id": "dl-1", "added": None,
         "title": "Some.Show.S01E01", "size": 1000, "sizeleft": 400,
         "timeleft": "00:10:00", "error_message": None,
         "status_messages": [{"title": None, "messages": ["unbounded detail"]}],
@@ -383,6 +385,24 @@ def test_get_queue_details_fails_closed_on_missing_queue_id():
     session = FakeSession(FakeResponse(200, {
         "totalRecords": 1,
         "records": [{"downloadId": "dl-1", "episode": {"id": 101}, "status": "downloading"}],
+    }))
+    with pytest.raises(SonarrDataError):
+        make_client(session).get_queue_details()
+
+
+def test_get_queue_details_tracked_status_defaults_to_none_when_absent():
+    session = FakeSession(FakeResponse(200, {
+        "totalRecords": 1,
+        "records": [{"id": 1, "episode": {"id": 1}, "status": "downloading"}],
+    }))
+    queue = make_client(session).get_queue_details()
+    assert queue["records"][0]["tracked_status"] is None
+
+
+def test_get_queue_details_tracked_status_fails_closed_on_oversized_value():
+    session = FakeSession(FakeResponse(200, {
+        "totalRecords": 1,
+        "records": [{"id": 1, "episode": {"id": 1}, "status": "downloading", "trackedDownloadStatus": "x" * 65}],
     }))
     with pytest.raises(SonarrDataError):
         make_client(session).get_queue_details()

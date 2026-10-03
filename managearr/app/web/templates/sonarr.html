@@ -165,6 +165,44 @@
     </table></div>
     <div class="form-actions"><button type="button" id="sdg-refresh" class="button-secondary">Refresh</button></div>
   </section>
+
+  <!-- ---------------------- Import-failure reason policy ------------------ -->
+  <section class="card">
+    <h2>Import-failure reason policy</h2>
+    <p class="hint-notice">Sonarr-only. Observes completed/import-blocked/warning queue records and their Sonarr-reported rejection reason(s). Every reason defaults to "leave in queue"; automatic removal is a separate switch, disabled by default. "Unknown" and any message that cannot be matched to a known reason are <strong>never</strong> eligible for automatic removal, no matter what is selected below. Removal (when it fires) reuses the exact same bounded Sonarr queue DELETE as the slow-download guard above - there is no force-import and no other Sonarr write here.</p>
+    <label>Sonarr instance <select id="ifp-library"></select></label>
+    <label><input id="ifp-monitoring" type="checkbox"> Monitoring enabled</label>
+    <label class="danger-confirm"><input id="ifp-auto-removal" type="checkbox"> Automatic removal enabled (destructive - removes from client and/or blocklists in Sonarr for the reasons selected below)</label>
+    <label>Poll cadence (seconds) <input id="ifp-poll" type="number" min="15" max="3600"></label>
+    <label><input id="ifp-remove-from-client" type="checkbox"> Remove from download client</label>
+    <label><input id="ifp-blocklist" type="checkbox"> Blocklist release</label>
+    <label><input id="ifp-skip-redownload" type="checkbox"> Skip redownload</label>
+
+    <h3>Removal-eligible reasons</h3>
+    <p class="muted">Checking a reason only makes it <em>eligible</em> for automatic removal; removal still requires the master switch above and every reason observed on an item to be checked here. Newly checking any reason, enabling automatic removal, or turning on remove-from-client/blocklist/skip-redownload all require the explicit confirmation below.</p>
+    <div id="ifp-reason-groups">Loading reasons...</div>
+
+    <label id="ifp-confirm-wrap" class="danger-confirm" hidden>
+      <input id="ifp-confirm-check" type="checkbox">
+      I understand this enables or expands automatic removal for the reasons selected above.
+    </label>
+    <label id="ifp-reason-wrap" hidden>Reason <input id="ifp-reason" type="text" maxlength="500" placeholder="Reason for enabling or expanding automatic removal"></label>
+    <div class="form-actions"><button type="button" id="ifp-save">Save settings</button></div>
+    <pre id="ifp-result"></pre>
+  </section>
+  <section class="card">
+    <h2>Tracked import-failure items</h2>
+    <div class="table-scroll"><table class="data-table">
+      <thead><tr><th>Title</th><th>Status</th><th>Matched reasons</th><th>Decision</th><th>Reason</th></tr></thead>
+      <tbody id="ifp-rows"><tr><td colspan="5">Loading...</td></tr></tbody>
+    </table></div>
+    <div class="form-actions"><button type="button" id="ifp-refresh" class="button-secondary">Refresh</button></div>
+  </section>
+  <section class="card">
+    <h2>Observed unmatched messages</h2>
+    <p class="muted">Raw Sonarr queue messages the policy could not match to any known reason. These are informational only - an unmatched message is always left in the queue and can never be selected for automatic removal.</p>
+    <ul id="ifp-unmatched" class="muted"><li>Loading...</li></ul>
+  </section>
 </section>
 {% endblock %}
 {% block scripts %}
@@ -510,6 +548,136 @@ loadPolicy().catch(err => toast('Failed to load hunting policy: ' + err.message)
   });
   function showSdg(value) { $('sdg-result').textContent = value instanceof Error ? value.message : value; }
   loadSdgLibraries().catch(showSdg);
+})();
+
+// --- Import-failure reason policy -------------------------------------------
+(() => {
+  const $ = id => document.getElementById(id);
+  let currentSettings = null;
+  let reasonGroups = [];
+  async function ifpApi(url, options = {}) {
+    const response = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
+    const body = await response.json();
+    if (!response.ok) throw new Error((body.errors || ['Request failed']).join('; '));
+    return body;
+  }
+  function reasonCheckboxId(key) { return 'ifp-reason-' + key.replace(/[^A-Za-z0-9]/g, '-'); }
+  async function loadReasonGroups() {
+    const body = await ifpApi('/api/v1/import-failure/reasons');
+    reasonGroups = body.groups;
+    // Every value here (group names, reason keys) comes from this
+    // application's own fixed catalog - never Sonarr- or operator-derived
+    // - but is still escaped for defense in depth, same discipline as
+    // every other innerHTML write on this page.
+    $('ifp-reason-groups').innerHTML = reasonGroups.map(group => (
+      '<div class="reason-group"><div class="reason-group-title">' + escapeHtml(group.name) + '</div>'
+      + group.reasons.map(key => (
+        '<label class="checkbox"><input type="checkbox" id="' + reasonCheckboxId(key) + '"> ' + escapeHtml(key) + '</label>'
+      )).join('')
+      + '</div>'
+    )).join('');
+  }
+  function allReasonKeys() { return reasonGroups.flatMap(g => g.reasons); }
+  function setSelectedReasons(keys) {
+    const selected = new Set(keys);
+    allReasonKeys().forEach(key => {
+      const el = document.getElementById(reasonCheckboxId(key));
+      if (el) el.checked = selected.has(key);
+    });
+  }
+  function getSelectedReasons() {
+    return allReasonKeys().filter(key => {
+      const el = document.getElementById(reasonCheckboxId(key));
+      return el && el.checked;
+    });
+  }
+  async function loadIfpLibraries() {
+    const body = await ifpApi('/api/v1/libraries');
+    const libraries = body.libraries.filter(x => x.type === 'sonarr' && x.enabled);
+    $('ifp-library').innerHTML = libraries.map(x => '<option value="' + x.id + '">' + x.name + '</option>').join('');
+    if (libraries.length) await loadIfpSettings();
+  }
+  async function loadIfpSettings() {
+    const id = $('ifp-library').value;
+    if (!id) return;
+    const body = await ifpApi('/api/v1/libraries/' + id + '/import-failure/settings');
+    currentSettings = body.settings;
+    const s = currentSettings;
+    $('ifp-monitoring').checked = s.monitoring_enabled;
+    $('ifp-auto-removal').checked = s.auto_removal_enabled;
+    $('ifp-poll').value = s.poll_seconds;
+    $('ifp-remove-from-client').checked = s.remove_from_client;
+    $('ifp-blocklist').checked = s.blocklist;
+    $('ifp-skip-redownload').checked = s.skip_redownload;
+    setSelectedReasons(s.removal_reasons);
+    await loadIfpQueue();
+  }
+  async function loadIfpQueue() {
+    const id = $('ifp-library').value;
+    if (!id) return;
+    const body = await ifpApi('/api/v1/libraries/' + id + '/import-failure/queue');
+    const rows = body.items;
+    // Every field here is Sonarr-derived (title/status/matched reasons are
+    // influenceable by a crafted release/download name or status message)
+    // and must never reach innerHTML unescaped.
+    if (!rows.length) {
+      $('ifp-rows').innerHTML = '<tr><td colspan="5">No tracked items.</td></tr>';
+    } else {
+      $('ifp-rows').innerHTML = rows.map(r => (
+        '<tr><td>' + escapeHtml(r.title || '(untitled)') + '</td><td>' + escapeHtml(r.status || '')
+        + '</td><td>' + escapeHtml((r.matched_reasons || []).join(', ')) + '</td><td>' + escapeHtml(r.decision)
+        + '</td><td class="muted">' + escapeHtml(r.decision_reason || '') + '</td></tr>'
+      )).join('');
+    }
+    const unmatched = rows.flatMap(r => r.unmatched_messages || []);
+    $('ifp-unmatched').innerHTML = unmatched.length
+      ? unmatched.map(m => '<li>' + escapeHtml(m) + '</li>').join('')
+      : '<li>None observed.</li>';
+  }
+  $('ifp-library').addEventListener('change', () => loadIfpSettings().catch(showIfp));
+  $('ifp-refresh').addEventListener('click', () => loadIfpQueue().catch(showIfp));
+  function updateIfpConfirmVisibility() {
+    const currentlySelected = new Set(currentSettings ? currentSettings.removal_reasons : []);
+    const addedReasons = getSelectedReasons().some(key => !currentlySelected.has(key));
+    const enablingAutoRemoval = $('ifp-auto-removal').checked && currentSettings && !currentSettings.auto_removal_enabled;
+    const booleanLoosening = ['ifp-remove-from-client', 'ifp-blocklist', 'ifp-skip-redownload'].some(id => (
+      $(id).checked && currentSettings && !currentSettings[id.replace('ifp-', '').replace(/-/g, '_')]
+    ));
+    const needsConfirm = enablingAutoRemoval || addedReasons || (($('ifp-auto-removal').checked) && booleanLoosening);
+    $('ifp-confirm-wrap').hidden = !needsConfirm;
+    $('ifp-reason-wrap').hidden = !needsConfirm;
+    return needsConfirm;
+  }
+  $('ifp-reason-groups').addEventListener('change', updateIfpConfirmVisibility);
+  $('ifp-auto-removal').addEventListener('change', updateIfpConfirmVisibility);
+  $('ifp-remove-from-client').addEventListener('change', updateIfpConfirmVisibility);
+  $('ifp-blocklist').addEventListener('change', updateIfpConfirmVisibility);
+  $('ifp-skip-redownload').addEventListener('change', updateIfpConfirmVisibility);
+  $('ifp-save').addEventListener('click', async () => {
+    const needsConfirm = updateIfpConfirmVisibility();
+    if (needsConfirm && !confirm('Enable or expand automatic removal? This will delete matching downloads from the Sonarr queue (and may remove from client / blocklist) once every observed reason on an item is selected.')) return;
+    const payload = {
+      revision: currentSettings ? currentSettings.revision : undefined,
+      monitoring_enabled: $('ifp-monitoring').checked,
+      auto_removal_enabled: $('ifp-auto-removal').checked,
+      poll_seconds: Number($('ifp-poll').value),
+      remove_from_client: $('ifp-remove-from-client').checked,
+      blocklist: $('ifp-blocklist').checked,
+      skip_redownload: $('ifp-skip-redownload').checked,
+      removal_reasons: getSelectedReasons(),
+    };
+    if (needsConfirm) {
+      if (!$('ifp-confirm-check').checked) return showIfp('Tick the explicit confirmation first.');
+      payload.confirm = true;
+      payload.reason = $('ifp-reason').value || 'operator confirmed from Sonarr workspace';
+    }
+    const body = await ifpApi('/api/v1/libraries/' + $('ifp-library').value + '/import-failure/settings', { method: 'PATCH', body: JSON.stringify(payload) });
+    currentSettings = body.settings;
+    showIfp('Settings saved.');
+    await loadIfpSettings();
+  });
+  function showIfp(value) { $('ifp-result').textContent = value instanceof Error ? value.message : value; }
+  loadReasonGroups().then(loadIfpLibraries).catch(showIfp);
 })();
 </script>
 {% endblock %}

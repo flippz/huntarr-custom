@@ -602,7 +602,7 @@ def test_v6_live_control_bounds_are_enforced(database):
 
 
 def test_v8_raises_legacy_singleton_ceiling_without_changing_authorization(database):
-    assert [item.version for item in MIGRATIONS[-6:]] == [9, 10, 11, 12, 13, 14]
+    assert [item.version for item in MIGRATIONS[-7:]] == [9, 10, 11, 12, 13, 14, 15]
     migration = next(item for item in MIGRATIONS if item.version == 8)
     with database.connect() as conn:
         conn.execute(
@@ -748,6 +748,141 @@ def test_v14_library_deletion_succeeds_with_populated_slow_download_audit_and_re
     with pytest.raises(Exception, match="append-only"):
         with database.connect() as conn:
             conn.execute("DELETE FROM slow_download_actions")
+
+
+def test_v15_import_failure_tables_exist_with_safe_defaults(database, library_repo):
+    with database.connect() as conn:
+        tables = {r["table_name"] for r in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+        ).fetchall()}
+    for table in (
+        "import_failure_reason_catalog", "import_failure_policies", "import_failure_policy_reasons",
+        "import_failure_policy_audit", "import_failure_queue_items", "import_failure_actions",
+        "import_failure_removal_attempts",
+    ):
+        assert table in tables
+
+    library = library_repo.create({"name": "Sonarr", "type": "sonarr", "url": "http://sonarr", "api_key": "k", "enabled": True})
+    with database.connect() as conn:
+        conn.execute("INSERT INTO import_failure_policies (library_id) VALUES (%s)", (library.id,))
+        row = conn.execute("SELECT * FROM import_failure_policies WHERE library_id = %s", (library.id,)).fetchone()
+    # Monitoring enabled, automatic removal disabled, no reasons selected -
+    # the core migration safety requirement: a fresh deploy/migration never
+    # starts deleting and every reason starts out "leave".
+    assert row["monitoring_enabled"] is True
+    assert row["auto_removal_enabled"] is False
+    assert row["remove_from_client"] is True and row["blocklist"] is True and row["skip_redownload"] is False
+    with database.connect() as conn:
+        reasons = conn.execute(
+            "SELECT reason_key FROM import_failure_policy_reasons WHERE library_id = %s", (library.id,)
+        ).fetchall()
+    assert reasons == []
+
+
+def test_v15_reason_catalog_is_seeded_with_every_selectable_key_and_excludes_unknown(database):
+    from app.domain.import_failure import REMOVAL_SELECTABLE_REASON_KEYS
+
+    with database.connect() as conn:
+        keys = {r["reason_key"] for r in conn.execute("SELECT reason_key FROM import_failure_reason_catalog").fetchall()}
+    assert keys == REMOVAL_SELECTABLE_REASON_KEYS
+    assert "Unknown" not in keys
+
+
+def test_v15_policy_reasons_are_fk_validated_against_the_catalog(database, library_repo):
+    library = library_repo.create({"name": "Sonarr", "type": "sonarr", "url": "http://sonarr", "api_key": "k", "enabled": True})
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        with database.connect() as conn:
+            conn.execute(
+                "INSERT INTO import_failure_policy_reasons (library_id, reason_key) VALUES (%s, 'TotallyMadeUp')",
+                (library.id,),
+            )
+    # "Unknown" is a real canonical catalog key but deliberately absent from
+    # this lookup table - it can never be selected, enforced at the schema
+    # level independent of any application-layer bug.
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        with database.connect() as conn:
+            conn.execute(
+                "INSERT INTO import_failure_policy_reasons (library_id, reason_key) VALUES (%s, 'Unknown')",
+                (library.id,),
+            )
+    with database.connect() as conn:
+        conn.execute(
+            "INSERT INTO import_failure_policy_reasons (library_id, reason_key) VALUES (%s, 'Sample')",
+            (library.id,),
+        )
+
+
+def test_v15_auto_removal_requires_remove_from_client_or_blocklist(database, library_repo):
+    library = library_repo.create({"name": "Sonarr", "type": "sonarr", "url": "http://sonarr", "api_key": "k", "enabled": True})
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with database.connect() as conn:
+            conn.execute(
+                "INSERT INTO import_failure_policies (library_id, auto_removal_enabled, remove_from_client, blocklist) "
+                "VALUES (%s, TRUE, FALSE, FALSE)",
+                (library.id,),
+            )
+
+
+def test_v15_policy_audit_actions_and_removal_markers_are_append_only(database, library_repo):
+    library = library_repo.create({"name": "Sonarr", "type": "sonarr", "url": "http://sonarr", "api_key": "k", "enabled": True})
+    with database.connect() as conn:
+        conn.execute(
+            "INSERT INTO import_failure_policy_audit (library_id, revision_before, revision_after, "
+            "auto_removal_enabled_before, auto_removal_enabled_after) VALUES (%s, 0, 1, FALSE, TRUE)",
+            (library.id,),
+        )
+        item_id = conn.execute(
+            "INSERT INTO import_failure_queue_items (library_id, sonarr_queue_id) VALUES (%s, 1) RETURNING id",
+            (library.id,),
+        ).fetchone()["id"]
+        conn.execute(
+            "INSERT INTO import_failure_actions (queue_item_id, library_id, sonarr_queue_id, action, reason) "
+            "VALUES (%s, %s, 1, 'observed', 'test')",
+            (item_id, library.id),
+        )
+        conn.execute("INSERT INTO import_failure_removal_attempts (queue_item_id) VALUES (%s)", (item_id,))
+
+    with pytest.raises(Exception, match="append-only"):
+        with database.connect() as conn:
+            conn.execute("UPDATE import_failure_policy_audit SET reason = 'tampered'")
+    with pytest.raises(Exception, match="append-only"):
+        with database.connect() as conn:
+            conn.execute("DELETE FROM import_failure_actions WHERE queue_item_id = %s", (item_id,))
+    with pytest.raises(Exception, match="append-only"):
+        with database.connect() as conn:
+            conn.execute("UPDATE import_failure_removal_attempts SET started_at = now() WHERE queue_item_id = %s", (item_id,))
+    with pytest.raises(Exception, match="append-only"):
+        with database.connect() as conn:
+            conn.execute("DELETE FROM import_failure_removal_attempts WHERE queue_item_id = %s", (item_id,))
+
+
+def test_v15_library_deletion_retains_audit_with_nulled_identity(database, library_repo):
+    library = library_repo.create({"name": "Sonarr", "type": "sonarr", "url": "http://sonarr", "api_key": "k", "enabled": True})
+    with database.connect() as conn:
+        item_id = conn.execute(
+            "INSERT INTO import_failure_queue_items (library_id, sonarr_queue_id) VALUES (%s, 1) RETURNING id",
+            (library.id,),
+        ).fetchone()["id"]
+        conn.execute(
+            "INSERT INTO import_failure_actions (queue_item_id, library_id, sonarr_queue_id, action, reason) "
+            "VALUES (%s, %s, 1, 'observed', 'test')",
+            (item_id, library.id),
+        )
+
+    assert library_repo.delete(library.id) is True
+    assert library_repo.get(library.id) is None
+
+    with database.connect() as conn:
+        # The queue-item row itself survives with its identity column
+        # nulled (SET NULL, not CASCADE) - the same lesson learned from the
+        # slow-download guard's own P1 fix, applied here from the start.
+        row = conn.execute("SELECT id, library_id FROM import_failure_queue_items WHERE id = %s", (item_id,)).fetchone()
+        assert row is not None
+        assert row["library_id"] is None
+        action = conn.execute("SELECT queue_item_id, library_id, reason FROM import_failure_actions WHERE queue_item_id = %s", (item_id,)).fetchone()
+        assert action is not None
+        assert action["library_id"] == library.id  # immutable snapshot, not an FK
+        assert action["reason"] == "test"
 
 
 def test_v6_live_challenge_kind_shape_is_enforced(database):

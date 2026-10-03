@@ -385,6 +385,10 @@ def test_off_simulate_and_unarmed_live_never_instantiate_write_client(
     # of scope for this specific live-dispatch *write*-client safety check.
     monkeypatch.setattr(worker.slow_download_service, "poll_all", lambda **_kwargs: [])
     monkeypatch.setattr(worker.slow_download_service, "attempt_removals", lambda **_kwargs: [])
+    # Same rationale, same out-of-scope read-only GET source, for the
+    # import-failure reason policy's own independent monitoring.
+    monkeypatch.setattr(worker.import_failure_service, "poll_all", lambda **_kwargs: [])
+    monkeypatch.setattr(worker.import_failure_service, "attempt_removals", lambda **_kwargs: [])
 
     # off
     worker.run_once()

@@ -18,6 +18,7 @@ from app.persistence.scheduler_repository import SchedulerRepository
 from app.persistence.refresh_repository import RefreshRepository
 from app.persistence.live_repository import LiveRepository
 from app.persistence.slow_download_repository import SlowDownloadRepository
+from app.persistence.import_failure_repository import ImportFailureRepository
 from app.services.dispatch_planning_service import DispatchPlanningService
 from app.services.dispatch_service import DispatchService
 from app.services.reconciliation_service import ReconciliationService
@@ -27,6 +28,7 @@ from app.services.refresh_settings_service import RefreshSettingsService
 from app.services.live_control_service import LiveControlService
 from app.services.live_dispatch_coordinator import LiveDispatchCoordinator
 from app.services.slow_download_service import SlowDownloadService
+from app.services.import_failure_service import ImportFailureService
 
 # Tests run against a real PostgreSQL instance - no SQLite/mock DB layer.
 # Point MANAGEARR_TEST_DB_* at a disposable database; the suite truncates
@@ -46,7 +48,9 @@ _DATA_TABLES = (
     "scheduler_run_requests, scheduler_mode_audit, "
     "refresh_run_reconciled_batches, refresh_runs, refresh_requests, "
     "live_dispatch_ledger, live_control_audit, live_challenges, season_pack_attempt_started, season_pack_audit, season_pack_settings, "
-    "slow_download_removal_attempts, slow_download_actions, slow_download_observations, slow_download_queue_items, slow_download_settings"
+    "slow_download_removal_attempts, slow_download_actions, slow_download_observations, slow_download_queue_items, slow_download_settings, "
+    "import_failure_removal_attempts, import_failure_actions, import_failure_queue_items, "
+    "import_failure_policy_audit, import_failure_policy_reasons, import_failure_policies"
 )
 
 
@@ -217,3 +221,13 @@ def slow_download_repo(database):
 @pytest.fixture
 def slow_download_service(slow_download_repo, library_repo, live_repo, scheduler_repo):
     return SlowDownloadService(slow_download_repo, library_repo, live_repo, scheduler_repo)
+
+
+@pytest.fixture
+def import_failure_repo(database):
+    return ImportFailureRepository(database)
+
+
+@pytest.fixture
+def import_failure_service(import_failure_repo, library_repo, live_repo, scheduler_repo):
+    return ImportFailureService(import_failure_repo, library_repo, live_repo, scheduler_repo)

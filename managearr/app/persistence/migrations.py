@@ -1505,6 +1505,182 @@ MIGRATIONS: list[Migration] = [
                 FOR EACH ROW EXECUTE FUNCTION protect_slow_download_append_only();
         """,
     ),
+    Migration(
+        version=15,
+        name="import_failure_reason_policy",
+        sql="""
+            -- Sonarr-only import-failure reason policy. Reason-aware
+            -- observation and reason-gated removal only - no force-import,
+            -- no new Sonarr write beyond the existing queue DELETE already
+            -- used by the slow-download guard. Every reason defaults to
+            -- "leave"; global automatic removal defaults to FALSE and this
+            -- migration never flips it for an existing library.
+            --
+            -- A fixed lookup table of every reason key an operator may
+            -- ever select for automatic removal - the 34 Sonarr v4
+            -- ImportRejectionReason values minus 'Unknown' (which is never
+            -- selectable; see app/domain/import_failure.py), plus the one
+            -- synthetic 'SeriesMatchedByIdOnly' queue-only message key.
+            -- Foreign-keying policy selections to this table means an
+            -- invalid/unrecognized reason key can never be persisted as
+            -- removal-eligible, independent of any application-layer bug.
+            CREATE TABLE import_failure_reason_catalog (
+                reason_key TEXT PRIMARY KEY CHECK (length(reason_key) <= 64)
+            );
+            INSERT INTO import_failure_reason_catalog (reason_key) VALUES
+                ('FileLocked'), ('UnknownSeries'), ('DangerousFile'), ('ExecutableFile'),
+                ('ArchiveFile'), ('SeriesFolder'), ('InvalidFilePath'), ('UnsupportedExtension'),
+                ('PartialSeason'), ('SeasonExtra'), ('InvalidSeasonOrEpisode'), ('UnableToParse'),
+                ('Error'), ('DecisionError'), ('NoEpisodes'), ('MissingAbsoluteEpisodeNumber'),
+                ('EpisodeAlreadyImported'), ('TitleMissing'), ('TitleTba'), ('MinimumFreeSpace'),
+                ('FullSeason'), ('NoAudio'), ('EpisodeUnexpected'), ('EpisodeNotFoundInRelease'),
+                ('Sample'), ('SampleIndeterminate'), ('Unpacking'), ('ExistingFileHasMoreEpisodes'),
+                ('SplitEpisode'), ('UnverifiedSceneMapping'), ('NotQualityUpgrade'),
+                ('NotRevisionUpgrade'), ('NotCustomFormatUpgrade'), ('SeriesMatchedByIdOnly');
+
+            -- One row per Sonarr library. Monitoring/removal are
+            -- deliberately separate flags, exactly like
+            -- slow_download_settings: auto_removal_enabled defaults to
+            -- FALSE and a fresh/upgraded deploy never starts deleting
+            -- anything. revision is optimistic-concurrency, bumped on
+            -- every settings write.
+            CREATE TABLE import_failure_policies (
+                library_id BIGINT PRIMARY KEY REFERENCES arr_libraries(id) ON DELETE CASCADE,
+                monitoring_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                auto_removal_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                poll_seconds INTEGER NOT NULL DEFAULT 60 CHECK (poll_seconds BETWEEN 15 AND 3600),
+                remove_from_client BOOLEAN NOT NULL DEFAULT TRUE,
+                blocklist BOOLEAN NOT NULL DEFAULT TRUE,
+                skip_redownload BOOLEAN NOT NULL DEFAULT FALSE,
+                revision BIGINT NOT NULL DEFAULT 1 CHECK (revision >= 1),
+                last_polled_at TIMESTAMPTZ NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                CHECK (
+                    NOT auto_removal_enabled OR (remove_from_client OR blocklist)
+                )
+            );
+
+            -- Which reasons are currently selected as removal-eligible for
+            -- a library. Absence of a row means "leave" - the safe
+            -- default for every reason. FK-validated against the fixed
+            -- catalog above so only a recognized key can ever be stored.
+            CREATE TABLE import_failure_policy_reasons (
+                library_id BIGINT NOT NULL REFERENCES arr_libraries(id) ON DELETE CASCADE,
+                reason_key TEXT NOT NULL REFERENCES import_failure_reason_catalog(reason_key),
+                PRIMARY KEY (library_id, reason_key)
+            );
+
+            -- Append-only revision/audit trail of every policy settings
+            -- change - distinct from the per-item action audit below.
+            -- library_id is an immutable identity snapshot (not an FK),
+            -- matching slow_download_actions: deleting a library must
+            -- never rewrite append-only audit history. Newly selecting
+            -- any removal category, or enabling/loosening automatic
+            -- removal, always requires confirm=TRUE and a non-empty
+            -- reason - enforced in the service layer and recorded here.
+            CREATE TABLE import_failure_policy_audit (
+                id BIGSERIAL PRIMARY KEY,
+                library_id BIGINT NOT NULL,
+                revision_before BIGINT NOT NULL,
+                revision_after BIGINT NOT NULL,
+                auto_removal_enabled_before BOOLEAN NOT NULL,
+                auto_removal_enabled_after BOOLEAN NOT NULL,
+                added_reasons TEXT[] NOT NULL DEFAULT '{}',
+                removed_reasons TEXT[] NOT NULL DEFAULT '{}',
+                confirm BOOLEAN NOT NULL DEFAULT FALSE,
+                reason TEXT NOT NULL DEFAULT '' CHECK (length(reason) <= 500),
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX idx_import_failure_policy_audit_library_time
+                ON import_failure_policy_audit (library_id, occurred_at DESC);
+            CREATE OR REPLACE FUNCTION protect_import_failure_append_only() RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'import-failure audit rows are append-only';
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER trg_protect_import_failure_policy_audit
+                BEFORE UPDATE OR DELETE ON import_failure_policy_audit
+                FOR EACH ROW EXECUTE FUNCTION protect_import_failure_append_only();
+
+            -- Durable current tracking for one watched Sonarr queue record
+            -- (completed/importBlocked/warning-or-error tracked status).
+            -- Keyed by the library plus the Sonarr queue record's own
+            -- immutable positive integer id, never downloadId - exactly
+            -- the same identity rule as slow_download_queue_items, and
+            -- for the same reason (Sonarr can reuse/rotate downloadId
+            -- across queue records).
+            CREATE TABLE import_failure_queue_items (
+                id BIGSERIAL PRIMARY KEY,
+                library_id BIGINT NULL REFERENCES arr_libraries(id) ON DELETE SET NULL,
+                sonarr_queue_id BIGINT NOT NULL CHECK (sonarr_queue_id > 0),
+                download_id TEXT NULL CHECK (download_id IS NULL OR length(download_id) <= 255),
+                title TEXT NOT NULL DEFAULT '' CHECK (length(title) <= 500),
+                status TEXT NOT NULL DEFAULT '' CHECK (length(status) <= 64),
+                tracked_state TEXT NULL CHECK (tracked_state IS NULL OR length(tracked_state) <= 64),
+                tracked_status TEXT NULL CHECK (tracked_status IS NULL OR length(tracked_status) <= 64),
+                matched_reasons TEXT[] NOT NULL DEFAULT '{}',
+                unmatched_messages TEXT[] NOT NULL DEFAULT '{}',
+                decision TEXT NOT NULL DEFAULT 'leave' CHECK (
+                    decision IN ('leave', 'remove_eligible', 'removed', 'ambiguous', 'resolved')
+                ),
+                decision_reason TEXT NOT NULL DEFAULT '' CHECK (length(decision_reason) <= 1000),
+                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                removed_at TIMESTAMPTZ NULL,
+                removal_outcome TEXT NULL CHECK (
+                    removal_outcome IS NULL OR removal_outcome IN ('completed', 'rejected', 'ambiguous')
+                ),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (library_id, sonarr_queue_id)
+            );
+            CREATE INDEX idx_import_failure_queue_items_library_decision
+                ON import_failure_queue_items (library_id, decision, updated_at DESC);
+            CREATE INDEX idx_import_failure_queue_items_last_seen
+                ON import_failure_queue_items (last_seen_at);
+
+            -- Append-only per-item action audit - observed/decision
+            -- changes/removal lifecycle - sufficient on its own to explain
+            -- any removal. Same append-only trigger function and the same
+            -- plain-snapshot (not FK) library_id convention as
+            -- slow_download_actions.
+            CREATE TABLE import_failure_actions (
+                id BIGSERIAL PRIMARY KEY,
+                queue_item_id BIGINT NOT NULL REFERENCES import_failure_queue_items(id) ON DELETE RESTRICT,
+                library_id BIGINT NOT NULL,
+                sonarr_queue_id BIGINT NOT NULL CHECK (sonarr_queue_id > 0),
+                action TEXT NOT NULL CHECK (
+                    action IN (
+                        'observed', 'decision_changed', 'resolved', 'cleared_disappeared',
+                        'removal_attempt_started', 'removal_completed',
+                        'removal_rejected', 'removal_ambiguous'
+                    )
+                ),
+                reason TEXT NOT NULL DEFAULT '' CHECK (length(reason) <= 1000),
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX idx_import_failure_actions_item_time
+                ON import_failure_actions (queue_item_id, occurred_at DESC, id DESC);
+            CREATE INDEX idx_import_failure_actions_library_time
+                ON import_failure_actions (library_id, occurred_at DESC);
+            CREATE TRIGGER trg_protect_import_failure_actions
+                BEFORE UPDATE OR DELETE ON import_failure_actions
+                FOR EACH ROW EXECUTE FUNCTION protect_import_failure_append_only();
+
+            -- Durable removal attempt-start marker, committed
+            -- independently just before the bounded Sonarr DELETE - same
+            -- pattern as slow_download_removal_attempts. Its mere
+            -- existence for a queue item permanently forbids any further
+            -- automatic retry of that exact queue record.
+            CREATE TABLE import_failure_removal_attempts (
+                queue_item_id BIGINT PRIMARY KEY REFERENCES import_failure_queue_items(id) ON DELETE RESTRICT,
+                started_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE TRIGGER trg_protect_import_failure_removal_attempts
+                BEFORE UPDATE OR DELETE ON import_failure_removal_attempts
+                FOR EACH ROW EXECUTE FUNCTION protect_import_failure_append_only();
+        """,
+    ),
 ]
 
 

@@ -23,6 +23,7 @@ from .persistence.refresh_repository import RefreshRepository
 from .persistence.live_repository import LiveRepository
 from .persistence.season_pack_repository import SeasonPackRepository
 from .persistence.slow_download_repository import SlowDownloadRepository
+from .persistence.import_failure_repository import ImportFailureRepository
 from .services.library_service import LibraryService
 from .services.policy_service import PolicyService
 from .services.activity_service import ActivityService
@@ -37,6 +38,7 @@ from .services.refresh_settings_service import RefreshSettingsService
 from .services.live_control_service import LiveControlService
 from .services.season_pack_service import SeasonPackService
 from .services.slow_download_service import SlowDownloadService
+from .services.import_failure_service import ImportFailureService
 from .api import api_bp
 from .web import web_bp
 
@@ -74,6 +76,7 @@ def create_app(config: dict | None = None) -> Flask:
     live_repo = LiveRepository(db)
     season_pack_repo = SeasonPackRepository(db)
     slow_download_repo = SlowDownloadRepository(db)
+    import_failure_repo = ImportFailureRepository(db)
 
     sonarr_timeout = app.config.get("SONARR_TIMEOUT_SECONDS")
 
@@ -102,6 +105,8 @@ def create_app(config: dict | None = None) -> Flask:
         "season_pack": SeasonPackService(season_pack_repo, library_repo, live_repo, scheduler_repo, timeout=sonarr_timeout),
         "slow_download_repo": slow_download_repo,
         "slow_download": SlowDownloadService(slow_download_repo, library_repo, live_repo, scheduler_repo, timeout=sonarr_timeout),
+        "import_failure_repo": import_failure_repo,
+        "import_failure": ImportFailureService(import_failure_repo, library_repo, live_repo, scheduler_repo, timeout=sonarr_timeout),
         # LiveControlService never imports DispatchService or a Sonarr
         # adapter - it can only change mode/arm state through the
         # two-step challenge/confirm flow. Scheduled live dispatch itself
