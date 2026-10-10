@@ -233,6 +233,16 @@ class MagnetarrMixin:
             ).fetchone()
             return row is not None
 
+    def get_realdebrid_submission(self, info_hash: str) -> Optional[Dict[str, Any]]:
+        """Return the tracked submission for an info-hash, if present."""
+        with self.get_connection() as conn:
+            with self._use_row_factory(conn) as c:
+                row = c.execute(
+                    'SELECT * FROM magnetarr_realdebrid_submissions WHERE info_hash = ?',
+                    (info_hash.lower(),)
+                ).fetchone()
+            return dict(row) if row else None
+
     def upsert_realdebrid_submission(self, data: Dict[str, Any]) -> None:
         """Create or update the tracked Real-Debrid submission for a magnet (keyed by info_hash)."""
         with self.get_connection() as conn:
@@ -242,7 +252,12 @@ class MagnetarrMixin:
                      content_hash, status, last_error, last_checked_at, active)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                 ON CONFLICT(info_hash) DO UPDATE SET
-                    rd_torrent_id = excluded.rd_torrent_id,
+                    rd_torrent_id = CASE
+                        WHEN ? THEN excluded.rd_torrent_id
+                        WHEN magnetarr_realdebrid_submissions.rd_torrent_id != ''
+                            THEN magnetarr_realdebrid_submissions.rd_torrent_id
+                        ELSE excluded.rd_torrent_id
+                    END,
                     content_hash = excluded.content_hash,
                     status = excluded.status,
                     last_error = excluded.last_error,
@@ -259,6 +274,7 @@ class MagnetarrMixin:
                 data.get('status', 'pending'),
                 data.get('last_error', ''),
                 1 if data.get('active', True) else 0,
+                1 if data.get('replace_rd_torrent_id', False) else 0,
             ))
             conn.commit()
 

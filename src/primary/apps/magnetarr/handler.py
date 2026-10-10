@@ -13,6 +13,7 @@ the Torznab endpoint to serve.
 import re
 import time
 import hashlib
+import threading
 import html as html_module
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -26,6 +27,10 @@ from src.primary.settings_manager import load_settings
 from src.primary.apps.magnetarr.realdebrid import rd_add_and_select, rd_get_status, rd_delete_torrent, RD_STATUS_DELETED
 
 magnetarr_logger = get_logger("magnetarr")
+
+# RD add/select is not idempotent. Serialize the local check/add/store sequence
+# across the scanner and watched-post rechecker.
+_REALDEBRID_SUBMISSION_LOCK = threading.RLock()
 
 USER_AGENT = "Mozilla/5.0 (compatible; Huntarr-Magnetarr/1.0; +https://github.com/plexguide/Huntarr)"
 
@@ -221,32 +226,50 @@ def matches_realdebrid_keywords(title: str, keywords_csv: str) -> bool:
     return all(k.lower() in title_lower for k in keywords)
 
 
-def _submit_to_realdebrid(source_id: str, post: Dict[str, Any], magnet_uri: str, info_hash: str, title: str) -> None:
-    """Send a newly discovered magnet to Real-Debrid and start tracking its post
-    for content changes (see recheck_realdebrid_watched_posts)."""
-    settings = load_settings("magnetarr")
-    api_token = (settings.get("realdebrid_api_token") or "").strip()
+def _submit_to_realdebrid(source_id: str, post: Dict[str, Any], magnet_uri: str,
+                            info_hash: str, title: str, api_token: str = '',
+                            replace_inactive: bool = False) -> bool:
+    """Submit once per info-hash and retain the first tracked RD torrent ID."""
+    if not api_token:
+        settings = load_settings("magnetarr")
+        api_token = (settings.get("realdebrid_api_token") or "").strip()
     if not api_token:
         magnetarr_logger.warning("Real-Debrid auto-add is enabled for a source but no API token is configured")
-        return
+        return False
 
     db = get_database()
-    torrent_id, err = rd_add_and_select(magnet_uri, api_token)
-    if err:
-        magnetarr_logger.warning(f"Real-Debrid submission failed for '{title}': {err}")
+    with _REALDEBRID_SUBMISSION_LOCK:
+        existing = db.get_realdebrid_submission(info_hash)
+        if existing and (existing.get('active') or not replace_inactive):
+            return False
 
-    db.upsert_realdebrid_submission({
-        'info_hash': info_hash,
-        'magnet_uri': magnet_uri,
-        'title': title,
-        'permalink': post.get('permalink', ''),
-        'source_id': source_id,
-        'rd_torrent_id': torrent_id or '',
-        'content_hash': _hash_post_content(post.get('content_html', '')),
-        'status': 'error' if err else 'submitted',
-        'last_error': err,
-        'active': True,
-    })
+        torrent_id, err = rd_add_and_select(magnet_uri, api_token)
+        if err:
+            magnetarr_logger.warning(f"Real-Debrid submission failed for '{title}': {err}")
+
+        db.upsert_realdebrid_submission({
+            'info_hash': info_hash,
+            'magnet_uri': magnet_uri,
+            'title': title,
+            'permalink': post.get('permalink', ''),
+            'source_id': source_id,
+            'rd_torrent_id': torrent_id or '',
+            'content_hash': _hash_post_content(post.get('content_html', '')),
+            'status': 'error' if err else 'submitted',
+            'last_error': err,
+            'active': True,
+            'replace_rd_torrent_id': bool(existing),
+        })
+
+        # The upsert also preserves a concurrently-created canonical ID (for
+        # example from another process). Remove our losing RD torrent at once.
+        canonical = db.get_realdebrid_submission(info_hash)
+        canonical_id = (canonical or {}).get('rd_torrent_id', '')
+        if torrent_id and canonical_id and canonical_id != torrent_id:
+            delete_err = rd_delete_torrent(torrent_id, api_token)
+            if delete_err:
+                magnetarr_logger.debug(f"Real-Debrid delete of duplicate entry: {delete_err}")
+        return True
 
 
 def extract_magnets_from_post(post: Dict[str, Any]) -> Tuple[List[str], bool]:
@@ -321,10 +344,9 @@ def scan_source(source: Dict[str, Any]) -> Dict[str, int]:
                 # under a keyword filter that excluded it. A source whose own filter
                 # matches should still be able to trigger the first submission.
                 if (source.get('realdebrid_auto_add')
-                        and matches_realdebrid_keywords(title, source.get('realdebrid_keywords', ''))
-                        and not db.has_realdebrid_submission(info_hash)):
-                    _submit_to_realdebrid(source_id, post, magnet_uri, info_hash, title)
-                    time.sleep(0.5)  # pace RD calls so a big backfill scan doesn't burst past its rate limit
+                        and matches_realdebrid_keywords(title, source.get('realdebrid_keywords', ''))):
+                    if _submit_to_realdebrid(source_id, post, magnet_uri, info_hash, title):
+                        time.sleep(0.5)  # pace RD calls so a big backfill scan doesn't burst past its rate limit
             if fetched_comments:
                 time.sleep(1.1)  # pace the comments-fallback request we just made
 
@@ -477,27 +499,33 @@ def recheck_realdebrid_watched_posts() -> None:
             needs_readd = rd_was_deleted or sub.get('status') == 'error' or rd_stuck
 
             if needs_readd:
-                reason = 'gone (deleted)' if rd_was_deleted else (f"stuck ('{rd_status}')" if rd_stuck else 'errored')
-                magnetarr_logger.info(f"Real-Debrid entry for '{sub.get('title')}' is {reason}, re-adding")
-                # Clean up the old entry first (unless it's already gone) so we don't
-                # leave duplicate stuck torrents piling up on the account.
-                if not rd_was_deleted and sub.get('rd_torrent_id'):
-                    del_err = rd_delete_torrent(sub.get('rd_torrent_id', ''), api_token)
-                    if del_err:
-                        magnetarr_logger.debug(f"Real-Debrid delete of stuck entry: {del_err}")
-                torrent_id, add_err = rd_add_and_select(sub['magnet_uri'], api_token)
-                db.upsert_realdebrid_submission({
-                    'info_hash': info_hash,
-                    'magnet_uri': sub['magnet_uri'],
-                    'title': sub.get('title', ''),
-                    'permalink': sub['permalink'],
-                    'source_id': sub.get('source_id', ''),
-                    'rd_torrent_id': torrent_id or '',
-                    'content_hash': sub.get('content_hash', ''),
-                    'status': 'error' if add_err else 'submitted',
-                    'last_error': add_err,
-                    'active': True,
-                })
+                with _REALDEBRID_SUBMISSION_LOCK:
+                    live = db.get_realdebrid_submission(info_hash)
+                    if (not live or not live.get('active')
+                            or live.get('rd_torrent_id', '') != sub.get('rd_torrent_id', '')):
+                        continue
+                    reason = 'gone (deleted)' if rd_was_deleted else (f"stuck ('{rd_status}')" if rd_stuck else 'errored')
+                    magnetarr_logger.info(f"Real-Debrid entry for '{sub.get('title')}' is {reason}, re-adding")
+                    # Clean up the old entry first (unless it's already gone) so we don't
+                    # leave duplicate stuck torrents piling up on the account.
+                    if not rd_was_deleted and sub.get('rd_torrent_id'):
+                        del_err = rd_delete_torrent(sub.get('rd_torrent_id', ''), api_token)
+                        if del_err:
+                            magnetarr_logger.debug(f"Real-Debrid delete of stuck entry: {del_err}")
+                    torrent_id, add_err = rd_add_and_select(sub['magnet_uri'], api_token)
+                    db.upsert_realdebrid_submission({
+                        'info_hash': info_hash,
+                        'magnet_uri': sub['magnet_uri'],
+                        'title': sub.get('title', ''),
+                        'permalink': sub['permalink'],
+                        'source_id': sub.get('source_id', ''),
+                        'rd_torrent_id': torrent_id or '',
+                        'content_hash': sub.get('content_hash', ''),
+                        'status': 'error' if add_err else 'submitted',
+                        'last_error': add_err,
+                        'active': True,
+                        'replace_rd_torrent_id': True,
+                    })
             elif rd_status == 'downloaded':
                 # RD has fully fetched whatever was in the torrent as of the last add —
                 # but that's a snapshot-in-time, not "the weekend is over": egortech
@@ -515,33 +543,44 @@ def recheck_realdebrid_watched_posts() -> None:
             f"New magnet detected for '{sub.get('title')}' ({info_hash} -> {new_info_hash}), submitting to Real-Debrid"
         )
 
-        del_err = rd_delete_torrent(sub.get('rd_torrent_id', ''), api_token)
-        if del_err:
-            magnetarr_logger.debug(f"Real-Debrid delete of superseded entry: {del_err}")
-        db.mark_realdebrid_submission_status(info_hash, 'superseded', active=False)
+        with _REALDEBRID_SUBMISSION_LOCK:
+            # The loop uses a snapshot. Another scanner/rechecker may already
+            # have superseded this row while we waited for the lock.
+            live = db.get_realdebrid_submission(info_hash)
+            if not live or not live.get('active'):
+                continue
 
-        title = post.get('title', sub.get('title', 'Untitled'))
-        db.insert_magnet_if_new({
-            'info_hash': new_info_hash,
-            'title': title,
-            'magnet_uri': new_magnet_uri,
-            'source_id': sub.get('source_id', ''),
-            'source_name': '',
-            'source_url': '',
-            'category': guess_category(title),
-            'size_bytes': parse_size_from_title(title),
-        })
+            # Historical races can leave several active hashes watching one
+            # logical post. Collapse all stale watchers before submitting the
+            # post's current hash; each old RD ID is therefore deleted once.
+            permalink = sub.get('permalink', '')
+            same_post = ([row for row in db.get_active_realdebrid_submissions()
+                          if row.get('permalink') == permalink] if permalink else [live])
+            deleted_ids = set()
+            for stale in same_post:
+                stale_hash = stale.get('info_hash', '')
+                if stale_hash == new_info_hash:
+                    continue
+                stale_id = stale.get('rd_torrent_id', '')
+                del_err = (rd_delete_torrent(stale_id, api_token)
+                           if stale_id and stale_id not in deleted_ids else '')
+                deleted_ids.add(stale_id)
+                if del_err:
+                    magnetarr_logger.debug(f"Real-Debrid delete of superseded entry: {del_err}")
+                db.mark_realdebrid_submission_status(stale_hash, 'superseded', active=False)
 
-        torrent_id, add_err = rd_add_and_select(new_magnet_uri, api_token)
-        db.upsert_realdebrid_submission({
-            'info_hash': new_info_hash,
-            'magnet_uri': new_magnet_uri,
-            'title': title,
-            'permalink': sub['permalink'],
-            'source_id': sub.get('source_id', ''),
-            'rd_torrent_id': torrent_id or '',
-            'content_hash': _hash_post_content(post.get('content_html', '')),
-            'status': 'error' if add_err else 'submitted',
-            'last_error': add_err,
-            'active': True,
-        })
+            title = post.get('title', sub.get('title', 'Untitled'))
+            db.insert_magnet_if_new({
+                'info_hash': new_info_hash,
+                'title': title,
+                'magnet_uri': new_magnet_uri,
+                'source_id': sub.get('source_id', ''),
+                'source_name': '',
+                'source_url': '',
+                'category': guess_category(title),
+                'size_bytes': parse_size_from_title(title),
+            })
+            _submit_to_realdebrid(
+                sub.get('source_id', ''), post, new_magnet_uri, new_info_hash, title,
+                api_token, replace_inactive=True
+            )
